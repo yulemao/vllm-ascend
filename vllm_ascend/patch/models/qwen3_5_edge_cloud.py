@@ -228,3 +228,20 @@ Qwen3_5MultiTokenPredictor.forward_edge_cloud_segment = (
     _forward_edge_cloud_segment_qwen3_5_mtp
 )
 Qwen3_5MTP.forward_edge_cloud_segment = _qwen3_5_mtp_forward_edge_cloud_segment
+
+# Patch supports_pp for Qwen3_5MTP to enable pipeline parallelism.
+# Qwen3_5MTP.forward already accepts intermediate_tensors, but the class
+# does not declare SupportsPP, so is_pp_supported_model returns False.
+Qwen3_5MTP.supports_pp = True
+
+
+def _qwen3_5_mtp_make_empty_intermediate_tensors(
+    self: Qwen3_5MTP,
+    batch_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+):
+    return self.model.make_empty_intermediate_tensors(batch_size, dtype, device)
+
+
+Qwen3_5MTP.make_empty_intermediate_tensors = _qwen3_5_mtp_make_empty_intermediate_tensors

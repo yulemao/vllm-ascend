@@ -39,11 +39,11 @@ class EdgeCloudLayerPlan:
         if self.role not in ("edge", "cloud"):
             raise ValueError(f"role must be edge or cloud, got {self.role}")
         if self.mode == "head_tail":
-            if self.head_k <= 0 or self.tail_k <= 0:
-                raise ValueError("head/tail layer counts must be positive in 'head_tail' mode")
-            if self.head_k + self.tail_k >= self.total_layers:
+            if self.head_k < 0 or self.tail_k < 0:
+                raise ValueError("head/tail layer counts must be non-negative in 'head_tail' mode")
+            if self.head_k + self.tail_k > self.total_layers:
                 raise ValueError(
-                    "edge head/tail layers must leave at least one cloud layer: "
+                    "edge head/tail layers cannot exceed total layers: "
                     f"head_k={self.head_k}, tail_k={self.tail_k}, "
                     f"total_layers={self.total_layers}"
                 )
@@ -54,9 +54,14 @@ class EdgeCloudLayerPlan:
                 return set()
             return set(range(self.total_layers))
         if self.role == "edge":
+            if self.head_k + self.tail_k >= self.total_layers:
+                return set(range(self.total_layers))
             return set(range(self.head_k)) | set(
                 range(self.total_layers - self.tail_k, self.total_layers)
             )
+        # cloud
+        if self.head_k + self.tail_k >= self.total_layers:
+            return set()
         return set(range(self.head_k, self.total_layers - self.tail_k))
 
     def get_released_layers(self) -> set[int]:
@@ -153,6 +158,65 @@ class LayerShardLoader:
                 for prefix in compilation_config.static_all_moe_layers
                 if prefix not in removed_prefixes
             ]
+
+    @staticmethod
+    def _get_mtp_model(model: nn.Module) -> nn.Module | None:
+        if hasattr(model, "model") and hasattr(model.model, "layers"):
+            inner = model.model
+            if hasattr(inner, "fc") and hasattr(inner, "embed_tokens"):
+                return inner
+        if hasattr(model, "layers") and hasattr(model, "fc"):
+            return model
+        return None
+
+    @classmethod
+    def apply_sharding_to_mtp(
+        cls,
+        mtp_model: nn.Module,
+        layer_plan: EdgeCloudLayerPlan,
+        compilation_config: Any = None,
+    ) -> None:
+        predictor = cls._get_mtp_model(mtp_model)
+        if predictor is None:
+            return
+
+        layers = predictor.layers
+        local_layers = layer_plan.get_local_layers()
+
+        converted = 0
+        for i in range(len(layers)):
+            if i not in local_layers and not isinstance(layers[i], PPMissingLayer):
+                old_layer = layers[i]
+                layers[i] = PPMissingLayer()
+                del old_layer
+                converted += 1
+
+        if layer_plan.role == "cloud":
+            for module_name in (
+                "embed_tokens",
+                "fc",
+                "norm",
+                "pre_fc_norm_hidden",
+                "pre_fc_norm_embedding",
+            ):
+                module = getattr(predictor, module_name, None)
+                if module is not None and not isinstance(module, PPMissingLayer):
+                    setattr(predictor, module_name, PPMissingLayer())
+            if (
+                hasattr(mtp_model, "lm_head")
+                and not isinstance(mtp_model.lm_head, PPMissingLayer)
+            ):
+                mtp_model.lm_head = PPMissingLayer()
+
+        if compilation_config is not None:
+            cls._clean_compilation_config(mtp_model, compilation_config)
+
+        logger.info(
+            "[LayerShardLoader] MTP sharding role=%s local_layers=%s converted=%d",
+            layer_plan.role,
+            sorted(local_layers),
+            converted,
+        )
 
     @classmethod
     def validate_sharding(cls, model: nn.Module, layer_plan: EdgeCloudLayerPlan) -> None:

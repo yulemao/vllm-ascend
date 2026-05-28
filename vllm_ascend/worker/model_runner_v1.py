@@ -758,6 +758,81 @@ class NPUModelRunner(GPUModelRunner):
             self.edge_cloud_cfg.role,
         )
 
+        if self.drafter is not None:
+            logger.info("[EdgeCloud] Loading drafter model...")
+            if self.vllm_config.quant_config is not None:
+                patch_load_weights(self.vllm_config)
+            with get_tp_context(self.drafter):
+                self.drafter.load_model(self.model)
+
+            if (
+                self.speculative_config
+                and self.speculative_config.method == "mtp"
+                and hasattr(self.drafter, "model")
+                and self.drafter.model is not None
+            ):
+                self._setup_edge_cloud_mtp(self.drafter.model)
+
+    def _setup_edge_cloud_mtp(self, mtp_model: nn.Module) -> None:
+        predictor = LayerShardLoader._get_mtp_model(mtp_model)
+        if predictor is None:
+            logger.warning("[EdgeCloud] Cannot find MTP predictor for sharding")
+            return
+
+        num_mtp_layers = len(predictor.layers)
+        head_k = min(self.head_k, num_mtp_layers)
+        tail_k = min(self.tail_k, num_mtp_layers)
+
+        if head_k + tail_k >= num_mtp_layers:
+            logger.info(
+                "[EdgeCloud] MTP layers=%d <= head_k+tail_k=%d, edge runs full MTP",
+                num_mtp_layers,
+                head_k + tail_k,
+            )
+            # When MTP layers are too few to split, edge keeps everything
+            # and cloud gets nothing.
+            layer_plan = EdgeCloudLayerPlan(
+                role=self.edge_cloud_cfg.role,
+                total_layers=num_mtp_layers,
+                k=[num_mtp_layers, 0],
+                mode="head_tail",
+            )
+        else:
+            layer_plan = EdgeCloudLayerPlan(
+                role=self.edge_cloud_cfg.role,
+                total_layers=num_mtp_layers,
+                k=[head_k, tail_k],
+                mode="head_tail",
+            )
+
+        LayerShardLoader.apply_sharding_to_mtp(
+            mtp_model, layer_plan, self.vllm_config.compilation_config
+        )
+
+        if hasattr(self, "_edge_cloud_mtp_segments"):
+            delattr(self, "_edge_cloud_mtp_segments")
+        self._edge_cloud_mtp_segments = {}
+
+        if self.edge_cloud_cfg.role == "edge":
+            self._edge_cloud_mtp_segments["a"] = self._create_segment_callable(
+                mtp_model, 0, head_k, is_first_segment=True, is_last_segment=False
+            )
+            self._edge_cloud_mtp_segments["e"] = self._create_segment_callable(
+                mtp_model,
+                num_mtp_layers - tail_k,
+                num_mtp_layers,
+                is_first_segment=False,
+                is_last_segment=True,
+            )
+        else:
+            self._edge_cloud_mtp_segments["c"] = self._create_segment_callable(
+                mtp_model,
+                head_k,
+                num_mtp_layers - tail_k,
+                is_first_segment=False,
+                is_last_segment=False,
+            )
+
     def _sync_metadata_across_dp(
         self,
         num_tokens: int,
@@ -2231,6 +2306,15 @@ class NPUModelRunner(GPUModelRunner):
                 if not self._edge_cloud_enabled:
                     self._pp_receive_prev_sampled_token_ids_to_input_batch()
             if not kv_connector_output:
+                if (
+                    self._edge_cloud_enabled
+                    and self.edge_cloud_cfg.role == "cloud"
+                    and self.speculative_config
+                    and self.speculative_config.method == "mtp"
+                    and hasattr(self, "_edge_cloud_mtp_segments")
+                    and "c" in self._edge_cloud_mtp_segments
+                ):
+                    self._run_mtp_cloud_segment()
                 return None  # noqa
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
@@ -2416,6 +2500,35 @@ class NPUModelRunner(GPUModelRunner):
             async_output.async_copy_ready_event,
         )
         return async_output
+
+    def _run_mtp_cloud_segment(self) -> None:
+        from vllm_ascend.distributed.parallel_state import edge_cloud_broadcast_recv
+
+        # Receive intermediate from edge (including positions)
+        tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+        for handle in comm_handles:
+            handle.wait()
+        for postprocess in comm_postprocess:
+            postprocess()
+        intermediate = IntermediateTensors(tensor_dict)
+
+        # Build kwargs for middle segment
+        positions = intermediate.tensors.get("positions", None)
+        model_kwargs = {
+            "intermediate_tensors": intermediate,
+            "positions": positions,
+        }
+
+        # Run middle segment
+        segment = self._edge_cloud_mtp_segments["c"]
+        output = segment(**model_kwargs)
+        assert isinstance(output, IntermediateTensors)
+
+        # Send back to edge
+        if get_pp_group().world_size == 2:
+            send_work = get_pp_group().isend_tensor_dict(dict(output.items()))
+            for handle in send_work:
+                handle.wait()
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):

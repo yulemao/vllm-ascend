@@ -18,6 +18,10 @@ from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5MoeForCausalLM,
     Qwen3_5MoeForConditionalGeneration,
 )
+from vllm.model_executor.models.qwen3_5_mtp import (
+    Qwen3_5MTP,
+    Qwen3_5MultiTokenPredictor,
+)
 from vllm.sequence import IntermediateTensors
 
 
@@ -132,3 +136,96 @@ Qwen3_5ForConditionalGeneration.forward_edge_cloud_segment = (
 Qwen3_5MoeForConditionalGeneration.forward_edge_cloud_segment = (
     _qwen3_5_cond_forward_edge_cloud_segment
 )
+
+
+def _forward_edge_cloud_segment_qwen3_5_mtp(
+    self: Qwen3_5MultiTokenPredictor,
+    start_layer: int,
+    end_layer: int,
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    intermediate_tensors: IntermediateTensors | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+    spec_step_idx: int = 0,
+    is_first_segment: bool | None = None,
+    is_last_segment: bool | None = None,
+    **extra_layer_kwargs: Any,
+) -> torch.Tensor | IntermediateTensors:
+    num_layers = len(self.layers)
+    assert 0 <= start_layer <= end_layer <= num_layers, (
+        f"Invalid MTP segment range [{start_layer}, {end_layer}) "
+        f"for {num_layers} layers"
+    )
+
+    if is_first_segment is None:
+        is_first_segment = start_layer == 0
+    if is_last_segment is None:
+        is_last_segment = end_layer == num_layers
+
+    if is_first_segment:
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+        hidden_states = self.fc(hidden_states)
+        residual = None
+    else:
+        assert intermediate_tensors is not None, (
+            "intermediate_tensors is None in MTP edge-cloud segment; "
+            "check that all TP ranks receive tensors correctly."
+        )
+        hidden_states = intermediate_tensors["hidden_states"]
+        residual = intermediate_tensors["residual"]
+
+    if start_layer < end_layer:
+        for layer_idx in range(start_layer, end_layer):
+            actual_idx = layer_idx % self.num_mtp_layers
+            hidden_states, residual = self.layers[actual_idx](
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+
+    if not is_last_segment:
+        if residual is None:
+            residual = torch.zeros_like(hidden_states)
+        return IntermediateTensors(
+            {"hidden_states": hidden_states, "residual": residual}
+        )
+
+    hidden_states, _ = self.norm(hidden_states, residual)
+    return hidden_states
+
+
+def _qwen3_5_mtp_forward_edge_cloud_segment(
+    self: Qwen3_5MTP,
+    start_layer: int,
+    end_layer: int,
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor,
+    intermediate_tensors: IntermediateTensors | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+    **extra_layer_kwargs: Any,
+) -> torch.Tensor | IntermediateTensors:
+    hidden_states = extra_layer_kwargs.pop("hidden_states", None)
+    spec_step_idx = extra_layer_kwargs.pop("spec_step_idx", 0)
+    return self.model.forward_edge_cloud_segment(
+        start_layer,
+        end_layer,
+        input_ids,
+        positions,
+        hidden_states,
+        intermediate_tensors,
+        inputs_embeds,
+        spec_step_idx,
+        **extra_layer_kwargs,
+    )
+
+
+Qwen3_5MultiTokenPredictor.forward_edge_cloud_segment = (
+    _forward_edge_cloud_segment_qwen3_5_mtp
+)
+Qwen3_5MTP.forward_edge_cloud_segment = _qwen3_5_mtp_forward_edge_cloud_segment

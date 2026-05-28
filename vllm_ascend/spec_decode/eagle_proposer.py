@@ -39,6 +39,7 @@ from vllm.v1.spec_decode.utils import (
     compute_new_slot_mapping,
     extend_all_queries_by_N,
 )
+from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
@@ -46,6 +47,7 @@ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
+from vllm_ascend.distributed.parallel_state import edge_cloud_broadcast_recv
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
@@ -874,7 +876,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if self.method == "mtp":
                     model_kwargs["positions"] = model_positions
 
-        ret_hidden_states = self.model(**model_kwargs)
+        if (
+            self.method == "mtp"
+            and self.runner is not None
+            and getattr(self.runner, "_edge_cloud_enabled", False)
+        ):
+            ret_hidden_states = self._run_mtp_edge_cloud(**model_kwargs)
+        else:
+            ret_hidden_states = self.model(**model_kwargs)
+
         if not self.model_returns_tuple():
             last_hidden_states = ret_hidden_states
             hidden_states = last_hidden_states
@@ -1799,6 +1809,60 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.vllm_config.speculative_config,
             draft_attn_metadatas=draft_attn_metadatas,
         )
+
+    def _run_mtp_edge_cloud(self, **model_kwargs) -> torch.Tensor:
+        segments = self.runner._edge_cloud_mtp_segments
+        role = self.runner.edge_cloud_cfg.role
+
+        if role == "edge":
+            # Edge first segment: embed + fc
+            output = segments["a"](**model_kwargs)
+            assert isinstance(output, IntermediateTensors)
+
+            # Include positions so cloud can run decoder layers
+            output["positions"] = model_kwargs["positions"]
+            if get_pp_group().world_size == 2:
+                send_work = get_pp_group().isend_tensor_dict(dict(output.items()))
+                for handle in send_work:
+                    handle.wait()
+
+            # Receive cloud middle segment result
+            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+            for handle in comm_handles:
+                handle.wait()
+            for postprocess in comm_postprocess:
+                postprocess()
+            intermediate = IntermediateTensors(tensor_dict)
+
+            # Edge last segment: norm
+            model_kwargs["intermediate_tensors"] = intermediate
+            for key in ("input_ids", "inputs_embeds", "hidden_states"):
+                model_kwargs.pop(key, None)
+            final_output = segments["e"](**model_kwargs)
+            return final_output
+        else:
+            # Cloud path: this should normally not be reached because cloud
+            # sample_tokens returns None before calling _run_merged_draft.
+            # Kept here as a fallback if the calling context changes.
+            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+            for handle in comm_handles:
+                handle.wait()
+            for postprocess in comm_postprocess:
+                postprocess()
+            intermediate = IntermediateTensors(tensor_dict)
+
+            model_kwargs["intermediate_tensors"] = intermediate
+            for key in ("input_ids", "inputs_embeds", "hidden_states"):
+                model_kwargs.pop(key, None)
+            output = segments["c"](**model_kwargs)
+            assert isinstance(output, IntermediateTensors)
+
+            if get_pp_group().world_size == 2:
+                send_work = get_pp_group().isend_tensor_dict(dict(output.items()))
+                for handle in send_work:
+                    handle.wait()
+
+            return output["hidden_states"]
 
     # adjusting tensor into desired size
     def _adjust_tensor(self, tensor, desired_size):

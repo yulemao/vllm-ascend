@@ -245,3 +245,20 @@ def _qwen3_5_mtp_make_empty_intermediate_tensors(
 
 
 Qwen3_5MTP.make_empty_intermediate_tensors = _qwen3_5_mtp_make_empty_intermediate_tensors
+
+# Clear stale _ModelInfo caches so that inspect_model_cls re-computes
+# supports_pp with the patched class instead of loading the old cached value.
+from pathlib import Path  # noqa: E402
+
+from vllm.envs import VLLM_CACHE_ROOT  # noqa: E402
+from vllm.model_executor.models.registry import _try_inspect_model_cls  # noqa: E402
+
+# Clear in-memory lru_cache in case it was populated before the patch.
+_try_inspect_model_cls.cache_clear()
+
+# Clear on-disk cache files for qwen3_5_mtp so the next inspect runs
+# _ModelInfo.from_model_cls on the patched class.
+_cache_dir = Path(VLLM_CACHE_ROOT) / "modelinfos"
+if _cache_dir.exists():
+    for _cache_file in _cache_dir.glob("*qwen3_5_mtp*"):
+        _cache_file.unlink()

@@ -780,30 +780,15 @@ class NPUModelRunner(GPUModelRunner):
             return
 
         num_mtp_layers = len(predictor.layers)
-        head_k = min(self.head_k, num_mtp_layers)
-        tail_k = min(self.tail_k, num_mtp_layers)
 
-        if head_k + tail_k >= num_mtp_layers:
-            logger.info(
-                "[EdgeCloud] MTP layers=%d <= head_k+tail_k=%d, edge runs full MTP",
-                num_mtp_layers,
-                head_k + tail_k,
-            )
-            # When MTP layers are too few to split, edge keeps everything
-            # and cloud gets nothing.
-            layer_plan = EdgeCloudLayerPlan(
-                role=self.edge_cloud_cfg.role,
-                total_layers=num_mtp_layers,
-                k=[num_mtp_layers, 0],
-                mode="head_tail",
-            )
-        else:
-            layer_plan = EdgeCloudLayerPlan(
-                role=self.edge_cloud_cfg.role,
-                total_layers=num_mtp_layers,
-                k=[head_k, tail_k],
-                mode="head_tail",
-            )
+        # All MTP decoder layers run on the cloud side; edge only keeps
+        # embed+fc (first segment) and norm (last segment).
+        layer_plan = EdgeCloudLayerPlan(
+            role=self.edge_cloud_cfg.role,
+            total_layers=num_mtp_layers,
+            k=[0, 0],
+            mode="head_tail",
+        )
 
         LayerShardLoader.apply_sharding_to_mtp(
             mtp_model, layer_plan, self.vllm_config.compilation_config
@@ -815,22 +800,14 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.edge_cloud_cfg.role == "edge":
             self._edge_cloud_mtp_segments["a"] = self._create_segment_callable(
-                mtp_model, 0, head_k, is_first_segment=True, is_last_segment=False
+                mtp_model, 0, 0, is_first_segment=True, is_last_segment=False
             )
             self._edge_cloud_mtp_segments["e"] = self._create_segment_callable(
-                mtp_model,
-                num_mtp_layers - tail_k,
-                num_mtp_layers,
-                is_first_segment=False,
-                is_last_segment=True,
+                mtp_model, 0, 0, is_first_segment=False, is_last_segment=True
             )
         else:
             self._edge_cloud_mtp_segments["c"] = self._create_segment_callable(
-                mtp_model,
-                head_k,
-                num_mtp_layers - tail_k,
-                is_first_segment=False,
-                is_last_segment=False,
+                mtp_model, 0, 0, is_first_segment=False, is_last_segment=False
             )
 
     def _sync_metadata_across_dp(
@@ -2504,31 +2481,42 @@ class NPUModelRunner(GPUModelRunner):
     def _run_mtp_cloud_segment(self) -> None:
         from vllm_ascend.distributed.parallel_state import edge_cloud_broadcast_recv
 
-        # Receive intermediate from edge (including positions)
-        tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
-        for handle in comm_handles:
-            handle.wait()
-        for postprocess in comm_postprocess:
-            postprocess()
-        intermediate = IntermediateTensors(tensor_dict)
+        # The edge side calls the MTP model for each speculative step
+        # (including the first pass).  We loop the same number of times so
+        # that every edge request has a matching cloud response.
+        num_steps = (
+            self.speculative_config.num_speculative_tokens
+            if self.speculative_config else 1
+        )
 
-        # Build kwargs for middle segment
-        positions = intermediate.tensors.get("positions", None)
-        model_kwargs = {
-            "intermediate_tensors": intermediate,
-            "positions": positions,
-        }
-
-        # Run middle segment
-        segment = self._edge_cloud_mtp_segments["c"]
-        output = segment(**model_kwargs)
-        assert isinstance(output, IntermediateTensors)
-
-        # Send back to edge
-        if get_pp_group().world_size == 2:
-            send_work = get_pp_group().isend_tensor_dict(dict(output.items()))
-            for handle in send_work:
+        for _ in range(num_steps):
+            # Receive intermediate from edge (including positions and spec_step_idx)
+            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+            for handle in comm_handles:
                 handle.wait()
+            for postprocess in comm_postprocess:
+                postprocess()
+            intermediate = IntermediateTensors(tensor_dict)
+
+            # Build kwargs for cloud segment
+            positions = intermediate.tensors.get("positions", None)
+            model_kwargs = {
+                "intermediate_tensors": intermediate,
+                "positions": positions,
+            }
+            if "spec_step_idx" in tensor_dict:
+                model_kwargs["spec_step_idx"] = tensor_dict["spec_step_idx"].item()
+
+            # Run cloud segment (all MTP decoder layers are on cloud)
+            segment = self._edge_cloud_mtp_segments["c"]
+            output = segment(**model_kwargs)
+            assert isinstance(output, IntermediateTensors)
+
+            # Send back to edge
+            if get_pp_group().world_size == 2:
+                send_work = get_pp_group().isend_tensor_dict(dict(output.items()))
+                for handle in send_work:
+                    handle.wait()
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):

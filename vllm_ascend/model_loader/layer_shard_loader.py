@@ -181,7 +181,13 @@ class LayerShardLoader:
             return
 
         layers = predictor.layers
-        local_layers = layer_plan.get_local_layers()
+
+        # All MTP decoder layers run on the cloud side; edge only keeps
+        # embed+fc and norm modules.
+        if layer_plan.role == "cloud":
+            local_layers = set(range(len(layers)))
+        else:
+            local_layers = set()
 
         converted = 0
         for i in range(len(layers)):

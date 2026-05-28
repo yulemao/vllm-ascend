@@ -1038,7 +1038,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = model_hidden_states
 
-            ret_hidden_states = self.model(**model_kwargs)
+            # MTP speculative steps beyond the first must also go through the
+            # edge-cloud communication path so that cloud runs the decoder layers.
+            if (
+                self.method == "mtp"
+                and self.runner is not None
+                and getattr(self.runner, "_edge_cloud_enabled", False)
+            ):
+                # spec_step_idx for the first pass is 0; subsequent steps are
+                # draft_step + 1 because the first draft token was already
+                # generated in the first pass.
+                model_kwargs["spec_step_idx"] = draft_step + 1
+                ret_hidden_states = self._run_mtp_edge_cloud(**model_kwargs)
+            else:
+                ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
@@ -1819,14 +1832,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             output = segments["a"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)
 
-            # Include positions so cloud can run decoder layers
+            # Include positions and spec_step_idx so cloud can run the correct
+            # decoder layer.
             output["positions"] = model_kwargs["positions"]
+            if "spec_step_idx" in model_kwargs:
+                output["spec_step_idx"] = torch.tensor(
+                    model_kwargs["spec_step_idx"], dtype=torch.int64, device="cpu"
+                )
             if get_pp_group().world_size == 2:
                 send_work = get_pp_group().isend_tensor_dict(dict(output.items()))
                 for handle in send_work:
                     handle.wait()
 
-            # Receive cloud middle segment result
+            # Receive cloud segment result (all decoder layers run on cloud)
             tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
             for handle in comm_handles:
                 handle.wait()
@@ -1836,7 +1854,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             # Edge last segment: norm
             model_kwargs["intermediate_tensors"] = intermediate
-            for key in ("input_ids", "inputs_embeds", "hidden_states"):
+            for key in ("input_ids", "inputs_embeds", "hidden_states", "spec_step_idx"):
                 model_kwargs.pop(key, None)
             final_output = segments["e"](**model_kwargs)
             return final_output
@@ -1854,6 +1872,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             model_kwargs["intermediate_tensors"] = intermediate
             for key in ("input_ids", "inputs_embeds", "hidden_states"):
                 model_kwargs.pop(key, None)
+            if "spec_step_idx" in tensor_dict:
+                model_kwargs["spec_step_idx"] = tensor_dict["spec_step_idx"].item()
             output = segments["c"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)
 

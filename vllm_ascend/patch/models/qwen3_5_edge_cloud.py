@@ -152,11 +152,10 @@ def _forward_edge_cloud_segment_qwen3_5_mtp(
     is_last_segment: bool | None = None,
     **extra_layer_kwargs: Any,
 ) -> torch.Tensor | IntermediateTensors:
+    # All MTP decoder layers run on the cloud side; edge only handles
+    # embed+fc (first segment) and norm (last segment).  start_layer/end_layer
+    # are kept in the signature for backward compatibility but ignored here.
     num_layers = len(self.layers)
-    assert 0 <= start_layer <= end_layer <= num_layers, (
-        f"Invalid MTP segment range [{start_layer}, {end_layer}) "
-        f"for {num_layers} layers"
-    )
 
     if is_first_segment is None:
         is_first_segment = start_layer == 0
@@ -180,14 +179,14 @@ def _forward_edge_cloud_segment_qwen3_5_mtp(
         hidden_states = intermediate_tensors["hidden_states"]
         residual = intermediate_tensors["residual"]
 
-    if start_layer < end_layer:
-        for layer_idx in range(start_layer, end_layer):
-            actual_idx = layer_idx % self.num_mtp_layers
-            hidden_states, residual = self.layers[actual_idx](
-                positions=positions,
-                hidden_states=hidden_states,
-                residual=residual,
-            )
+    # Cloud segment: execute exactly one decoder layer selected by spec_step_idx.
+    if not is_first_segment and not is_last_segment:
+        actual_idx = spec_step_idx % self.num_mtp_layers
+        hidden_states, residual = self.layers[actual_idx](
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=residual,
+        )
 
     if not is_last_segment:
         if residual is None:

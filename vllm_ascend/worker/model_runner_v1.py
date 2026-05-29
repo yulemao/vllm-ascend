@@ -295,6 +295,50 @@ class NPUModelRunner(GPUModelRunner):
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
+
+        # Edge-cloud initialization must happen before _set_up_drafter
+        # because the drafter setup needs to know whether edge-cloud is enabled.
+        self.edge_cloud_cfg = self.ascend_config.edge_cloud_config
+        self._edge_cloud_enabled = self.edge_cloud_cfg.enabled
+        if self._edge_cloud_enabled:
+            if not self.parallel_config.enable_edge_cloud:
+                raise ValueError(
+                    "additional_config.edge_cloud_config.enabled requires "
+                    "--enable-edge-cloud."
+                )
+            expected_role = "edge" if self.parallel_config.is_edge_node else "cloud"
+            if self.edge_cloud_cfg.role != expected_role:
+                raise ValueError(
+                    "additional_config.edge_cloud_config.role must match the "
+                    f"process role inferred from --headless. Expected "
+                    f"{expected_role!r}, got {self.edge_cloud_cfg.role!r}."
+                )
+            self.head_k, self.tail_k = self.edge_cloud_cfg.head_tail_k
+            if self.edge_cloud_cfg.mode == "embedding_only":
+                self.head_k = 0
+                self.tail_k = 0
+                logger.info(
+                    "Edge-cloud mode is 'embedding_only', forcing head_k=0, tail_k=0"
+                )
+            hf_config = getattr(self.model_config, "hf_text_config", None)
+            model_type = getattr(hf_config, "model_type", "")
+            self._is_qwen3_5 = "qwen3_5" in model_type
+            self.num_layers = 0
+            self.segment_a: Any = None
+            self.segment_e: Any = None
+            self.segment_c: Any = None
+            self.segment_a_wrapper: Any = None
+            self.segment_e_wrapper: Any = None
+            self.segment_c_wrapper: Any = None
+        else:
+            self.head_k = 0
+            self.tail_k = 0
+            self._is_qwen3_5 = False
+            if self.parallel_config.enable_edge_cloud:
+                raise ValueError(
+                    "--enable-edge-cloud requires "
+                    "additional_config.edge_cloud_config.enabled=true."
+                )
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
         dump_cfg = self.ascend_config.dump_config_path
         self.debugger = None
@@ -505,48 +549,6 @@ class NPUModelRunner(GPUModelRunner):
             self.kvcomp_meta_data = initialize_kvcomp_metadata(max_num_reqs=self.max_num_reqs,
                 block_size=self.block_size, device=self.device, vllm_config=self.vllm_config,
                 parallel_config=self.parallel_config, dtype=self.dtype)
-
-        self.edge_cloud_cfg = self.ascend_config.edge_cloud_config
-        self._edge_cloud_enabled = self.edge_cloud_cfg.enabled
-        if self._edge_cloud_enabled:
-            if not self.parallel_config.enable_edge_cloud:
-                raise ValueError(
-                    "additional_config.edge_cloud_config.enabled requires "
-                    "--enable-edge-cloud."
-                )
-            expected_role = "edge" if self.parallel_config.is_edge_node else "cloud"
-            if self.edge_cloud_cfg.role != expected_role:
-                raise ValueError(
-                    "additional_config.edge_cloud_config.role must match the "
-                    f"process role inferred from --headless. Expected "
-                    f"{expected_role!r}, got {self.edge_cloud_cfg.role!r}."
-                )
-            self.head_k, self.tail_k = self.edge_cloud_cfg.head_tail_k
-            if self.edge_cloud_cfg.mode == "embedding_only":
-                self.head_k = 0
-                self.tail_k = 0
-                logger.info(
-                    "Edge-cloud mode is 'embedding_only', forcing head_k=0, tail_k=0"
-                )
-            hf_config = getattr(self.model_config, "hf_text_config", None)
-            model_type = getattr(hf_config, "model_type", "")
-            self._is_qwen3_5 = "qwen3_5" in model_type
-            self.num_layers = 0
-            self.segment_a: Any = None
-            self.segment_e: Any = None
-            self.segment_c: Any = None
-            self.segment_a_wrapper: Any = None
-            self.segment_e_wrapper: Any = None
-            self.segment_c_wrapper: Any = None
-        else:
-            self.head_k = 0
-            self.tail_k = 0
-            self._is_qwen3_5 = False
-            if self.parallel_config.enable_edge_cloud:
-                raise ValueError(
-                    "--enable-edge-cloud requires "
-                    "additional_config.edge_cloud_config.enabled=true."
-                )
 
     @property
     def use_cp(self) -> bool:

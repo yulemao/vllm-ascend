@@ -464,7 +464,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if is_profile:
             batch_size = min(batch_size, self.runner.max_num_reqs)
 
-        if self.supports_mm_inputs:
+        # On the cloud side of edge-cloud MTP, the draft model's embed_tokens
+        # is replaced with PPMissingLayer, so embed_input_ids would return the
+        # raw 1D input_ids instead of 2D embeddings. The cloud side does not
+        # need inputs_embeds anyway — it receives intermediate tensors from
+        # the edge via broadcast.
+        is_cloud_mtp = (
+            self.method == "mtp"
+            and self.runner is not None
+            and getattr(self.runner, "_edge_cloud_enabled", False)
+            and self.runner.edge_cloud_cfg.role == "cloud"
+        )
+        if self.supports_mm_inputs and not is_cloud_mtp:
             mm_embeds, is_mm_embed = (None, None)
             inputs_embeds = self.model.embed_input_ids(
                 self.input_ids[:num_tokens], multimodal_embeddings=mm_embeds, is_multimodal=is_mm_embed
@@ -653,7 +664,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     common_attn_metadata.block_table_tensor, num_reqs_padded
                 )
 
-        if self.supports_mm_inputs:
+        # On the cloud side of edge-cloud MTP, the draft model's embed_tokens
+        # is replaced with PPMissingLayer, so embed_input_ids would return the
+        # raw 1D input_ids instead of 2D embeddings. The cloud side does not
+        # need inputs_embeds anyway — it receives intermediate tensors from
+        # the edge via broadcast.
+        is_cloud_mtp = (
+            self.method == "mtp"
+            and self.runner is not None
+            and getattr(self.runner, "_edge_cloud_enabled", False)
+            and self.runner.edge_cloud_cfg.role == "cloud"
+        )
+        if self.supports_mm_inputs and not is_cloud_mtp:
             mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
             inputs_embeds = self.model.embed_input_ids(
                 self.input_ids[:num_tokens], multimodal_embeddings=mm_embeds, is_multimodal=is_mm_embed

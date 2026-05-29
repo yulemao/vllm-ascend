@@ -1862,7 +1862,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     model_kwargs["spec_step_idx"], dtype=torch.int64, device="cpu"
                 )
             if get_pp_group().world_size == 2:
-                send_work = get_pp_group().isend_tensor_dict(dict(output.items()))
+                send_work = get_pp_group().isend_tensor_dict(
+                    {k: v.contiguous() if isinstance(v, torch.Tensor) else v
+                     for k, v in output.items()}
+                )
                 for handle in send_work:
                     handle.wait()
 
@@ -1900,7 +1903,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             assert isinstance(output, IntermediateTensors)
 
             if get_pp_group().world_size == 2:
-                send_work = get_pp_group().isend_tensor_dict(dict(output.items()))
+                send_work = get_pp_group().isend_tensor_dict(
+                    {k: v.contiguous() if isinstance(v, torch.Tensor) else v
+                     for k, v in output.items()}
+                )
                 for handle in send_work:
                     handle.wait()
 

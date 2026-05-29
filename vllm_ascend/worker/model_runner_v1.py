@@ -2381,37 +2381,24 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
-                # On the cloud side of edge-cloud MTP, run the cloud segment
-                # directly and skip propose_draft_token_ids because draft
-                # tokens are generated on the edge side.
-                is_cloud_mtp = (
-                    self._edge_cloud_enabled
-                    and self.edge_cloud_cfg.role == "cloud"
-                    and self.speculative_config.method == "mtp"
-                    and hasattr(self, "_edge_cloud_mtp_segments")
-                    and "c" in self._edge_cloud_mtp_segments
-                )
-                if is_cloud_mtp:
-                    self._run_mtp_cloud_segment()
-                else:
-                    use_padded_batch = (
-                        self.speculative_config
-                        and (
-                            self.speculative_config.use_eagle()
-                            or self.speculative_config.uses_draft_model()
-                            or self.speculative_config.uses_extract_hidden_states()
-                            or self.speculative_config.use_ngram_gpu()
-                        )
-                        and not self.speculative_config.disable_padded_drafter_batch
+                use_padded_batch = (
+                    self.speculative_config
+                    and (
+                        self.speculative_config.use_eagle()
+                        or self.speculative_config.uses_draft_model()
+                        or self.speculative_config.uses_extract_hidden_states()
+                        or self.speculative_config.use_ngram_gpu()
                     )
-                    if use_padded_batch:
-                        # EAGLE speculative decoding can use the GPU sampled tokens
-                        # as inputs, and does not need to wait for bookkeeping to finish.
-                        propose_draft_token_ids(sampler_output.sampled_token_ids)
-                    if self.speculative_config and not use_padded_batch:
-                        # ngram and other speculative decoding methods use the sampled
-                        # tokens on the CPU, so they are run after bookkeeping.
-                        propose_draft_token_ids(valid_sampled_token_ids)
+                    and not self.speculative_config.disable_padded_drafter_batch
+                )
+                if use_padded_batch:
+                    # EAGLE speculative decoding can use the GPU sampled tokens
+                    # as inputs, and does not need to wait for bookkeeping to finish.
+                    propose_draft_token_ids(sampler_output.sampled_token_ids)
+                if self.speculative_config and not use_padded_batch:
+                    # ngram and other speculative decoding methods use the sampled
+                    # tokens on the CPU, so they are run after bookkeeping.
+                    propose_draft_token_ids(valid_sampled_token_ids)
 
             # vLLM v0.18 defers KV connector finalization during target-model
             # forward when speculative decoding is enabled. Finalize here after

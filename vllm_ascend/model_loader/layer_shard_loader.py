@@ -189,6 +189,13 @@ class LayerShardLoader:
         else:
             local_layers = set()
 
+        # Capture MTP module ids before replacing layers, so we only clean
+        # compilation_config entries that originally belong to the MTP model.
+        # Otherwise _clean_compilation_config would also delete the main model's
+        # static_forward_context entries since they are not in mtp_model.
+        if compilation_config is not None:
+            mtp_module_ids = {id(module) for _, module in mtp_model.named_modules()}
+
         converted = 0
         for i in range(len(layers)):
             if i not in local_layers and not isinstance(layers[i], PPMissingLayer):
@@ -215,7 +222,30 @@ class LayerShardLoader:
                 mtp_model.lm_head = PPMissingLayer()
 
         if compilation_config is not None:
-            cls._clean_compilation_config(mtp_model, compilation_config)
+            current_mtp_module_ids = {
+                id(module) for _, module in mtp_model.named_modules()
+            }
+            removed_prefixes: list[str] = []
+            for prefix in list(compilation_config.static_forward_context.keys()):
+                module = compilation_config.static_forward_context[prefix]
+                if id(module) in mtp_module_ids and id(module) not in current_mtp_module_ids:
+                    del compilation_config.static_forward_context[prefix]
+                    removed_prefixes.append(prefix)
+
+            if removed_prefixes:
+                logger.info(
+                    "[LayerShardLoader] MTP removed %d stale static_forward_context "
+                    "entries: %s",
+                    len(removed_prefixes),
+                    removed_prefixes,
+                )
+
+            if hasattr(compilation_config, "static_all_moe_layers"):
+                compilation_config.static_all_moe_layers[:] = [
+                    prefix
+                    for prefix in compilation_config.static_all_moe_layers
+                    if prefix not in removed_prefixes
+                ]
 
         logger.info(
             "[LayerShardLoader] MTP sharding role=%s local_layers=%s converted=%d",

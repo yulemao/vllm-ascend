@@ -577,7 +577,10 @@ class NPUModelRunner(GPUModelRunner):
             spec_token_num = self.speculative_config.num_speculative_tokens
             assert spec_token_num > 0
             self.decode_token_per_req = 1 + spec_token_num
-            if get_pp_group().is_last_rank:
+            if get_pp_group().is_last_rank or (
+                self._edge_cloud_enabled
+                and self.speculative_config.method == "mtp"
+            ):
                 self.drafter = self._get_drafter()
                 if self.speculative_config.method == "eagle3":
                     assert isinstance(self.drafter, AscendEagleProposer)

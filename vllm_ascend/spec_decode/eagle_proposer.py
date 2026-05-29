@@ -904,6 +904,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             and getattr(self.runner, "_edge_cloud_enabled", False)
         ):
             ret_hidden_states = self._run_mtp_edge_cloud(**model_kwargs)
+            if self.runner.edge_cloud_cfg.role == "cloud":
+                # Cloud has already run the decoder layers and sent hidden
+                # states back to edge.  Logits computation and token sampling
+                # happen exclusively on the edge side.
+                return torch.empty(0, dtype=torch.int64, device=self.device)
         else:
             ret_hidden_states = self.model(**model_kwargs)
 
@@ -1072,6 +1077,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # generated in the first pass.
                 model_kwargs["spec_step_idx"] = draft_step + 1
                 ret_hidden_states = self._run_mtp_edge_cloud(**model_kwargs)
+                if self.runner.edge_cloud_cfg.role == "cloud":
+                    # Cloud has already sent hidden states back to edge;
+                    # logits are computed on the edge side.
+                    continue
             else:
                 ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():

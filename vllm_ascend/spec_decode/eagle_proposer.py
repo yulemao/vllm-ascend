@@ -1880,6 +1880,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self,
         positions: torch.Tensor | None,
         num_tokens: int,
+        spec_step_idx: int = 0,
     ) -> Any:
         """Build attention metadata for the MTP decoder layer on the cloud.
 
@@ -1938,7 +1939,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if num_tokens > valid_tokens:
             slot_mapping[valid_tokens:] = -1
 
-        seq_lens_cpu = runner.optimistic_seq_lens_cpu[:num_reqs].clone()
+        # seq_lens must advance with each draft step so the MTP decoder
+        # layer on the cloud accesses the correct KV cache slot.  Without
+        # this adjustment all steps reuse the same seq_len, causing KV
+        # overwrites and degrading draft acceptance as generation grows.
+        seq_lens_cpu = runner.optimistic_seq_lens_cpu[:num_reqs].clone() + spec_step_idx
         seq_lens = seq_lens_cpu.to(device, non_blocking=True)
         query_start_loc_np = (
             np.arange(num_reqs + 1, dtype=np.int32) * step_stride
@@ -2034,9 +2039,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             # Build proper attention metadata so the MTP decoder layer on
             # the cloud can access its KV cache rather than zero-filling.
+            spec_step_idx = model_kwargs.get("spec_step_idx", 0)
             attn_metadata = self._build_cloud_mtp_attn_metadata(
                 positions=positions,
                 num_tokens=num_tokens,
+                spec_step_idx=spec_step_idx,
             )
             with set_ascend_forward_context(
                 attn_metadata=attn_metadata,

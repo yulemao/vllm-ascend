@@ -2514,7 +2514,14 @@ class NPUModelRunner(GPUModelRunner):
 
             # Run cloud segment (all MTP decoder layers are on cloud)
             segment = self._edge_cloud_mtp_segments["c"]
-            output = segment(**model_kwargs)
+            num_tokens = positions.shape[0] if positions is not None else 0
+            with set_ascend_forward_context(
+                attn_metadata=None,
+                vllm_config=self.vllm_config,
+                num_tokens=num_tokens,
+                is_draft_model=True,
+            ):
+                output = segment(**model_kwargs)
             assert isinstance(output, IntermediateTensors)
 
             # Send back to edge

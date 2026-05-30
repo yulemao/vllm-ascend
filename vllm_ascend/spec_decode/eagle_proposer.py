@@ -1916,7 +1916,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 model_kwargs.pop(key, None)
             if "spec_step_idx" in tensor_dict:
                 model_kwargs["spec_step_idx"] = tensor_dict["spec_step_idx"].item()
-            output = segments["c"](**model_kwargs)
+            positions = model_kwargs.get("positions", None)
+            num_tokens = positions.shape[0] if positions is not None else 0
+            with set_ascend_forward_context(
+                attn_metadata=None,
+                vllm_config=self.vllm_config,
+                num_tokens=num_tokens,
+                is_draft_model=True,
+            ):
+                output = segments["c"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)
 
             if get_pp_group().world_size == 2:

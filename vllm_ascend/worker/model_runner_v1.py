@@ -2484,6 +2484,8 @@ class NPUModelRunner(GPUModelRunner):
         return async_output
 
     def _run_mtp_cloud_segment(self) -> None:
+        from vllm_ascend.attention.attention_v1 import AscendAttentionState
+        from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
         from vllm_ascend.distributed.parallel_state import edge_cloud_broadcast_recv
 
         # The edge side calls the MTP model for each speculative step
@@ -2494,29 +2496,174 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config else 1
         )
 
-        for _ in range(num_steps):
-            # Receive intermediate from edge (including positions and spec_step_idx)
-            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+        # Get draft attention metadata builder from the drafter — the cloud
+        # side owns the real MTP decoder layers and their KV cache, so the
+        # attention metadata must be built locally to ensure the Ascend
+        # attention backend does not fall into the attn_metadata-is-None
+        # path that fills the output with zeros.
+        drafter = getattr(self, "drafter", None)
+        draft_attn_groups = drafter.draft_attn_groups if drafter else []
+        if not draft_attn_groups:
+            logger.warning(
+                "[EdgeCloud] No MTP draft attention groups on cloud; "
+                "draft acceptance rate will be degraded."
+            )
+            # Fall back to original broken path so the system does not crash.
+            for _ in range(num_steps):
+                tensor_dict, comm_handles, comm_postprocess = (
+                    edge_cloud_broadcast_recv()
+                )
+                for handle in comm_handles:
+                    handle.wait()
+                for postprocess in comm_postprocess:
+                    postprocess()
+                intermediate = IntermediateTensors(tensor_dict)
+                positions = intermediate.tensors.get("positions", None)
+                model_kwargs = {
+                    "intermediate_tensors": intermediate,
+                    "positions": positions,
+                }
+                if "spec_step_idx" in tensor_dict:
+                    model_kwargs["spec_step_idx"] = tensor_dict[
+                        "spec_step_idx"
+                    ].item()
+                segment = self._edge_cloud_mtp_segments["c"]
+                num_tokens = (
+                    positions.shape[0] if positions is not None else 0
+                )
+                with set_ascend_forward_context(
+                    attn_metadata=None,
+                    vllm_config=self.vllm_config,
+                    num_tokens=num_tokens,
+                    is_draft_model=True,
+                ):
+                    output = segment(**model_kwargs)
+                if get_pp_group().world_size == 2:
+                    send_work = get_pp_group().isend_tensor_dict(
+                        {
+                            k: v.contiguous()
+                            if isinstance(v, torch.Tensor)
+                            else v
+                            for k, v in output.items()
+                        }
+                    )
+                    for handle in send_work:
+                        handle.wait()
+            return
+
+        builder = draft_attn_groups[0].get_metadata_builder()
+        block_size = draft_attn_groups[0].kv_cache_spec.block_size
+        device = self.device
+        num_reqs = self.input_batch.num_reqs
+        block_table_tensor = self.input_batch.block_table[0].get_device_tensor()[
+            :num_reqs
+        ]
+        max_model_len = self.vllm_config.model_config.max_model_len
+
+        # Track per-request sequence lengths across draft steps.  The edge
+        # sends positions that correspond to the main model's last token
+        # position; each MTP draft step advances the sequence by one.
+        seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs].clone()
+
+        for step in range(num_steps):
+            tensor_dict, comm_handles, comm_postprocess = (
+                edge_cloud_broadcast_recv()
+            )
             for handle in comm_handles:
                 handle.wait()
             for postprocess in comm_postprocess:
                 postprocess()
             intermediate = IntermediateTensors(tensor_dict)
 
-            # Build kwargs for cloud segment
             positions = intermediate.tensors.get("positions", None)
+            num_tokens = positions.shape[0] if positions is not None else 0
+
+            # --- Build attention metadata so the MTP decoder layer can
+            #     correctly read/write the KV cache on the cloud side. ---
+
+            # In decode-mode MTP each request occupies
+            # (num_spec_tokens + 1) uniformly-sized rows; extra padding
+            # beyond that should produce PADDING_SLOT_ID.
+            step_stride = (
+                self.speculative_config.num_speculative_tokens + 1
+                if self.speculative_config else 1
+            )
+            valid_tokens = num_reqs * step_stride
+
+            # Map each token to its owning request.
+            token_idx = torch.arange(num_tokens, dtype=torch.int64, device=device)
+            req_idx = torch.clamp(
+                token_idx // step_stride, 0, num_reqs - 1
+            )
+
+            # Compute slot_mapping from the block table and positions.
+            max_blocks = block_table_tensor.shape[1]
+            block_nums = torch.clamp(
+                positions // block_size, 0, max_blocks - 1
+            )
+            block_ids = block_table_tensor[req_idx, block_nums]
+            slot_mapping = (
+                block_ids * block_size + (positions % block_size)
+            )
+            exceeds = positions >= max_model_len
+            slot_mapping[exceeds] = -1  # PADDING_SLOT_ID
+            # Mask any tokens beyond the valid per-request stride.
+            if num_tokens > valid_tokens:
+                slot_mapping[valid_tokens:] = -1
+
+            seq_lens = seq_lens_cpu.to(device, non_blocking=True)
+
+            # Query start locations reflect the padded batch structure:
+            # each request occupies step_stride slots, matching the layout
+            # used by the target model's attention metadata.
+            query_start_loc_np = (
+                np.arange(num_reqs + 1, dtype=np.int32) * step_stride
+            )
+            if num_tokens != valid_tokens:
+                query_start_loc_np[-1] = num_tokens
+            query_start_loc_cpu = torch.from_numpy(query_start_loc_np)
+            query_start_loc = query_start_loc_cpu.to(
+                device, non_blocking=True
+            )
+
+            common_attn_metadata = AscendCommonAttentionMetadata(
+                query_start_loc=query_start_loc,
+                query_start_loc_cpu=query_start_loc_cpu,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                _seq_lens_cpu=seq_lens_cpu,
+                num_reqs=num_reqs,
+                num_actual_tokens=num_tokens,
+                max_query_len=1,
+                max_seq_len=0,
+                block_table_tensor=block_table_tensor,
+                slot_mapping=slot_mapping,
+                positions=positions,
+                decode_token_per_req=1,
+                attn_state=AscendAttentionState.SpecDecoding,
+            )
+            common_attn_metadata.num_input_tokens = num_tokens
+
+            # Build per-layer attention metadata through the same builder
+            # path used by the Eagle proposer on the non-edge-cloud path.
+            attn_metadata = builder.build(
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+                model_instance=self.model,
+            )
+
             model_kwargs = {
                 "intermediate_tensors": intermediate,
                 "positions": positions,
             }
             if "spec_step_idx" in tensor_dict:
-                model_kwargs["spec_step_idx"] = tensor_dict["spec_step_idx"].item()
+                model_kwargs["spec_step_idx"] = tensor_dict[
+                    "spec_step_idx"
+                ].item()
 
-            # Run cloud segment (all MTP decoder layers are on cloud)
             segment = self._edge_cloud_mtp_segments["c"]
-            num_tokens = positions.shape[0] if positions is not None else 0
             with set_ascend_forward_context(
-                attn_metadata=None,
+                attn_metadata=attn_metadata,
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
                 is_draft_model=True,
@@ -2524,11 +2671,17 @@ class NPUModelRunner(GPUModelRunner):
                 output = segment(**model_kwargs)
             assert isinstance(output, IntermediateTensors)
 
-            # Send back to edge
+            # Advance sequence lengths for the next draft step.
+            seq_lens_cpu = seq_lens_cpu + 1
+
             if get_pp_group().world_size == 2:
                 send_work = get_pp_group().isend_tensor_dict(
-                    {k: v.contiguous() if isinstance(v, torch.Tensor) else v
-                     for k, v in output.items()}
+                    {
+                        k: v.contiguous()
+                        if isinstance(v, torch.Tensor)
+                        else v
+                        for k, v in output.items()
+                    }
                 )
                 for handle in send_work:
                     handle.wait()

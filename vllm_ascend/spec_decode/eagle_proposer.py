@@ -1876,6 +1876,99 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             draft_attn_metadatas=draft_attn_metadatas,
         )
 
+    def _build_cloud_mtp_attn_metadata(
+        self,
+        positions: torch.Tensor | None,
+        num_tokens: int,
+    ) -> Any:
+        """Build attention metadata for the MTP decoder layer on the cloud.
+
+        The cloud owns the MTP decoder layers and their KV cache, so
+        attention metadata must be provided; otherwise the Ascend
+        attention backend falls into ``attn_metadata is None`` and fills
+        the output with zeros, eliminating the attention contribution.
+
+        This helper mirrors the metadata construction that
+        ``_propose`` does on the non-edge-cloud path, adapted to
+        the information available on the cloud side.
+        """
+        from vllm_ascend.attention.attention_v1 import AscendAttentionState
+        from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+
+        draft_attn_groups = self.draft_attn_groups
+        if not draft_attn_groups or positions is None:
+            return None
+
+        builder = draft_attn_groups[0].get_metadata_builder()
+        block_size = draft_attn_groups[0].kv_cache_spec.block_size
+        device = self.device
+        runner = self.runner
+        num_reqs = runner.input_batch.num_reqs
+        block_table_tensor = runner.input_batch.block_table[0].get_device_tensor()[
+            :num_reqs
+        ]
+        max_model_len = self.vllm_config.model_config.max_model_len
+
+        # Map tokens to requests.  In decode-mode MTP each request has
+        # (num_spec_tokens + 1) uniformly-sized rows; extra padding beyond
+        # that should produce PADDING_SLOT_ID.
+        step_stride = (
+            self.speculative_config.num_speculative_tokens + 1
+            if self.speculative_config else 1
+        )
+        valid_tokens = num_reqs * step_stride
+        token_idx = torch.arange(num_tokens, dtype=torch.int64, device=device)
+        req_idx = torch.clamp(
+            token_idx // step_stride, 0, num_reqs - 1
+        )
+
+        max_blocks = block_table_tensor.shape[1]
+        block_nums = torch.clamp(
+            positions // block_size, 0, max_blocks - 1
+        )
+        block_ids = block_table_tensor[req_idx, block_nums]
+        slot_mapping = (
+            block_ids * block_size + (positions % block_size)
+        )
+        exceeds = positions >= max_model_len
+        slot_mapping[exceeds] = -1  # PADDING_SLOT_ID
+        if num_tokens > valid_tokens:
+            slot_mapping[valid_tokens:] = -1
+
+        seq_lens_cpu = runner.optimistic_seq_lens_cpu[:num_reqs].clone()
+        seq_lens = seq_lens_cpu.to(device, non_blocking=True)
+        query_start_loc_np = (
+            np.arange(num_reqs + 1, dtype=np.int32) * step_stride
+        )
+        if num_tokens != valid_tokens:
+            query_start_loc_np[-1] = num_tokens
+        query_start_loc_cpu = torch.from_numpy(query_start_loc_np)
+        query_start_loc = query_start_loc_cpu.to(device, non_blocking=True)
+
+        common_attn_metadata = AscendCommonAttentionMetadata(
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            _seq_lens_cpu=seq_lens_cpu,
+            num_reqs=num_reqs,
+            num_actual_tokens=num_tokens,
+            max_query_len=1,
+            max_seq_len=0,
+            block_table_tensor=block_table_tensor,
+            slot_mapping=slot_mapping,
+            positions=positions,
+            decode_token_per_req=1,
+            attn_state=AscendAttentionState.SpecDecoding,
+        )
+        common_attn_metadata.num_input_tokens = num_tokens
+
+        return builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+            model_instance=runner.get_model(),
+        )
+
     def _run_mtp_edge_cloud(self, **model_kwargs) -> torch.Tensor:
         segments = self.runner._edge_cloud_mtp_segments
         role = self.runner.edge_cloud_cfg.role
@@ -1934,8 +2027,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 model_kwargs["positions"] = tensor_dict["positions"]
             positions = model_kwargs.get("positions", None)
             num_tokens = positions.shape[0] if positions is not None else 0
+
+            # Build proper attention metadata so the MTP decoder layer on
+            # the cloud can access its KV cache rather than zero-filling.
+            attn_metadata = self._build_cloud_mtp_attn_metadata(
+                positions=positions,
+                num_tokens=num_tokens,
+            )
             with set_ascend_forward_context(
-                attn_metadata=None,
+                attn_metadata=attn_metadata,
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
                 is_draft_model=True,

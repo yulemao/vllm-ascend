@@ -904,6 +904,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if self.method == "mtp":
                     model_kwargs["positions"] = model_positions
 
+            if self.method == "mtp":
+                model_kwargs["mtp_num_reqs"] = batch_size
+
         if (
             self.method == "mtp"
             and self.runner is not None
@@ -1096,6 +1099,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # draft_step + 1 because the first draft token was already
                 # generated in the first pass.
                 model_kwargs["spec_step_idx"] = draft_step + 1
+                model_kwargs["mtp_num_reqs"] = batch_size
                 ret_hidden_states = self._run_mtp_edge_cloud(**model_kwargs)
                 if self.runner.edge_cloud_cfg.role == "cloud":
                     # Cloud has already sent hidden states back to edge;
@@ -1885,12 +1889,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             output = segments["a"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)
 
-            # Include positions and spec_step_idx so cloud can run the correct
-            # decoder layer.
+            # Include positions, spec_step_idx, and num_reqs so cloud can
+            # build correct attention metadata for the MTP decoder layer.
             output["positions"] = model_kwargs["positions"]
             if "spec_step_idx" in model_kwargs:
                 output["spec_step_idx"] = torch.tensor(
                     model_kwargs["spec_step_idx"], dtype=torch.int64, device="cpu"
+                )
+            if "mtp_num_reqs" in model_kwargs:
+                output["mtp_num_reqs"] = torch.tensor(
+                    model_kwargs["mtp_num_reqs"], dtype=torch.int64, device="cpu"
                 )
             if get_pp_group().world_size == 2:
                 send_work = get_pp_group().isend_tensor_dict(
@@ -1910,7 +1918,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             # Edge last segment: norm
             model_kwargs["intermediate_tensors"] = intermediate
-            for key in ("input_ids", "inputs_embeds", "hidden_states", "spec_step_idx"):
+            for key in ("input_ids", "inputs_embeds", "hidden_states", "spec_step_idx", "mtp_num_reqs"):
                 model_kwargs.pop(key, None)
             final_output = segments["e"](**model_kwargs)
             return final_output
@@ -1934,11 +1942,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 model_kwargs["positions"] = tensor_dict["positions"]
             positions = model_kwargs.get("positions", None)
             num_tokens = positions.shape[0] if positions is not None else 0
+            num_reqs = tensor_dict.get("mtp_num_reqs", num_tokens)
+            if isinstance(num_reqs, torch.Tensor):
+                num_reqs = num_reqs.item()
+            spec_step_idx = model_kwargs.get("spec_step_idx", 0)
+            attn_metadata = self.runner._build_mtp_cloud_attn_metadata(
+                num_tokens, positions, num_reqs, spec_step_idx
+            )
             with set_ascend_forward_context(
-                attn_metadata=None,
+                attn_metadata=attn_metadata,
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
                 is_draft_model=True,
+                draft_attn_metadatas=[attn_metadata],
             ):
                 output = segments["c"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)

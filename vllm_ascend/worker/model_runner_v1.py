@@ -112,7 +112,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState, AscendMetadata
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
 
@@ -2483,6 +2483,49 @@ class NPUModelRunner(GPUModelRunner):
         )
         return async_output
 
+    def _build_mtp_cloud_attn_metadata(
+        self,
+        num_tokens: int,
+        positions: torch.Tensor,
+        num_reqs: int,
+        spec_step_idx: int = 0,
+    ):
+        """Build minimal AscendMetadata for MTP decoder layer on cloud.
+
+        The cloud runs MTP decoder layers without access to the edge-side KV
+        cache.  Each sequence uses its own block in the cloud-local MTP KV
+        cache so that draft-token K/V is persisted across speculative steps.
+        """
+        device = positions.device
+        block_size = self.vllm_config.cache_config.block_size
+
+        # 1 token per sequence for standard MTP decode
+        query_start_loc = torch.arange(0, num_reqs + 1, dtype=torch.int32, device=device)
+        seq_lens = positions.to(device) + 1
+        seq_lens_cpu = seq_lens.cpu()
+
+        # Each sequence gets its own block; unused columns are filled with -1
+        max_blocks_per_seq = 8
+        block_tables = torch.full(
+            (num_reqs, max_blocks_per_seq), -1, dtype=torch.int32, device=device
+        )
+        block_tables[:, 0] = torch.arange(num_reqs, dtype=torch.int32, device=device)
+        slot_mapping = block_tables[:, 0] * block_size + spec_step_idx
+
+        metadata = AscendMetadata()
+        metadata.num_actual_tokens = num_tokens
+        metadata.num_decode_tokens = num_tokens
+        metadata.num_decodes = num_reqs
+        metadata.query_start_loc = query_start_loc
+        metadata.seq_lens = seq_lens
+        metadata.seq_lens_cpu = seq_lens_cpu
+        metadata.max_query_len = 1
+        metadata.block_tables = block_tables
+        metadata.slot_mapping = slot_mapping
+        metadata.attn_state = AscendAttentionState.DecodeOnly
+        metadata.causal = True
+        return metadata
+
     def _run_mtp_cloud_segment(self) -> None:
         from vllm_ascend.distributed.parallel_state import edge_cloud_broadcast_recv
 
@@ -2494,7 +2537,7 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config else 1
         )
 
-        for _ in range(num_steps):
+        for step_idx in range(num_steps):
             # Receive intermediate from edge (including positions and spec_step_idx)
             tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
             for handle in comm_handles:
@@ -2509,17 +2552,26 @@ class NPUModelRunner(GPUModelRunner):
                 "intermediate_tensors": intermediate,
                 "positions": positions,
             }
+            spec_step_idx = 0
             if "spec_step_idx" in tensor_dict:
-                model_kwargs["spec_step_idx"] = tensor_dict["spec_step_idx"].item()
+                spec_step_idx = tensor_dict["spec_step_idx"].item()
+                model_kwargs["spec_step_idx"] = spec_step_idx
 
             # Run cloud segment (all MTP decoder layers are on cloud)
             segment = self._edge_cloud_mtp_segments["c"]
             num_tokens = positions.shape[0] if positions is not None else 0
+            num_reqs = tensor_dict.get("mtp_num_reqs", num_tokens)
+            if isinstance(num_reqs, torch.Tensor):
+                num_reqs = num_reqs.item()
+            attn_metadata = self._build_mtp_cloud_attn_metadata(
+                num_tokens, positions, num_reqs, spec_step_idx
+            )
             with set_ascend_forward_context(
-                attn_metadata=None,
+                attn_metadata=attn_metadata,
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
                 is_draft_model=True,
+                draft_attn_metadatas=[attn_metadata],
             ):
                 output = segment(**model_kwargs)
             assert isinstance(output, IntermediateTensors)

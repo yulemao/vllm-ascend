@@ -401,7 +401,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 pin_memory=self.runner.pin_memory,
             )
 
-        if aclgraph_runtime_mode == CUDAGraphMode.FULL and len(self.runner.attn_groups) > 0:
+        if aclgraph_runtime_mode == CUDAGraphMode.FULL and len(self.runner.attn_groups) > 0 and len(self.draft_attn_groups) > 0:
             num_computed_tokens_cpu = self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
 
             # num_reqs is already the padded version
@@ -704,87 +704,110 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         common_attn_metadata.query_start_loc = self.query_start_loc_group[0][: num_reqs_padded + 1]
 
         common_attn_metadata.num_input_tokens = num_input_tokens
-        # FIXME(woosuk): The below two ops cause synchronization. Optimize.
-        assert len(self.draft_attn_groups) > 0
-        builder = self.draft_attn_groups[0].get_metadata_builder()
-        attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model())
+        if self.draft_attn_groups:
+            # FIXME(woosuk): The below two ops cause synchronization. Optimize.
+            assert len(self.draft_attn_groups) > 0
+            builder = self.draft_attn_groups[0].get_metadata_builder()
+            attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model())
 
-        if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
-            attn_metadata.attn_mask = None
+            if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
+                attn_metadata.attn_mask = None
 
-        if self.uses_mrope:
-            used_update_positions = self.mrope_positions[:, token_indices_to_sample]
-        else:
-            used_update_positions = self.positions[token_indices_to_sample]
-        per_layer_attn_metadata = dict()
-        # The first step of speculative.
-        for layer_name in self.attn_layer_names:
-            per_layer_attn_metadata[layer_name] = attn_metadata
-        multi_steps_attn_metadata = [per_layer_attn_metadata]
+            if self.uses_mrope:
+                used_update_positions = self.mrope_positions[:, token_indices_to_sample]
+            else:
+                used_update_positions = self.positions[token_indices_to_sample]
+            per_layer_attn_metadata = dict()
+            # The first step of speculative.
+            for layer_name in self.attn_layer_names:
+                per_layer_attn_metadata[layer_name] = attn_metadata
+            multi_steps_attn_metadata = [per_layer_attn_metadata]
 
-        # Copy the old attn_metadata and update
-        attn_metadata_i = per_layer_attn_metadata[self.attn_layer_names[0]]
+            # Copy the old attn_metadata and update
+            attn_metadata_i = per_layer_attn_metadata[self.attn_layer_names[0]]
 
-        # Clone the data so that when calculating the data at position 2 and position 3
-        # in the merged graph, it does not affect position 1
-        # FIXME(lilinsiman)
-        if self.pcp_size * self.dcp_size > 1 and self.use_cuda_graph:
-            assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
-            self.block_table_tensor_clone[: common_attn_metadata.block_table_tensor.shape[0]] = (
-                common_attn_metadata.block_table_tensor
-            )
-            common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[
-                : common_attn_metadata.block_table_tensor.shape[0]
-            ]
-        else:
-            common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor.clone()
-
-        if self.pcp_size * self.dcp_size > 1:
-            if self.num_speculative_tokens > 1 and not attn_metadata_i.num_prefills:
-                # For pcp/dcp, tokens are split across different cp ranks,
-                # so we can not simply update slot_mapping by += 1.
-                # Instead, we pre-allocate mtp slot_mapping in model_runner
-                # (_generate_pcp_mtp_input), and use updated slot_indices
-                # to get corresponding slot_mapping in each step.
-                num_reject_tokens = (
-                    torch.tensor(self.runner.pcp_manager.cu_num_tokens_pcp_full, dtype=torch.int32).to(self.device)
-                    - ori_token_indices_to_sample
-                    - 1
+            # Clone the data so that when calculating the data at position 2 and position 3
+            # in the merged graph, it does not affect position 1
+            # FIXME(lilinsiman)
+            if self.pcp_size * self.dcp_size > 1 and self.use_cuda_graph:
+                assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
+                self.block_table_tensor_clone[: common_attn_metadata.block_table_tensor.shape[0]] = (
+                    common_attn_metadata.block_table_tensor
                 )
-                num_accept_tokens = query_lens_d.to(self.device) - num_reject_tokens
-                ori_seq_len = attn_metadata_i.seq_lens_cpu[:batch_size].clone()
-                mtp_slot_mapping = self.runner.pcp_manager.mtp_slot_pad
-
-                # slot_mapping index base offset:
-                # scheduled tokens + pre-allocated mtp tokens + accepted tokens
-                slot_idx_base = (
-                    torch.cat(
-                        [
-                            torch.tensor([0], dtype=torch.int32, device=self.device),
-                            (torch.cumsum(query_lens_d, dim=0)[:-1] * self.pcp_size).to(self.device),
-                        ]
-                    )
-                    + torch.arange(num_decode_reqs, device=self.device)
-                    * (self.num_speculative_tokens - 1)
-                    * self.pcp_size
-                    + (num_accept_tokens - 1) * self.pcp_size
-                )
-                slot_indices_list = []
-                for req_id in range(num_decode_reqs):
-                    slot_indices_list.append(
-                        torch.arange(slot_idx_base[req_id], slot_idx_base[req_id] + self.pcp_size, device=self.device)
-                    )
-                slot_indices = torch.cat(slot_indices_list, dim=0)
-
-                # fold block_table (restore it to original size before flattened)
-                block_indices = torch.cat(
-                    [torch.tensor([0], dtype=torch.int32), torch.cumsum(query_lens_d, dim=0)[:-1]]
-                )
-                common_attn_metadata.block_table_tensor[:batch_size] = common_attn_metadata.block_table_tensor[
-                    block_indices
+                common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[
+                    : common_attn_metadata.block_table_tensor.shape[0]
                 ]
-                common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor[:batch_size]
+            else:
+                common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor.clone()
 
+            if self.pcp_size * self.dcp_size > 1:
+                if self.num_speculative_tokens > 1 and not attn_metadata_i.num_prefills:
+                    # For pcp/dcp, tokens are split across different cp ranks,
+                    # so we can not simply update slot_mapping by += 1.
+                    # Instead, we pre-allocate mtp slot_mapping in model_runner
+                    # (_generate_pcp_mtp_input), and use updated slot_indices
+                    # to get corresponding slot_mapping in each step.
+                    num_reject_tokens = (
+                        torch.tensor(self.runner.pcp_manager.cu_num_tokens_pcp_full, dtype=torch.int32).to(self.device)
+                        - ori_token_indices_to_sample
+                        - 1
+                    )
+                    num_accept_tokens = query_lens_d.to(self.device) - num_reject_tokens
+                    ori_seq_len = attn_metadata_i.seq_lens_cpu[:batch_size].clone()
+                    mtp_slot_mapping = self.runner.pcp_manager.mtp_slot_pad
+
+                    # slot_mapping index base offset:
+                    # scheduled tokens + pre-allocated mtp tokens + accepted tokens
+                    slot_idx_base = (
+                        torch.cat(
+                            [
+                                torch.tensor([0], dtype=torch.int32, device=self.device),
+                                (torch.cumsum(query_lens_d, dim=0)[:-1] * self.pcp_size).to(self.device),
+                            ]
+                        )
+                        + torch.arange(num_decode_reqs, device=self.device)
+                        * (self.num_speculative_tokens - 1)
+                        * self.pcp_size
+                        + (num_accept_tokens - 1) * self.pcp_size
+                    )
+                    slot_indices_list = []
+                    for req_id in range(num_decode_reqs):
+                        slot_indices_list.append(
+                            torch.arange(slot_idx_base[req_id], slot_idx_base[req_id] + self.pcp_size, device=self.device)
+                        )
+                    slot_indices = torch.cat(slot_indices_list, dim=0)
+
+                    # fold block_table (restore it to original size before flattened)
+                    block_indices = torch.cat(
+                        [torch.tensor([0], dtype=torch.int32), torch.cumsum(query_lens_d, dim=0)[:-1]]
+                    )
+                    common_attn_metadata.block_table_tensor[:batch_size] = common_attn_metadata.block_table_tensor[
+                        block_indices
+                    ]
+                    common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor[:batch_size]
+
+                    # Copy the old attn_metadata and update
+                    if not self.parallel_drafting:
+                        for draft_step in range(1, self.num_speculative_tokens):
+                            per_layer_attn_metadata = dict()
+                            for attn_group in self.draft_attn_groups:
+                                common_attn_metadata, attn_metadata = self.attn_update_stack_num_spec_norm(
+                                    draft_step,
+                                    attn_metadata,
+                                    common_attn_metadata,
+                                    batch_size,
+                                    num_input_tokens,
+                                    used_update_positions,
+                                    aclgraph_runtime_mode,
+                                    ori_seq_len,
+                                    slot_indices,
+                                    mtp_slot_mapping,
+                                    attn_group=attn_group,
+                                )
+                                for layer_name in self.attn_layer_names:
+                                    per_layer_attn_metadata[layer_name] = attn_metadata
+                            multi_steps_attn_metadata.append(per_layer_attn_metadata)
+            else:
                 # Copy the old attn_metadata and update
                 if not self.parallel_drafting:
                     for draft_step in range(1, self.num_speculative_tokens):
@@ -798,39 +821,22 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                                 num_input_tokens,
                                 used_update_positions,
                                 aclgraph_runtime_mode,
-                                ori_seq_len,
-                                slot_indices,
-                                mtp_slot_mapping,
                                 attn_group=attn_group,
                             )
                             for layer_name in self.attn_layer_names:
                                 per_layer_attn_metadata[layer_name] = attn_metadata
                         multi_steps_attn_metadata.append(per_layer_attn_metadata)
         else:
-            # Copy the old attn_metadata and update
-            if not self.parallel_drafting:
-                for draft_step in range(1, self.num_speculative_tokens):
-                    per_layer_attn_metadata = dict()
-                    for attn_group in self.draft_attn_groups:
-                        common_attn_metadata, attn_metadata = self.attn_update_stack_num_spec_norm(
-                            draft_step,
-                            attn_metadata,
-                            common_attn_metadata,
-                            batch_size,
-                            num_input_tokens,
-                            used_update_positions,
-                            aclgraph_runtime_mode,
-                            attn_group=attn_group,
-                        )
-                        for layer_name in self.attn_layer_names:
-                            per_layer_attn_metadata[layer_name] = attn_metadata
-                    multi_steps_attn_metadata.append(per_layer_attn_metadata)
+            # Edge-cloud MTP edge: draft attention layers are on the cloud
+            # side (PPMissingLayer on edge), so no attention metadata is needed.
+            multi_steps_attn_metadata = []
+            attn_metadata_i = None
 
         token_indices_to_sample_len = token_indices_to_sample.shape[0]
         self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
 
         with set_ascend_forward_context(
-            multi_steps_attn_metadata[0],
+            multi_steps_attn_metadata[0] if multi_steps_attn_metadata else None,
             self.vllm_config,
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
@@ -853,7 +859,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 "inputs_embeds": inputs_embeds,
                 "multi_steps_attn_metadata": multi_steps_attn_metadata,
                 "num_tokens": num_tokens,
-                "is_prefill": attn_metadata_i.num_prefills,
+                "is_prefill": attn_metadata_i.num_prefills if attn_metadata_i is not None else 0,
             }
             run_draft = partial(self._runnable, **model_inputs)
 
@@ -1842,6 +1848,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
     # update full-graph params for one spec token
     def _update_full_graph_params(self, forward_context, num_tokens, draft_attn_metadatas=None):
+        if not self.draft_attn_groups:
+            return
         assert len(self.draft_attn_groups) > 0
         attn_backend = self.draft_attn_groups[0].backend
         update_full_graph_params(

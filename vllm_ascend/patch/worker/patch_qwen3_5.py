@@ -19,7 +19,6 @@
 
 import torch
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.forward_context import is_forward_context_available
 from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
@@ -89,10 +88,7 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        flash_comm_v1_enabled = (
-            is_forward_context_available() and _EXTRA_CTX.flash_comm_v1_enabled
-        )
-        if self.layer_idx == 0 and flash_comm_v1_enabled:
+        if self.layer_idx == 0 and _EXTRA_CTX.flash_comm_v1_enabled:
             tp_size = get_tensor_model_parallel_world_size()
             n_out = (hidden_states.shape[0] + tp_size - 1) // tp_size
             hidden_dim = hidden_states.shape[-1]

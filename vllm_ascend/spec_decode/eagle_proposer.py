@@ -1969,7 +1969,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         return builder.build(
             common_prefix_len=0,
             common_attn_metadata=common_attn_metadata,
-            model_instance=runner.get_model(),
         )
 
     def _run_mtp_edge_cloud(self, **model_kwargs) -> torch.Tensor:

@@ -2659,7 +2659,6 @@ class NPUModelRunner(GPUModelRunner):
             attn_metadata = builder.build(
                 common_prefix_len=0,
                 common_attn_metadata=common_attn_metadata,
-                model_instance=self.model,
             )
 
             model_kwargs = {

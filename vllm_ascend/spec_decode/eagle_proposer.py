@@ -1922,15 +1922,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             token_idx // step_stride, 0, num_reqs - 1
         )
 
+        # For mRoPE (shape [3, N]) use the first row — all three rows
+        # encode the same token position at different rotary frequencies.
+        pos_1d = positions[0] if positions.ndim == 2 else positions
         max_blocks = block_table_tensor.shape[1]
         block_nums = torch.clamp(
-            positions // block_size, 0, max_blocks - 1
+            pos_1d // block_size, 0, max_blocks - 1
         )
         block_ids = block_table_tensor[req_idx, block_nums]
         slot_mapping = (
-            block_ids * block_size + (positions % block_size)
+            block_ids * block_size + (pos_1d % block_size)
         )
-        exceeds = positions >= max_model_len
+        exceeds = pos_1d >= max_model_len
         slot_mapping[exceeds] = -1  # PADDING_SLOT_ID
         if num_tokens > valid_tokens:
             slot_mapping[valid_tokens:] = -1
@@ -2026,7 +2029,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if "positions" in tensor_dict:
                 model_kwargs["positions"] = tensor_dict["positions"]
             positions = model_kwargs.get("positions", None)
-            num_tokens = positions.shape[0] if positions is not None else 0
+            # num_tokens is the sequence-length axis: shape[-1] works for
+            # both standard RoPE (N,) and mRoPE (3, N).
+            num_tokens = positions.shape[-1] if positions is not None else 0
 
             # Build proper attention metadata so the MTP decoder layer on
             # the cloud can access its KV cache rather than zero-filling.

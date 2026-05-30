@@ -2576,7 +2576,14 @@ class NPUModelRunner(GPUModelRunner):
             intermediate = IntermediateTensors(tensor_dict)
 
             positions = intermediate.tensors.get("positions", None)
-            num_tokens = positions.shape[0] if positions is not None else 0
+            if positions is None:
+                # Should not happen, but guard against it.
+                raise RuntimeError(
+                    "[EdgeCloud] Cloud did not receive positions from edge"
+                )
+            # num_tokens is the sequence-length axis.  For standard RoPE
+            # positions is 1-D (num_tokens,); for mRoPE it is (3, num_tokens).
+            num_tokens = positions.shape[-1]
 
             # --- Build attention metadata so the MTP decoder layer can
             #     correctly read/write the KV cache on the cloud side. ---
@@ -2597,15 +2604,18 @@ class NPUModelRunner(GPUModelRunner):
             )
 
             # Compute slot_mapping from the block table and positions.
+            # For mRoPE (shape [3, N]) use the first row — all three rows
+            # encode the same token position at different rotary frequencies.
+            pos_1d = positions[0] if positions.ndim == 2 else positions
             max_blocks = block_table_tensor.shape[1]
             block_nums = torch.clamp(
-                positions // block_size, 0, max_blocks - 1
+                pos_1d // block_size, 0, max_blocks - 1
             )
             block_ids = block_table_tensor[req_idx, block_nums]
             slot_mapping = (
-                block_ids * block_size + (positions % block_size)
+                block_ids * block_size + (pos_1d % block_size)
             )
-            exceeds = positions >= max_model_len
+            exceeds = pos_1d >= max_model_len
             slot_mapping[exceeds] = -1  # PADDING_SLOT_ID
             # Mask any tokens beyond the valid per-request stride.
             if num_tokens > valid_tokens:

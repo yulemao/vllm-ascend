@@ -1955,12 +1955,40 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     and len(self.runner.input_batch.block_table.block_tables) > self.runner.drafter.kv_cache_gid
                 ):
                     draft_block_table = self.runner.input_batch.block_table[self.runner.drafter.kv_cache_gid]
-                    block_tables = draft_block_table.block_table.gpu[:num_tokens]
+                    block_tables_all = draft_block_table.block_table.gpu
                     block_size = draft_block_table.block_size
-                    positions_device = positions.to(block_tables.device)
-                    block_numbers = (positions_device // block_size).long()
+                    positions_device = positions.to(block_tables_all.device)
+
+                    # Clamp num_tokens to available rows in block_table to avoid
+                    # gather index row count mismatch (MTP may have num_tokens > num_reqs).
+                    num_available_rows = block_tables_all.shape[0]
+                    if num_tokens > num_available_rows:
+                        logger.warning(
+                            "num_tokens (%d) exceeds block_table rows (%d), "
+                            "truncating to available rows",
+                            num_tokens,
+                            num_available_rows,
+                        )
+                    effective_num_tokens = min(num_tokens, num_available_rows)
+                    block_tables = block_tables_all[:effective_num_tokens]
+
+                    # Clamp block_numbers to valid column range to avoid gather
+                    # index out of bounds (positions may exceed draft block_table).
+                    max_blocks = block_tables.shape[1]
+                    block_numbers = (positions_device[:effective_num_tokens] // block_size).long()
+                    block_numbers = block_numbers.clamp(0, max_blocks - 1)
                     block_ids = block_tables.gather(dim=1, index=block_numbers.view(-1, 1))
                     block_ids = block_ids.view(-1)
+
+                    # Pad block_ids back to original num_tokens if we truncated.
+                    if effective_num_tokens < num_tokens:
+                        pad = torch.zeros(
+                            num_tokens - effective_num_tokens,
+                            dtype=block_ids.dtype,
+                            device=block_ids.device,
+                        )
+                        block_ids = torch.cat([block_ids, pad])
+
                     slot_mapping = (block_ids * block_size + positions_device % block_size).to(torch.int32)
 
                 if slot_mapping is not None:

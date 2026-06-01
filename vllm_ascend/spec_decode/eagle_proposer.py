@@ -1977,7 +1977,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     max_blocks = block_tables.shape[1]
                     block_numbers = (positions_device[:effective_num_tokens] // block_size).long()
                     block_numbers = block_numbers.clamp(0, max_blocks - 1)
-                    block_ids = block_tables.gather(dim=1, index=block_numbers.view(-1, 1))
+                    block_ids = block_tables.gather(dim=1, index=block_numbers.unsqueeze(1))
                     block_ids = block_ids.view(-1)
 
                     # Pad block_ids back to original num_tokens if we truncated.

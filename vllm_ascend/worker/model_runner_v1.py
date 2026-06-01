@@ -2581,6 +2581,15 @@ class NPUModelRunner(GPUModelRunner):
                 raise RuntimeError(
                     "[EdgeCloud] Cloud did not receive positions from edge"
                 )
+            # Advance positions by the draft step so RoPE and slot_mapping
+            # match the sequence length progression, just like the non-edge-
+            # cloud path does via used_update_positions += 1.
+            spec_step_idx = (
+                tensor_dict["spec_step_idx"].item()
+                if "spec_step_idx" in tensor_dict
+                else 0
+            )
+            positions = positions + spec_step_idx
             # num_tokens is the sequence-length axis.  For standard RoPE
             # positions is 1-D (num_tokens,); for mRoPE it is (3, num_tokens).
             num_tokens = positions.shape[-1]
@@ -2637,7 +2646,7 @@ class NPUModelRunner(GPUModelRunner):
                 seq_lens_cpu=seq_lens_cpu,
                 _seq_lens_cpu=seq_lens_cpu,
                 num_reqs=num_reqs,
-                num_actual_tokens=num_tokens,
+                num_actual_tokens=valid_tokens,
                 max_query_len=1,
                 max_seq_len=0,
                 block_table_tensor=block_table_tensor,

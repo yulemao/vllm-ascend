@@ -1957,7 +1957,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             seq_lens_cpu=seq_lens_cpu,
             _seq_lens_cpu=seq_lens_cpu,
             num_reqs=num_reqs,
-            num_actual_tokens=num_tokens,
+            num_actual_tokens=valid_tokens,
             max_query_len=1,
             max_seq_len=0,
             block_table_tensor=block_table_tensor,
@@ -2030,13 +2030,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if "positions" in tensor_dict:
                 model_kwargs["positions"] = tensor_dict["positions"]
             positions = model_kwargs.get("positions", None)
+            spec_step_idx = model_kwargs.get("spec_step_idx", 0)
+            if positions is not None:
+                positions = positions + spec_step_idx
+                model_kwargs["positions"] = positions
             # num_tokens is the sequence-length axis: shape[-1] works for
             # both standard RoPE (N,) and mRoPE (3, N).
             num_tokens = positions.shape[-1] if positions is not None else 0
 
             # Build proper attention metadata so the MTP decoder layer on
             # the cloud can access its KV cache rather than zero-filling.
-            spec_step_idx = model_kwargs.get("spec_step_idx", 0)
             attn_metadata = self._build_cloud_mtp_attn_metadata(
                 positions=positions,
                 num_tokens=num_tokens,

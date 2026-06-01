@@ -2533,58 +2533,74 @@ class NPUModelRunner(GPUModelRunner):
         common_attn_metadata = self._cloud_spec_decode_common_attn_metadata
         num_reqs = getattr(self, "_cloud_spec_decode_num_reqs", 0)
 
-        # Shallow copy so in-place updates don't corrupt the saved
-        # original metadata for subsequent draft steps.
+        # Adapt common_attn_metadata for draft model positions.
+        # The positions come from the edge side and reflect the draft
+        # model's token positions for the current speculative step.
         common_attn_metadata = self.drafter.shallow_copy_metadata(
             common_attn_metadata
         )
         common_attn_metadata.positions = positions
 
-        # The edge side sends exactly num_reqs positions per draft
-        # step (one token per request).
-        # However, maybe_pad_and_reduce may pad positions on the edge
-        # side (flash_comm_v1_enabled), so positions.shape[0] can be
-        # larger than the actual number of requests.  We keep
-        # num_actual_tokens equal to the padded tensor size so that
-        # key[:num_actual_tokens] and slot_mapping[:num_actual_tokens]
-        # remain consistent in reshape_and_cache, but pad the trailing
-        # slot_mapping entries with -1 so the KV cache is not touched
-        # for padding tokens.
+        # Compute batch_size: each decode request contributes one
+        # draft token per step.
         batch_size = num_reqs
-        num_tokens = positions.shape[0]
+
+        # For the first draft step, the draft model processes the same
+        # tokens as the target model (num_tokens = batch_size *
+        # decode_threshold for decode).  For subsequent steps, only
+        # batch_size tokens are processed.  The cloud side only runs
+        # the decoder layer (not embed/fc/norm), so it always
+        # receives batch_size * decode_threshold tokens for step 0 and
+        # batch_size tokens for step > 0.
+        if spec_step_idx == 0:
+            num_tokens = batch_size * self.decode_threshold
+        else:
+            num_tokens = batch_size
 
         # Update common_attn_metadata fields for this draft step.
         common_attn_metadata.num_actual_tokens = num_tokens
         common_attn_metadata.num_input_tokens = num_tokens
 
+        # The saved metadata was captured before the target model's forward
+        # pass, which processed decode_threshold query tokens per request
+        # and advanced seq_lens accordingly.  Add this base advance for all
+        # draft steps so the draft model's attention metadata reflects the
+        # current KV cache state.
+        base_advance = self.decode_threshold
+
+        # Clone and advance seq_lens for ALL spec_step values (including
+        # spec_step_idx == 0).
+        common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
+        common_attn_metadata.seq_lens[:batch_size] += base_advance
+        if common_attn_metadata.seq_lens_cpu is not None:
+            common_attn_metadata.seq_lens_cpu = (
+                common_attn_metadata.seq_lens_cpu.clone()
+            )
+            common_attn_metadata.seq_lens_cpu[:batch_size] += base_advance
+        if common_attn_metadata._seq_lens_cpu is not None:
+            common_attn_metadata._seq_lens_cpu = (
+                common_attn_metadata._seq_lens_cpu.clone()
+            )
+            common_attn_metadata._seq_lens_cpu[:batch_size] += base_advance
+        if common_attn_metadata.num_computed_tokens_cpu is not None:
+            common_attn_metadata.num_computed_tokens_cpu = (
+                common_attn_metadata.num_computed_tokens_cpu.clone()
+            )
+            common_attn_metadata.num_computed_tokens_cpu[:batch_size] += base_advance
+
         if spec_step_idx > 0:
             # For steps after the first, each request has exactly one
-            # query token and the sequence length has grown by
-            # spec_step_idx compared to the target model.
+            # query token and the sequence length has grown further by
+            # spec_step_idx for previously accepted draft tokens.
             common_attn_metadata.max_query_len = 1
             common_attn_metadata.decode_token_per_req = 1
-            common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
 
-            # Increment seq_lens to account for previously generated
-            # draft tokens.  The target model's seq_lens already
-            # includes one accepted token; each additional draft step
-            # adds one more.
-            common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
             common_attn_metadata.seq_lens[:batch_size] += spec_step_idx
             if common_attn_metadata.seq_lens_cpu is not None:
-                common_attn_metadata.seq_lens_cpu = (
-                    common_attn_metadata.seq_lens_cpu.clone()
-                )
                 common_attn_metadata.seq_lens_cpu[:batch_size] += spec_step_idx
             if common_attn_metadata._seq_lens_cpu is not None:
-                common_attn_metadata._seq_lens_cpu = (
-                    common_attn_metadata._seq_lens_cpu.clone()
-                )
                 common_attn_metadata._seq_lens_cpu[:batch_size] += spec_step_idx
             if common_attn_metadata.num_computed_tokens_cpu is not None:
-                common_attn_metadata.num_computed_tokens_cpu = (
-                    common_attn_metadata.num_computed_tokens_cpu.clone()
-                )
                 common_attn_metadata.num_computed_tokens_cpu[:batch_size] += (
                     spec_step_idx
                 )
@@ -2597,58 +2613,7 @@ class NPUModelRunner(GPUModelRunner):
             common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
                 self.drafter.token_arange_np[: batch_size + 1]
             ).clone()
-
-            # Recompute slot_mapping from positions so that each draft
-            # step writes to the correct KV cache slot.  Without this
-            # the KV cache is overwritten at the same slots every step,
-            # producing identical hidden states (dead loop).
-            block_size = self.drafter.draft_attn_groups[0].kv_cache_spec.block_size
-            # Only the first batch_size entries are real tokens; the rest
-            # are padding introduced by maybe_pad_and_reduce on the edge
-            # side.  Compute slot_mapping for real tokens and pad the
-            # tail with -1 so reshape_and_cache skips them.
-            valid_positions = positions[:batch_size]
-            block_numbers = valid_positions // block_size
-            block_table = common_attn_metadata.block_table_tensor[:batch_size]
-            block_ids = block_table.gather(
-                dim=1, index=block_numbers.view(-1, 1)
-            ).view(-1)
-            valid_slot_mapping = block_ids * block_size + valid_positions % block_size
-            exceeds_max_model_len = valid_positions >= self.model_config.max_model_len
-            valid_slot_mapping = torch.where(
-                exceeds_max_model_len,
-                torch.tensor(
-                    -1, dtype=valid_slot_mapping.dtype, device=valid_slot_mapping.device
-                ),
-                valid_slot_mapping,
-            )
-            if num_tokens > batch_size:
-                slot_mapping = torch.full(
-                    (num_tokens,),
-                    -1,
-                    dtype=valid_slot_mapping.dtype,
-                    device=valid_slot_mapping.device,
-                )
-                slot_mapping[:batch_size] = valid_slot_mapping
-            else:
-                slot_mapping = valid_slot_mapping
-            common_attn_metadata.slot_mapping = slot_mapping.to(torch.int32)
         else:
-            # Step 0: the draft model processes the same tokens as the
-            # target model, so the saved slot_mapping is already
-            # correct.  However, if edge-side maybe_pad_and_reduce
-            # padded positions, the saved slot_mapping may be shorter
-            # than num_tokens; extend it with -1s to match.
-            saved_slot_mapping = common_attn_metadata.slot_mapping
-            if num_tokens > saved_slot_mapping.shape[0]:
-                slot_mapping = torch.full(
-                    (num_tokens,),
-                    -1,
-                    dtype=saved_slot_mapping.dtype,
-                    device=saved_slot_mapping.device,
-                )
-                slot_mapping[: saved_slot_mapping.shape[0]] = saved_slot_mapping
-                common_attn_metadata.slot_mapping = slot_mapping.to(torch.int32)
             common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
 
         # Build per-layer attention metadata using draft_attn_groups.

@@ -2588,13 +2588,9 @@ class NPUModelRunner(GPUModelRunner):
             # --- Build attention metadata so the MTP decoder layer can
             #     correctly read/write the KV cache on the cloud side. ---
 
-            # In decode-mode MTP each request occupies
-            # (num_spec_tokens + 1) uniformly-sized rows; extra padding
-            # beyond that should produce PADDING_SLOT_ID.
-            step_stride = (
-                self.speculative_config.num_speculative_tokens + 1
-                if self.speculative_config else 1
-            )
+            # In edge-cloud MTP the cloud receives exactly one token per
+            # request per speculative step, so step_stride is 1.
+            step_stride = 1
             valid_tokens = num_reqs * step_stride
 
             # Map each token to its owning request.
@@ -2623,9 +2619,7 @@ class NPUModelRunner(GPUModelRunner):
 
             seq_lens = seq_lens_cpu.to(device, non_blocking=True)
 
-            # Query start locations reflect the padded batch structure:
-            # each request occupies step_stride slots, matching the layout
-            # used by the target model's attention metadata.
+            # Query start locations: each request occupies one slot.
             query_start_loc_np = (
                 np.arange(num_reqs + 1, dtype=np.int32) * step_stride
             )

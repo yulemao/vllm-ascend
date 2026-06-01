@@ -1910,13 +1910,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         ]
         max_model_len = self.vllm_config.model_config.max_model_len
 
-        # Map tokens to requests.  In decode-mode MTP each request has
-        # (num_spec_tokens + 1) uniformly-sized rows; extra padding beyond
-        # that should produce PADDING_SLOT_ID.
-        step_stride = (
-            self.speculative_config.num_speculative_tokens + 1
-            if self.speculative_config else 1
-        )
+        # Map tokens to requests.  In edge-cloud MTP the cloud receives
+        # exactly one token per request per speculative step, so
+        # step_stride is 1.
+        step_stride = 1
         valid_tokens = num_reqs * step_stride
         token_idx = torch.arange(num_tokens, dtype=torch.int64, device=device)
         req_idx = torch.clamp(

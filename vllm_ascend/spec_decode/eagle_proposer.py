@@ -918,6 +918,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # participate in every round or the edge blocks on recv.
                 if self.num_speculative_tokens > 1:
                     for draft_step in range(self.num_speculative_tokens - 1):
+                        if multi_steps_attn_metadata:
+                            forward_context = get_forward_context()
+                            if forward_context is not None:
+                                forward_context.attn_metadata = (
+                                    multi_steps_attn_metadata[draft_step + 1]
+                                )
                         # The cloud path populates intermediate_tensors,
                         # positions, and spec_step_idx from the received
                         # tensor_dict; pass placeholders for keys it will pop.
@@ -1934,8 +1940,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 model_kwargs["positions"] = tensor_dict["positions"]
             positions = model_kwargs.get("positions", None)
             num_tokens = positions.shape[0] if positions is not None else 0
+            # Use the outer forward context's attn_metadata instead of None
+            # so that the draft model's attention layers receive proper metadata.
+            current_forward_context = get_forward_context()
+            attn_metadata = (
+                current_forward_context.attn_metadata
+                if current_forward_context is not None
+                else None
+            )
             with set_ascend_forward_context(
-                attn_metadata=None,
+                attn_metadata=attn_metadata,
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
                 is_draft_model=True,

@@ -1945,7 +1945,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         query_start_loc_np = (
             np.arange(num_reqs + 1, dtype=np.int32) * step_stride
         )
-        if num_tokens != valid_tokens:
+        if num_tokens < valid_tokens:
             query_start_loc_np[-1] = num_tokens
         query_start_loc_cpu = torch.from_numpy(query_start_loc_np)
         query_start_loc = query_start_loc_cpu.to(device, non_blocking=True)

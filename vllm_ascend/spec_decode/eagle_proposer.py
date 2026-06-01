@@ -44,7 +44,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetadata
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
 from vllm_ascend.distributed.parallel_state import edge_cloud_broadcast_recv
@@ -909,6 +909,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             and self.runner is not None
             and getattr(self.runner, "_edge_cloud_enabled", False)
         ):
+            model_kwargs["multi_steps_attn_metadata"] = multi_steps_attn_metadata
             ret_hidden_states = self._run_mtp_edge_cloud(**model_kwargs)
             if self.runner.edge_cloud_cfg.role == "cloud":
                 # When num_speculative_tokens > 1, the edge side iterates
@@ -1096,6 +1097,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # draft_step + 1 because the first draft token was already
                 # generated in the first pass.
                 model_kwargs["spec_step_idx"] = draft_step + 1
+                if multi_steps_attn_metadata:
+                    model_kwargs["multi_steps_attn_metadata"] = [
+                        multi_steps_attn_metadata[draft_step + 1]
+                    ]
                 ret_hidden_states = self._run_mtp_edge_cloud(**model_kwargs)
                 if self.runner.edge_cloud_cfg.role == "cloud":
                     # Cloud has already sent hidden states back to edge;
@@ -1892,6 +1897,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 output["spec_step_idx"] = torch.tensor(
                     model_kwargs["spec_step_idx"], dtype=torch.int64, device="cpu"
                 )
+
+            # Pack attention metadata tensors for cloud-side draft layers.
+            # The cloud needs slot_mapping, seq_lens, block_tables and
+            # query_start_loc to build per-layer AscendMetadata.
+            multi_steps_attn_metadata = model_kwargs.get("multi_steps_attn_metadata")
+            if multi_steps_attn_metadata:
+                for step_idx, per_layer_md in enumerate(multi_steps_attn_metadata):
+                    sample_layer = (
+                        self.attn_layer_names[0] if self.attn_layer_names else None
+                    )
+                    if sample_layer and sample_layer in per_layer_md:
+                        md = per_layer_md[sample_layer]
+                        output[f"draft_slot_mapping_{step_idx}"] = md.slot_mapping
+                        output[f"draft_seq_lens_{step_idx}"] = md.seq_lens
+                        output[f"draft_block_tables_{step_idx}"] = md.block_tables
+                        output[f"draft_query_start_loc_{step_idx}"] = (
+                            md.query_start_loc
+                        )
+
             if get_pp_group().world_size == 2:
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v
@@ -1934,11 +1958,55 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 model_kwargs["positions"] = tensor_dict["positions"]
             positions = model_kwargs.get("positions", None)
             num_tokens = positions.shape[0] if positions is not None else 0
+
+            # Reconstruct attention metadata from edge-provided tensors.
+            multi_steps_attn_metadata = []
+            step_idx = 0
+            while f"draft_slot_mapping_{step_idx}" in tensor_dict:
+                slot_mapping = tensor_dict[f"draft_slot_mapping_{step_idx}"]
+                seq_lens = tensor_dict.get(f"draft_seq_lens_{step_idx}")
+                block_tables = tensor_dict.get(f"draft_block_tables_{step_idx}")
+                query_start_loc = tensor_dict.get(
+                    f"draft_query_start_loc_{step_idx}"
+                )
+                per_layer_md = {}
+                for layer_name in self.attn_layer_names:
+                    per_layer_md[layer_name] = AscendMetadata(
+                        num_actual_tokens=slot_mapping.shape[0],
+                        num_decode_tokens=slot_mapping.shape[0],
+                        block_tables=block_tables,
+                        query_start_loc=query_start_loc,
+                        seq_lens=seq_lens,
+                        seq_lens_cpu=seq_lens.cpu() if seq_lens is not None else None,
+                        seq_lens_list=(
+                            seq_lens.cpu().tolist() if seq_lens is not None else []
+                        ),
+                        max_query_len=1,
+                        actual_seq_lengths_q=(
+                            [1] * seq_lens.shape[0] if seq_lens is not None else []
+                        ),
+                        slot_mapping=slot_mapping,
+                        attn_state=AscendAttentionState.SpecDecoding,
+                        num_prefills=0,
+                        num_decodes=(
+                            seq_lens.shape[0] if seq_lens is not None else 0
+                        ),
+                        causal=True,
+                        model_runner_type=self.vllm_config.model_config.runner_type,
+                    )
+                multi_steps_attn_metadata.append(per_layer_md)
+                step_idx += 1
+
             with set_ascend_forward_context(
-                attn_metadata=None,
+                (
+                    multi_steps_attn_metadata[0]
+                    if multi_steps_attn_metadata
+                    else None
+                ),
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
                 is_draft_model=True,
+                draft_attn_metadatas=multi_steps_attn_metadata,
             ):
                 output = segments["c"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)

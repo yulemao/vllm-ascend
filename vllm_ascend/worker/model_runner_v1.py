@@ -112,7 +112,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState, AscendMetadata
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
 
@@ -2512,14 +2512,58 @@ class NPUModelRunner(GPUModelRunner):
             if "spec_step_idx" in tensor_dict:
                 model_kwargs["spec_step_idx"] = tensor_dict["spec_step_idx"].item()
 
+            # Reconstruct attention metadata from edge-provided tensors.
+            slot_mapping = tensor_dict.get("draft_slot_mapping_0")
+            seq_lens = tensor_dict.get("draft_seq_lens_0")
+            block_tables = tensor_dict.get("draft_block_tables_0")
+            query_start_loc = tensor_dict.get("draft_query_start_loc_0")
+            if slot_mapping is not None:
+                per_layer_md = {}
+                layer_names = (
+                    self.drafter.attn_layer_names
+                    if self.drafter is not None
+                    and hasattr(self.drafter, "attn_layer_names")
+                    else ["default"]
+                )
+                for layer_name in layer_names:
+                    per_layer_md[layer_name] = AscendMetadata(
+                        num_actual_tokens=slot_mapping.shape[0],
+                        num_decode_tokens=slot_mapping.shape[0],
+                        block_tables=block_tables,
+                        query_start_loc=query_start_loc,
+                        seq_lens=seq_lens,
+                        seq_lens_cpu=seq_lens.cpu() if seq_lens is not None else None,
+                        seq_lens_list=(
+                            seq_lens.cpu().tolist() if seq_lens is not None else []
+                        ),
+                        max_query_len=1,
+                        actual_seq_lengths_q=(
+                            [1] * seq_lens.shape[0] if seq_lens is not None else []
+                        ),
+                        slot_mapping=slot_mapping,
+                        attn_state=AscendAttentionState.SpecDecoding,
+                        num_prefills=0,
+                        num_decodes=(
+                            seq_lens.shape[0] if seq_lens is not None else 0
+                        ),
+                        causal=True,
+                        model_runner_type=self.vllm_config.model_config.runner_type,
+                    )
+                attn_metadata = per_layer_md
+                draft_attn_metadatas = [per_layer_md]
+            else:
+                attn_metadata = None
+                draft_attn_metadatas = None
+
             # Run cloud segment (all MTP decoder layers are on cloud)
             segment = self._edge_cloud_mtp_segments["c"]
             num_tokens = positions.shape[0] if positions is not None else 0
             with set_ascend_forward_context(
-                attn_metadata=None,
+                attn_metadata=attn_metadata,
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
                 is_draft_model=True,
+                draft_attn_metadatas=draft_attn_metadatas,
             ):
                 output = segment(**model_kwargs)
             assert isinstance(output, IntermediateTensors)

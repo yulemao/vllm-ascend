@@ -1934,8 +1934,58 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 model_kwargs["positions"] = tensor_dict["positions"]
             positions = model_kwargs.get("positions", None)
             num_tokens = positions.shape[0] if positions is not None else 0
+
+            # Build draft attention metadata so cloud-side decoder layers can
+            # perform paged attention and update KV cache correctly.
+            attn_metadata = None
+            if num_tokens > 0 and positions is not None:
+                from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetadata
+                seq_lens = (positions + 1).to(torch.int32)
+                seq_lens_list = seq_lens.cpu().tolist()
+                actual_seq_lengths_q = list(range(1, num_tokens + 1))
+
+                slot_mapping = None
+                block_tables = None
+                if (
+                    self.runner is not None
+                    and self.runner.drafter is not None
+                    and hasattr(self.runner.drafter, "kv_cache_gid")
+                    and self.runner.input_batch is not None
+                    and hasattr(self.runner.input_batch, "block_table")
+                    and len(self.runner.input_batch.block_table) > self.runner.drafter.kv_cache_gid
+                ):
+                    draft_block_table = self.runner.input_batch.block_table[self.runner.drafter.kv_cache_gid]
+                    block_tables = draft_block_table.block_table.gpu[:num_tokens]
+                    block_size = draft_block_table.block_size
+                    block_numbers = (positions // block_size).long()
+                    block_ids = block_tables.gather(dim=1, index=block_numbers.view(-1, 1))
+                    block_ids = block_ids.view(-1)
+                    slot_mapping = (block_ids * block_size + positions % block_size).to(torch.int32)
+
+                if slot_mapping is not None:
+                    attn_metadata = AscendMetadata(
+                        attn_state=AscendAttentionState.DecodeOnly,
+                        seq_lens=seq_lens,
+                        seq_lens_cpu=seq_lens.cpu(),
+                        seq_lens_list=seq_lens_list,
+                        actual_seq_lengths_q=actual_seq_lengths_q,
+                        block_tables=block_tables,
+                        slot_mapping=slot_mapping,
+                        causal=True,
+                        num_actual_tokens=num_tokens,
+                        num_decode_tokens=num_tokens,
+                        num_prefills=0,
+                        num_decodes=num_tokens,
+                    )
+
+                    if self.runner.drafter is not None and self.runner.drafter.attn_layer_names:
+                        per_layer_metadata = {}
+                        for layer_name in self.runner.drafter.attn_layer_names:
+                            per_layer_metadata[layer_name] = attn_metadata
+                        attn_metadata = per_layer_metadata
+
             with set_ascend_forward_context(
-                attn_metadata=None,
+                attn_metadata=attn_metadata,
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
                 is_draft_model=True,

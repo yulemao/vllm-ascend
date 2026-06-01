@@ -2543,13 +2543,15 @@ class NPUModelRunner(GPUModelRunner):
         # The edge side sends exactly num_reqs positions per draft
         # step (one token per request).
         # However, maybe_pad_and_reduce may pad positions on the edge
-        # side (flash_comm_v1_enabled).  We must clip to the actual
-        # number of requests so that slot_mapping and key/value sizes
-        # stay consistent in reshape_and_cache.
+        # side (flash_comm_v1_enabled), so positions.shape[0] can be
+        # larger than the actual number of requests.  We keep
+        # num_actual_tokens equal to the padded tensor size so that
+        # key[:num_actual_tokens] and slot_mapping[:num_actual_tokens]
+        # remain consistent in reshape_and_cache, but pad the trailing
+        # slot_mapping entries with -1 so the KV cache is not touched
+        # for padding tokens.
         batch_size = num_reqs
-        num_tokens = min(positions.shape[0], batch_size)
-        if positions.shape[0] > batch_size:
-            positions = positions[:batch_size]
+        num_tokens = positions.shape[0]
 
         # Update common_attn_metadata fields for this draft step.
         common_attn_metadata.num_actual_tokens = num_tokens
@@ -2601,29 +2603,52 @@ class NPUModelRunner(GPUModelRunner):
             # the KV cache is overwritten at the same slots every step,
             # producing identical hidden states (dead loop).
             block_size = self.drafter.draft_attn_groups[0].kv_cache_spec.block_size
-            block_numbers = positions // block_size
-            # For step > 0 only batch_size tokens are processed; use
-            # the first batch_size rows of the block table.
+            # Only the first batch_size entries are real tokens; the rest
+            # are padding introduced by maybe_pad_and_reduce on the edge
+            # side.  Compute slot_mapping for real tokens and pad the
+            # tail with -1 so reshape_and_cache skips them.
+            valid_positions = positions[:batch_size]
+            block_numbers = valid_positions // block_size
             block_table = common_attn_metadata.block_table_tensor[:batch_size]
             block_ids = block_table.gather(
                 dim=1, index=block_numbers.view(-1, 1)
             ).view(-1)
-            slot_mapping = block_ids * block_size + positions % block_size
-            # Mask positions that exceed max_model_len so padding
-            # tokens don't corrupt the KV cache.
-            exceeds_max_model_len = positions >= self.model_config.max_model_len
-            slot_mapping = torch.where(
+            valid_slot_mapping = block_ids * block_size + valid_positions % block_size
+            exceeds_max_model_len = valid_positions >= self.model_config.max_model_len
+            valid_slot_mapping = torch.where(
                 exceeds_max_model_len,
                 torch.tensor(
-                    -1, dtype=slot_mapping.dtype, device=slot_mapping.device
+                    -1, dtype=valid_slot_mapping.dtype, device=valid_slot_mapping.device
                 ),
-                slot_mapping,
+                valid_slot_mapping,
             )
+            if num_tokens > batch_size:
+                slot_mapping = torch.full(
+                    (num_tokens,),
+                    -1,
+                    dtype=valid_slot_mapping.dtype,
+                    device=valid_slot_mapping.device,
+                )
+                slot_mapping[:batch_size] = valid_slot_mapping
+            else:
+                slot_mapping = valid_slot_mapping
             common_attn_metadata.slot_mapping = slot_mapping.to(torch.int32)
         else:
             # Step 0: the draft model processes the same tokens as the
             # target model, so the saved slot_mapping is already
-            # correct.  Just ensure the attention state is set.
+            # correct.  However, if edge-side maybe_pad_and_reduce
+            # padded positions, the saved slot_mapping may be shorter
+            # than num_tokens; extend it with -1s to match.
+            saved_slot_mapping = common_attn_metadata.slot_mapping
+            if num_tokens > saved_slot_mapping.shape[0]:
+                slot_mapping = torch.full(
+                    (num_tokens,),
+                    -1,
+                    dtype=saved_slot_mapping.dtype,
+                    device=saved_slot_mapping.device,
+                )
+                slot_mapping[: saved_slot_mapping.shape[0]] = saved_slot_mapping
+                common_attn_metadata.slot_mapping = slot_mapping.to(torch.int32)
             common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
 
         # Build per-layer attention metadata using draft_attn_groups.

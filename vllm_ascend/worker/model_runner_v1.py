@@ -2600,6 +2600,44 @@ class NPUModelRunner(GPUModelRunner):
             common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
                 self.drafter.token_arange_np[: batch_size + 1]
             ).clone()
+
+            # Recompute slot_mapping from positions so that each draft
+            # step writes to the correct KV cache slot.  Without this
+            # the KV cache is overwritten at the same slots every step,
+            # producing identical hidden states (dead loop).
+            block_size = self.drafter.draft_attn_groups[0].kv_cache_spec.block_size
+            # Only the first batch_size entries are real tokens; the rest
+            # are padding introduced by maybe_pad_and_reduce on the edge
+            # side.  Compute slot_mapping for real tokens and pad the
+            # tail with -1 so reshape_and_cache skips them.
+            valid_positions = positions[:batch_size]
+            block_numbers = valid_positions // block_size
+            block_table = common_attn_metadata.block_table_tensor[:batch_size]
+            block_ids = block_table.gather(
+                dim=1, index=block_numbers.view(-1, 1)
+            ).view(-1)
+            valid_slot_mapping = block_ids * block_size + valid_positions % block_size
+            exceeds_max_model_len = valid_positions >= self.model_config.max_model_len
+            valid_slot_mapping = torch.where(
+                exceeds_max_model_len,
+                torch.tensor(
+                    -1,
+                    dtype=valid_slot_mapping.dtype,
+                    device=valid_slot_mapping.device,
+                ),
+                valid_slot_mapping,
+            )
+            if num_tokens > batch_size:
+                slot_mapping = torch.full(
+                    (num_tokens,),
+                    -1,
+                    dtype=valid_slot_mapping.dtype,
+                    device=valid_slot_mapping.device,
+                )
+                slot_mapping[:batch_size] = valid_slot_mapping
+            else:
+                slot_mapping = valid_slot_mapping
+            common_attn_metadata.slot_mapping = slot_mapping.to(torch.int32)
         else:
             common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
 

@@ -2561,46 +2561,33 @@ class NPUModelRunner(GPUModelRunner):
         common_attn_metadata.num_actual_tokens = num_tokens
         common_attn_metadata.num_input_tokens = num_tokens
 
-        # The saved metadata was captured before the target model's forward
-        # pass, which processed decode_threshold query tokens per request
-        # and advanced seq_lens accordingly.  Add this base advance for all
-        # draft steps so the draft model's attention metadata reflects the
-        # current KV cache state.
-        base_advance = self.decode_threshold
-
-        # Clone and advance seq_lens for ALL spec_step values (including
-        # spec_step_idx == 0).
-        common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
-        common_attn_metadata.seq_lens[:batch_size] += base_advance
-        if common_attn_metadata.seq_lens_cpu is not None:
-            common_attn_metadata.seq_lens_cpu = (
-                common_attn_metadata.seq_lens_cpu.clone()
-            )
-            common_attn_metadata.seq_lens_cpu[:batch_size] += base_advance
-        if common_attn_metadata._seq_lens_cpu is not None:
-            common_attn_metadata._seq_lens_cpu = (
-                common_attn_metadata._seq_lens_cpu.clone()
-            )
-            common_attn_metadata._seq_lens_cpu[:batch_size] += base_advance
-        if common_attn_metadata.num_computed_tokens_cpu is not None:
-            common_attn_metadata.num_computed_tokens_cpu = (
-                common_attn_metadata.num_computed_tokens_cpu.clone()
-            )
-            common_attn_metadata.num_computed_tokens_cpu[:batch_size] += base_advance
-
         if spec_step_idx > 0:
             # For steps after the first, each request has exactly one
-            # query token and the sequence length has grown further by
-            # spec_step_idx for previously accepted draft tokens.
+            # query token and the sequence length has grown by
+            # spec_step_idx compared to the target model.
             common_attn_metadata.max_query_len = 1
             common_attn_metadata.decode_token_per_req = 1
 
+            # Increment seq_lens to account for previously accepted
+            # draft tokens.  The target model's seq_lens already
+            # includes one accepted token; each additional draft step
+            # adds one more.
+            common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
             common_attn_metadata.seq_lens[:batch_size] += spec_step_idx
             if common_attn_metadata.seq_lens_cpu is not None:
+                common_attn_metadata.seq_lens_cpu = (
+                    common_attn_metadata.seq_lens_cpu.clone()
+                )
                 common_attn_metadata.seq_lens_cpu[:batch_size] += spec_step_idx
             if common_attn_metadata._seq_lens_cpu is not None:
+                common_attn_metadata._seq_lens_cpu = (
+                    common_attn_metadata._seq_lens_cpu.clone()
+                )
                 common_attn_metadata._seq_lens_cpu[:batch_size] += spec_step_idx
             if common_attn_metadata.num_computed_tokens_cpu is not None:
+                common_attn_metadata.num_computed_tokens_cpu = (
+                    common_attn_metadata.num_computed_tokens_cpu.clone()
+                )
                 common_attn_metadata.num_computed_tokens_cpu[:batch_size] += (
                     spec_step_idx
                 )

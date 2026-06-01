@@ -2581,15 +2581,11 @@ class NPUModelRunner(GPUModelRunner):
                 raise RuntimeError(
                     "[EdgeCloud] Cloud did not receive positions from edge"
                 )
-            # Advance positions by the draft step so RoPE and slot_mapping
-            # match the sequence length progression, just like the non-edge-
-            # cloud path does via used_update_positions += 1.
-            spec_step_idx = (
-                tensor_dict["spec_step_idx"].item()
-                if "spec_step_idx" in tensor_dict
-                else 0
-            )
-            positions = positions + spec_step_idx
+            # The edge side already advances positions by 1 for each draft
+            # step (via positions += 1 in _run_merged_draft).  Do NOT add
+            # spec_step_idx here — that would double-increment positions,
+            # causing KV cache accesses at wrong slots and degrading draft
+            # acceptance rate as generation progresses.
             # num_tokens is the sequence-length axis.  For standard RoPE
             # positions is 1-D (num_tokens,); for mRoPE it is (3, num_tokens).
             num_tokens = positions.shape[-1]

@@ -1986,8 +1986,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # decoder layer.
             output["positions"] = model_kwargs["positions"]
             if "spec_step_idx" in model_kwargs:
+                # NPU tensor to avoid mixed-device errors in isend_tensor_dict.
                 output["spec_step_idx"] = torch.tensor(
-                    model_kwargs["spec_step_idx"], dtype=torch.int64, device="cpu"
+                    model_kwargs["spec_step_idx"], dtype=torch.int64,
+                    device=model_kwargs["positions"].device,
                 )
             if get_pp_group().world_size == 2:
                 send_work = get_pp_group().isend_tensor_dict(
@@ -2031,9 +2033,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 model_kwargs["positions"] = tensor_dict["positions"]
             positions = model_kwargs.get("positions", None)
             spec_step_idx = model_kwargs.get("spec_step_idx", 0)
-            if positions is not None:
-                positions = positions + spec_step_idx
-                model_kwargs["positions"] = positions
+            # Edge already advances positions per draft step; do not add spec_step_idx.
             # num_tokens is the sequence-length axis: shape[-1] works for
             # both standard RoPE (N,) and mRoPE (3, N).
             num_tokens = positions.shape[-1] if positions is not None else 0

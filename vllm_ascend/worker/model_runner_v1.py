@@ -2538,7 +2538,9 @@ class NPUModelRunner(GPUModelRunner):
                         ),
                         max_query_len=1,
                         actual_seq_lengths_q=(
-                            [1] * seq_lens.shape[0] if seq_lens is not None else []
+                            query_start_loc[1:].tolist()
+                            if query_start_loc is not None
+                            else []
                         ),
                         slot_mapping=slot_mapping,
                         attn_state=AscendAttentionState.SpecDecoding,

@@ -1573,19 +1573,34 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         AscendMetadata directly from the common tensors so they can be sent to
         the cloud."""
         num_reqs = common_attn_metadata.num_reqs
-        seq_lens = common_attn_metadata.seq_lens[:num_reqs]
-        seq_lens_cpu = seq_lens.cpu() if seq_lens is not None else None
+        num_actual_tokens = common_attn_metadata.num_actual_tokens
+        # Use CPU seq_lens to match the normal metadata builder
+        if common_attn_metadata._seq_lens_cpu is not None:
+            seq_lens = common_attn_metadata._seq_lens_cpu[:num_reqs]
+        elif common_attn_metadata.seq_lens_cpu is not None:
+            seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
+        else:
+            seq_lens = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
+        # Truncate slot_mapping to actual tokens so cloud receives exact-size tensor
+        slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]
+        # Truncate query_start_loc to actual requests
+        query_start_loc = common_attn_metadata.query_start_loc[:num_reqs + 1]
+        query_start_loc_cpu = (
+            common_attn_metadata.query_start_loc_cpu[:num_reqs + 1]
+            if common_attn_metadata.query_start_loc_cpu is not None
+            else query_start_loc.cpu()
+        )
         return AscendMetadata(
-            num_actual_tokens=common_attn_metadata.num_actual_tokens,
-            num_decode_tokens=common_attn_metadata.num_actual_tokens,
+            num_actual_tokens=num_actual_tokens,
+            num_decode_tokens=num_actual_tokens,
             block_tables=common_attn_metadata.block_table_tensor,
-            query_start_loc=common_attn_metadata.query_start_loc,
+            query_start_loc=query_start_loc,
             seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            seq_lens_list=seq_lens_cpu.tolist() if seq_lens_cpu is not None else [],
+            seq_lens_cpu=seq_lens,
+            seq_lens_list=seq_lens.tolist() if seq_lens is not None else [],
             max_query_len=common_attn_metadata.max_query_len,
-            actual_seq_lengths_q=common_attn_metadata.query_start_loc[1:].tolist(),
-            slot_mapping=common_attn_metadata.slot_mapping,
+            actual_seq_lengths_q=query_start_loc_cpu[1:].tolist(),
+            slot_mapping=slot_mapping,
             attn_state=AscendAttentionState.SpecDecoding,
             num_prefills=0,
             num_decodes=num_reqs,
@@ -2041,7 +2056,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         ),
                         max_query_len=1,
                         actual_seq_lengths_q=(
-                            [1] * seq_lens.shape[0] if seq_lens is not None else []
+                            query_start_loc[1:].tolist()
+                            if query_start_loc is not None
+                            else []
                         ),
                         slot_mapping=slot_mapping,
                         attn_state=AscendAttentionState.SpecDecoding,

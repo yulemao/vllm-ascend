@@ -2542,8 +2542,14 @@ class NPUModelRunner(GPUModelRunner):
 
         # The edge side sends exactly num_reqs positions per draft
         # step (one token per request).
-        num_tokens = positions.shape[0]
+        # However, maybe_pad_and_reduce may pad positions on the edge
+        # side (flash_comm_v1_enabled).  We must clip to the actual
+        # number of requests so that slot_mapping and key/value sizes
+        # stay consistent in reshape_and_cache.
         batch_size = num_reqs
+        num_tokens = min(positions.shape[0], batch_size)
+        if positions.shape[0] > batch_size:
+            positions = positions[:batch_size]
 
         # Update common_attn_metadata fields for this draft step.
         common_attn_metadata.num_actual_tokens = num_tokens

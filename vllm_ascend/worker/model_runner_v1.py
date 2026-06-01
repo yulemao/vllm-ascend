@@ -2533,29 +2533,17 @@ class NPUModelRunner(GPUModelRunner):
         common_attn_metadata = self._cloud_spec_decode_common_attn_metadata
         num_reqs = getattr(self, "_cloud_spec_decode_num_reqs", 0)
 
-        # Adapt common_attn_metadata for draft model positions.
-        # The positions come from the edge side and reflect the draft
-        # model's token positions for the current speculative step.
+        # Shallow copy so in-place updates don't corrupt the saved
+        # original metadata for subsequent draft steps.
         common_attn_metadata = self.drafter.shallow_copy_metadata(
             common_attn_metadata
         )
         common_attn_metadata.positions = positions
 
-        # Compute batch_size: each decode request contributes one
-        # draft token per step.
+        # The edge side sends exactly num_reqs positions per draft
+        # step (one token per request).
+        num_tokens = positions.shape[0]
         batch_size = num_reqs
-
-        # For the first draft step, the draft model processes the same
-        # tokens as the target model (num_tokens = batch_size *
-        # decode_threshold for decode).  For subsequent steps, only
-        # batch_size tokens are processed.  The cloud side only runs
-        # the decoder layer (not embed/fc/norm), so it always
-        # receives batch_size * decode_threshold tokens for step 0 and
-        # batch_size tokens for step > 0.
-        if spec_step_idx == 0:
-            num_tokens = batch_size * self.decode_threshold
-        else:
-            num_tokens = batch_size
 
         # Update common_attn_metadata fields for this draft step.
         common_attn_metadata.num_actual_tokens = num_tokens
@@ -2567,8 +2555,9 @@ class NPUModelRunner(GPUModelRunner):
             # spec_step_idx compared to the target model.
             common_attn_metadata.max_query_len = 1
             common_attn_metadata.decode_token_per_req = 1
+            common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
 
-            # Increment seq_lens to account for previously accepted
+            # Increment seq_lens to account for previously generated
             # draft tokens.  The target model's seq_lens already
             # includes one accepted token; each additional draft step
             # adds one more.
@@ -2600,7 +2589,35 @@ class NPUModelRunner(GPUModelRunner):
             common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
                 self.drafter.token_arange_np[: batch_size + 1]
             ).clone()
+
+            # Recompute slot_mapping from positions so that each draft
+            # step writes to the correct KV cache slot.  Without this
+            # the KV cache is overwritten at the same slots every step,
+            # producing identical hidden states (dead loop).
+            block_size = self.drafter.draft_attn_groups[0].kv_cache_spec.block_size
+            block_numbers = positions // block_size
+            # For step > 0 only batch_size tokens are processed; use
+            # the first batch_size rows of the block table.
+            block_table = common_attn_metadata.block_table_tensor[:batch_size]
+            block_ids = block_table.gather(
+                dim=1, index=block_numbers.view(-1, 1)
+            ).view(-1)
+            slot_mapping = block_ids * block_size + positions % block_size
+            # Mask positions that exceed max_model_len so padding
+            # tokens don't corrupt the KV cache.
+            exceeds_max_model_len = positions >= self.model_config.max_model_len
+            slot_mapping = torch.where(
+                exceeds_max_model_len,
+                torch.tensor(
+                    -1, dtype=slot_mapping.dtype, device=slot_mapping.device
+                ),
+                slot_mapping,
+            )
+            common_attn_metadata.slot_mapping = slot_mapping.to(torch.int32)
         else:
+            # Step 0: the draft model processes the same tokens as the
+            # target model, so the saved slot_mapping is already
+            # correct.  Just ensure the attention state is set.
             common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
 
         # Build per-layer attention metadata using draft_attn_groups.

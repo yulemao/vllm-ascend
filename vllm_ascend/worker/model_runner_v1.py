@@ -2529,7 +2529,7 @@ class NPUModelRunner(GPUModelRunner):
                     and hasattr(self.drafter, "kv_cache_gid")
                     and self.input_batch is not None
                     and hasattr(self.input_batch, "block_table")
-                    and len(self.input_batch.block_table) > self.drafter.kv_cache_gid
+                    and len(self.input_batch.block_table.block_tables) > self.drafter.kv_cache_gid
                 ):
                     draft_block_table = self.input_batch.block_table[self.drafter.kv_cache_gid]
                     block_tables = draft_block_table.block_table.gpu[:num_tokens]

@@ -1952,7 +1952,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     and hasattr(self.runner.drafter, "kv_cache_gid")
                     and self.runner.input_batch is not None
                     and hasattr(self.runner.input_batch, "block_table")
-                    and len(self.runner.input_batch.block_table) > self.runner.drafter.kv_cache_gid
+                    and len(self.runner.input_batch.block_table.block_tables) > self.runner.drafter.kv_cache_gid
                 ):
                     draft_block_table = self.runner.input_batch.block_table[self.runner.drafter.kv_cache_gid]
                     block_tables = draft_block_table.block_table.gpu[:num_tokens]

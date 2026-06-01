@@ -1959,49 +1959,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             positions = model_kwargs.get("positions", None)
             num_tokens = positions.shape[0] if positions is not None else 0
 
-            # Reconstruct attention metadata.  Prefer edge-provided tensors;
-            # when the edge cannot supply them (draft attention layers are on
-            # the cloud side), compute slot_mapping from the cloud's own
-            # KV-cache block tables.
-            if "draft_slot_mapping_0" not in tensor_dict:
-                if positions is not None and self.kv_cache_gid >= 0:
-                    blk_table = self.runner.input_batch.block_table[
-                        self.kv_cache_gid
-                    ]
-                    block_tables = blk_table.get_device_tensor()
-                    block_size = (
-                        self.block_size
-                        if hasattr(self, "block_size") and self.block_size
-                        else None
-                    )
-                    if block_size is not None and block_tables is not None:
-                        num_tokens = positions.shape[0]
-                        block_numbers = positions // block_size
-                        block_ids = (
-                            block_tables[:num_tokens]
-                            .gather(
-                                dim=1, index=block_numbers.view(-1, 1)
-                            )
-                            .view(-1)
-                        )
-                        slot_mapping = (
-                            block_ids * block_size + positions % block_size
-                        ).to(torch.int32)
-                        seq_lens = (positions + 1).to(torch.int32)
-                        query_start_loc = torch.arange(
-                            num_tokens + 1,
-                            dtype=torch.int32,
-                            device=positions.device,
-                        )
-                        tensor_dict["draft_slot_mapping_0"] = slot_mapping
-                        tensor_dict["draft_seq_lens_0"] = seq_lens
-                        tensor_dict["draft_block_tables_0"] = block_tables[
-                            :num_tokens
-                        ]
-                        tensor_dict[
-                            "draft_query_start_loc_0"
-                        ] = query_start_loc
-
+            # Reconstruct attention metadata from edge-provided tensors.
             multi_steps_attn_metadata = []
             step_idx = 0
             while f"draft_slot_mapping_{step_idx}" in tensor_dict:

@@ -828,9 +828,36 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         multi_steps_attn_metadata.append(per_layer_attn_metadata)
         else:
             # Edge-cloud MTP edge: draft attention layers are on the cloud
-            # side (PPMissingLayer on edge), so no attention metadata is needed.
-            multi_steps_attn_metadata = []
-            attn_metadata_i = None
+            # side (PPMissingLayer on edge).  The cloud still needs attention
+            # metadata, so we build it manually from common_attn_metadata.
+            per_layer_attn_metadata = {}
+            for layer_name in self.attn_layer_names:
+                per_layer_attn_metadata[layer_name] = (
+                    self._build_edge_cloud_attn_metadata(common_attn_metadata)
+                )
+            multi_steps_attn_metadata = [per_layer_attn_metadata]
+            attn_metadata_i = per_layer_attn_metadata[self.attn_layer_names[0]]
+
+            if not self.parallel_drafting:
+                for draft_step in range(1, self.num_speculative_tokens):
+                    common_attn_metadata, _ = self.attn_update_stack_num_spec_norm(
+                        draft_step,
+                        None,
+                        common_attn_metadata,
+                        batch_size,
+                        num_input_tokens,
+                        used_update_positions,
+                        aclgraph_runtime_mode,
+                        attn_group=None,
+                    )
+                    per_layer_attn_metadata = {}
+                    for layer_name in self.attn_layer_names:
+                        per_layer_attn_metadata[layer_name] = (
+                            self._build_edge_cloud_attn_metadata(
+                                common_attn_metadata
+                            )
+                        )
+                    multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
         token_indices_to_sample_len = token_indices_to_sample.shape[0]
         self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
@@ -1372,7 +1399,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         attn_group=None,
     ):
         assert draft_step > 0
-        assert attn_group is not None, "vllm-ascend v0.17.0rc1 requires attn_group"
         common_attn_metadata = self.shallow_copy_metadata(old_common_metadata)
 
         if draft_step == 1:
@@ -1519,21 +1545,53 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             : common_attn_metadata.query_start_loc.shape[0]
         ]
 
-        attn_metadata_builder = attn_group.get_metadata_builder()
+        if attn_group is not None:
+            attn_metadata_builder = attn_group.get_metadata_builder()
+            attn_metadata = attn_metadata_builder.build_for_drafting(
+                common_attn_metadata=common_attn_metadata,
+                draft_index=draft_step,
+            )
 
-        attn_metadata = attn_metadata_builder.build_for_drafting(
-            common_attn_metadata=common_attn_metadata,
-            draft_index=draft_step,
-        )
-
-        if self.pcp_size * self.dcp_size > 1:
-            if self.vllm_config.model_config.use_mla:
-                if getattr(attn_metadata, "decode", None):
-                    attn_metadata.decode.cp_seq_len = cp_seq_len
-            else:
-                attn_metadata.decode_meta.num_computed_tokens_of_pcp_dcp = num_computed_tokens_of_pcp_dcp.numpy()
+            if self.pcp_size * self.dcp_size > 1:
+                if self.vllm_config.model_config.use_mla:
+                    if getattr(attn_metadata, "decode", None):
+                        attn_metadata.decode.cp_seq_len = cp_seq_len
+                else:
+                    attn_metadata.decode_meta.num_computed_tokens_of_pcp_dcp = num_computed_tokens_of_pcp_dcp.numpy()
+        else:
+            attn_metadata = None
 
         return common_attn_metadata, attn_metadata
+
+    def _build_edge_cloud_attn_metadata(
+        self, common_attn_metadata: AscendCommonAttentionMetadata
+    ) -> AscendMetadata:
+        """Build AscendMetadata from common metadata for edge-cloud draft layers.
+
+        On the edge side draft attention layers are replaced by PPMissingLayer,
+        so the normal metadata builder is unavailable.  We construct the minimal
+        AscendMetadata directly from the common tensors so they can be sent to
+        the cloud."""
+        num_reqs = common_attn_metadata.num_reqs
+        seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+        seq_lens_cpu = seq_lens.cpu() if seq_lens is not None else None
+        return AscendMetadata(
+            num_actual_tokens=common_attn_metadata.num_actual_tokens,
+            num_decode_tokens=common_attn_metadata.num_actual_tokens,
+            block_tables=common_attn_metadata.block_table_tensor,
+            query_start_loc=common_attn_metadata.query_start_loc,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_list=seq_lens_cpu.tolist() if seq_lens_cpu is not None else [],
+            max_query_len=common_attn_metadata.max_query_len,
+            actual_seq_lengths_q=common_attn_metadata.query_start_loc[1:].tolist(),
+            slot_mapping=common_attn_metadata.slot_mapping,
+            attn_state=AscendAttentionState.SpecDecoding,
+            num_prefills=0,
+            num_decodes=num_reqs,
+            causal=True,
+            model_runner_type=self.vllm_config.model_config.runner_type,
+        )
 
     def prepare_next_token_ids_padded(
         self,

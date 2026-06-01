@@ -2552,7 +2552,7 @@ class NPUModelRunner(GPUModelRunner):
                     # Clamp block_numbers to valid column range to avoid gather
                     # index out of bounds (positions may exceed draft block_table).
                     max_blocks = block_tables.shape[1]
-                    block_numbers = (positions_device[:effective_num_tokens] // block_size).long()
+                    block_numbers = (positions_device[:effective_num_tokens] // block_size).int()
                     block_numbers = block_numbers.clamp(0, max_blocks - 1)
                     block_ids = block_tables.gather(dim=1, index=block_numbers.unsqueeze(1))
                     block_ids = block_ids.view(-1)

@@ -828,36 +828,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         multi_steps_attn_metadata.append(per_layer_attn_metadata)
         else:
             # Edge-cloud MTP edge: draft attention layers are on the cloud
-            # side (PPMissingLayer on edge).  The cloud still needs attention
-            # metadata, so we build it manually from common_attn_metadata.
-            per_layer_attn_metadata = {}
-            for layer_name in self.attn_layer_names:
-                per_layer_attn_metadata[layer_name] = (
-                    self._build_edge_cloud_attn_metadata(common_attn_metadata)
-                )
-            multi_steps_attn_metadata = [per_layer_attn_metadata]
-            attn_metadata_i = per_layer_attn_metadata[self.attn_layer_names[0]]
-
-            if not self.parallel_drafting:
-                for draft_step in range(1, self.num_speculative_tokens):
-                    common_attn_metadata, _ = self.attn_update_stack_num_spec_norm(
-                        draft_step,
-                        None,
-                        common_attn_metadata,
-                        batch_size,
-                        num_input_tokens,
-                        used_update_positions,
-                        aclgraph_runtime_mode,
-                        attn_group=None,
-                    )
-                    per_layer_attn_metadata = {}
-                    for layer_name in self.attn_layer_names:
-                        per_layer_attn_metadata[layer_name] = (
-                            self._build_edge_cloud_attn_metadata(
-                                common_attn_metadata
-                            )
-                        )
-                    multi_steps_attn_metadata.append(per_layer_attn_metadata)
+            # side (PPMissingLayer on edge), so no attention metadata is needed.
+            multi_steps_attn_metadata = []
+            attn_metadata_i = None
 
         token_indices_to_sample_len = token_indices_to_sample.shape[0]
         self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
@@ -1399,6 +1372,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         attn_group=None,
     ):
         assert draft_step > 0
+        assert attn_group is not None, "vllm-ascend v0.17.0rc1 requires attn_group"
         common_attn_metadata = self.shallow_copy_metadata(old_common_metadata)
 
         if draft_step == 1:
@@ -1545,68 +1519,21 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             : common_attn_metadata.query_start_loc.shape[0]
         ]
 
-        if attn_group is not None:
-            attn_metadata_builder = attn_group.get_metadata_builder()
-            attn_metadata = attn_metadata_builder.build_for_drafting(
-                common_attn_metadata=common_attn_metadata,
-                draft_index=draft_step,
-            )
+        attn_metadata_builder = attn_group.get_metadata_builder()
 
-            if self.pcp_size * self.dcp_size > 1:
-                if self.vllm_config.model_config.use_mla:
-                    if getattr(attn_metadata, "decode", None):
-                        attn_metadata.decode.cp_seq_len = cp_seq_len
-                else:
-                    attn_metadata.decode_meta.num_computed_tokens_of_pcp_dcp = num_computed_tokens_of_pcp_dcp.numpy()
-        else:
-            attn_metadata = None
+        attn_metadata = attn_metadata_builder.build_for_drafting(
+            common_attn_metadata=common_attn_metadata,
+            draft_index=draft_step,
+        )
+
+        if self.pcp_size * self.dcp_size > 1:
+            if self.vllm_config.model_config.use_mla:
+                if getattr(attn_metadata, "decode", None):
+                    attn_metadata.decode.cp_seq_len = cp_seq_len
+            else:
+                attn_metadata.decode_meta.num_computed_tokens_of_pcp_dcp = num_computed_tokens_of_pcp_dcp.numpy()
 
         return common_attn_metadata, attn_metadata
-
-    def _build_edge_cloud_attn_metadata(
-        self, common_attn_metadata: AscendCommonAttentionMetadata
-    ) -> AscendMetadata:
-        """Build AscendMetadata from common metadata for edge-cloud draft layers.
-
-        On the edge side draft attention layers are replaced by PPMissingLayer,
-        so the normal metadata builder is unavailable.  We construct the minimal
-        AscendMetadata directly from the common tensors so they can be sent to
-        the cloud."""
-        num_reqs = common_attn_metadata.num_reqs
-        num_actual_tokens = common_attn_metadata.num_actual_tokens
-        # Use CPU seq_lens to match the normal metadata builder
-        if common_attn_metadata._seq_lens_cpu is not None:
-            seq_lens = common_attn_metadata._seq_lens_cpu[:num_reqs]
-        elif common_attn_metadata.seq_lens_cpu is not None:
-            seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
-        else:
-            seq_lens = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
-        # Truncate slot_mapping to actual tokens so cloud receives exact-size tensor
-        slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]
-        # Truncate query_start_loc to actual requests
-        query_start_loc = common_attn_metadata.query_start_loc[:num_reqs + 1]
-        query_start_loc_cpu = (
-            common_attn_metadata.query_start_loc_cpu[:num_reqs + 1]
-            if common_attn_metadata.query_start_loc_cpu is not None
-            else query_start_loc.cpu()
-        )
-        return AscendMetadata(
-            num_actual_tokens=num_actual_tokens,
-            num_decode_tokens=num_actual_tokens,
-            block_tables=common_attn_metadata.block_table_tensor,
-            query_start_loc=query_start_loc,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens,
-            seq_lens_list=seq_lens.tolist() if seq_lens is not None else [],
-            max_query_len=common_attn_metadata.max_query_len,
-            actual_seq_lengths_q=query_start_loc_cpu[1:].tolist(),
-            slot_mapping=slot_mapping,
-            attn_state=AscendAttentionState.SpecDecoding,
-            num_prefills=0,
-            num_decodes=num_reqs,
-            causal=True,
-            model_runner_type=self.vllm_config.model_config.runner_type,
-        )
 
     def prepare_next_token_ids_padded(
         self,
@@ -2032,7 +1959,49 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             positions = model_kwargs.get("positions", None)
             num_tokens = positions.shape[0] if positions is not None else 0
 
-            # Reconstruct attention metadata from edge-provided tensors.
+            # Reconstruct attention metadata.  Prefer edge-provided tensors;
+            # when the edge cannot supply them (draft attention layers are on
+            # the cloud side), compute slot_mapping from the cloud's own
+            # KV-cache block tables.
+            if "draft_slot_mapping_0" not in tensor_dict:
+                if positions is not None and self.kv_cache_gid >= 0:
+                    blk_table = self.runner.input_batch.block_table[
+                        self.kv_cache_gid
+                    ]
+                    block_tables = blk_table.get_device_tensor()
+                    block_size = (
+                        self.block_size
+                        if hasattr(self, "block_size") and self.block_size
+                        else None
+                    )
+                    if block_size is not None and block_tables is not None:
+                        num_tokens = positions.shape[0]
+                        block_numbers = positions // block_size
+                        block_ids = (
+                            block_tables[:num_tokens]
+                            .gather(
+                                dim=1, index=block_numbers.view(-1, 1)
+                            )
+                            .view(-1)
+                        )
+                        slot_mapping = (
+                            block_ids * block_size + positions % block_size
+                        ).to(torch.int32)
+                        seq_lens = (positions + 1).to(torch.int32)
+                        query_start_loc = torch.arange(
+                            num_tokens + 1,
+                            dtype=torch.int32,
+                            device=positions.device,
+                        )
+                        tensor_dict["draft_slot_mapping_0"] = slot_mapping
+                        tensor_dict["draft_seq_lens_0"] = seq_lens
+                        tensor_dict["draft_block_tables_0"] = block_tables[
+                            :num_tokens
+                        ]
+                        tensor_dict[
+                            "draft_query_start_loc_0"
+                        ] = query_start_loc
+
             multi_steps_attn_metadata = []
             step_idx = 0
             while f"draft_slot_mapping_{step_idx}" in tensor_dict:
@@ -2056,9 +2025,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         ),
                         max_query_len=1,
                         actual_seq_lengths_q=(
-                            query_start_loc[1:].tolist()
-                            if query_start_loc is not None
-                            else []
+                            [1] * seq_lens.shape[0] if seq_lens is not None else []
                         ),
                         slot_mapping=slot_mapping,
                         attn_state=AscendAttentionState.SpecDecoding,

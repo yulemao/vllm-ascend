@@ -2512,11 +2512,44 @@ class NPUModelRunner(GPUModelRunner):
             if "spec_step_idx" in tensor_dict:
                 model_kwargs["spec_step_idx"] = tensor_dict["spec_step_idx"].item()
 
-            # Reconstruct attention metadata from edge-provided tensors.
+            # Reconstruct attention metadata.  Prefer edge-provided tensors;
+            # when the edge cannot supply them (draft attention layers are on
+            # the cloud side as PPMissingLayer), compute slot_mapping from the
+            # cloud's own KV-cache block tables.
             slot_mapping = tensor_dict.get("draft_slot_mapping_0")
             seq_lens = tensor_dict.get("draft_seq_lens_0")
             block_tables = tensor_dict.get("draft_block_tables_0")
             query_start_loc = tensor_dict.get("draft_query_start_loc_0")
+            if slot_mapping is None and positions is not None and self.drafter is not None:
+                drafter = self.drafter
+                kv_cache_gid = getattr(drafter, "kv_cache_gid", -1)
+                if kv_cache_gid is not None and kv_cache_gid >= 0:
+                    blk_table = self.input_batch.block_table[kv_cache_gid]
+                    block_tables = blk_table.get_device_tensor()
+                    block_size = getattr(drafter, "block_size", None)
+                    if block_size is None and getattr(
+                        drafter, "draft_attn_groups", None
+                    ):
+                        block_size = drafter.draft_attn_groups[
+                            0
+                        ].kv_cache_spec.block_size
+                    if block_size is not None and block_tables is not None:
+                        num_tokens = positions.shape[0]
+                        block_numbers = positions // block_size
+                        block_ids = (
+                            block_tables[:num_tokens]
+                            .gather(dim=1, index=block_numbers.view(-1, 1))
+                            .view(-1)
+                        )
+                        slot_mapping = (
+                            block_ids * block_size + positions % block_size
+                        ).to(torch.int32)
+                        seq_lens = (positions + 1).to(torch.int32)
+                        query_start_loc = torch.arange(
+                            num_tokens + 1,
+                            dtype=torch.int32,
+                            device=positions.device,
+                        )
             if slot_mapping is not None:
                 per_layer_md = {}
                 layer_names = (
@@ -2538,9 +2571,7 @@ class NPUModelRunner(GPUModelRunner):
                         ),
                         max_query_len=1,
                         actual_seq_lengths_q=(
-                            query_start_loc[1:].tolist()
-                            if query_start_loc is not None
-                            else []
+                            [1] * seq_lens.shape[0] if seq_lens is not None else []
                         ),
                         slot_mapping=slot_mapping,
                         attn_state=AscendAttentionState.SpecDecoding,

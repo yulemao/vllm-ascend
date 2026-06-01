@@ -904,6 +904,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if self.method == "mtp":
                     model_kwargs["positions"] = model_positions
 
+            if self.method == "mtp":
+                model_kwargs["mtp_num_reqs"] = batch_size
+
         if (
             self.method == "mtp"
             and self.runner is not None
@@ -1096,6 +1099,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # draft_step + 1 because the first draft token was already
                 # generated in the first pass.
                 model_kwargs["spec_step_idx"] = draft_step + 1
+                model_kwargs["mtp_num_reqs"] = batch_size
                 ret_hidden_states = self._run_mtp_edge_cloud(**model_kwargs)
                 if self.runner.edge_cloud_cfg.role == "cloud":
                     # Cloud has already sent hidden states back to edge;
@@ -1885,12 +1889,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             output = segments["a"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)
 
-            # Include positions and spec_step_idx so cloud can run the correct
-            # decoder layer.
+            # Include positions, spec_step_idx, and num_reqs so cloud can
+            # build correct attention metadata for the MTP decoder layer.
             output["positions"] = model_kwargs["positions"]
             if "spec_step_idx" in model_kwargs:
                 output["spec_step_idx"] = torch.tensor(
                     model_kwargs["spec_step_idx"], dtype=torch.int64, device="cpu"
+                )
+            if "mtp_num_reqs" in model_kwargs:
+                output["mtp_num_reqs"] = torch.tensor(
+                    model_kwargs["mtp_num_reqs"], dtype=torch.int64, device="cpu"
                 )
             if get_pp_group().world_size == 2:
                 send_work = get_pp_group().isend_tensor_dict(
@@ -1910,7 +1918,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             # Edge last segment: norm
             model_kwargs["intermediate_tensors"] = intermediate
-            for key in ("input_ids", "inputs_embeds", "hidden_states", "spec_step_idx"):
+            for key in ("input_ids", "inputs_embeds", "hidden_states", "spec_step_idx", "mtp_num_reqs"):
                 model_kwargs.pop(key, None)
             final_output = segments["e"](**model_kwargs)
             return final_output
@@ -1934,90 +1942,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 model_kwargs["positions"] = tensor_dict["positions"]
             positions = model_kwargs.get("positions", None)
             num_tokens = positions.shape[0] if positions is not None else 0
-
-            # Build draft attention metadata so cloud-side decoder layers can
-            # perform paged attention and update KV cache correctly.
-            attn_metadata = None
-            if num_tokens > 0 and positions is not None:
-                from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetadata
-                seq_lens = (positions + 1).to(torch.int32)
-                seq_lens_list = seq_lens.cpu().tolist()
-                actual_seq_lengths_q = list(range(1, num_tokens + 1))
-
-                slot_mapping = None
-                block_tables = None
-                if (
-                    self.runner is not None
-                    and self.runner.drafter is not None
-                    and hasattr(self.runner.drafter, "kv_cache_gid")
-                    and self.runner.input_batch is not None
-                    and hasattr(self.runner.input_batch, "block_table")
-                    and len(self.runner.input_batch.block_table.block_tables) > self.runner.drafter.kv_cache_gid
-                ):
-                    draft_block_table = self.runner.input_batch.block_table[self.runner.drafter.kv_cache_gid]
-                    block_tables_all = draft_block_table.block_table.gpu
-                    block_size = draft_block_table.block_size
-                    positions_device = positions.to(block_tables_all.device)
-
-                    # Clamp num_tokens to available rows in block_table to avoid
-                    # gather index row count mismatch (MTP may have num_tokens > num_reqs).
-                    num_available_rows = block_tables_all.shape[0]
-                    if num_tokens > num_available_rows:
-                        logger.warning(
-                            "num_tokens (%d) exceeds block_table rows (%d), "
-                            "truncating to available rows",
-                            num_tokens,
-                            num_available_rows,
-                        )
-                    effective_num_tokens = min(num_tokens, num_available_rows)
-                    block_tables = block_tables_all[:effective_num_tokens]
-
-                    # Clamp block_numbers to valid column range to avoid gather
-                    # index out of bounds (positions may exceed draft block_table).
-                    max_blocks = block_tables.shape[1]
-                    block_numbers = (positions_device[:effective_num_tokens] // block_size).int()
-                    block_numbers = block_numbers.clamp(0, max_blocks - 1)
-                    block_ids = block_tables.gather(dim=1, index=block_numbers.unsqueeze(1))
-                    block_ids = block_ids.view(-1)
-
-                    # Pad block_ids back to original num_tokens if we truncated.
-                    if effective_num_tokens < num_tokens:
-                        pad = torch.zeros(
-                            num_tokens - effective_num_tokens,
-                            dtype=block_ids.dtype,
-                            device=block_ids.device,
-                        )
-                        block_ids = torch.cat([block_ids, pad])
-
-                    slot_mapping = (block_ids * block_size + positions_device % block_size).to(torch.int32)
-
-                if slot_mapping is not None:
-                    attn_metadata = AscendMetadata(
-                        attn_state=AscendAttentionState.DecodeOnly,
-                        seq_lens=seq_lens,
-                        seq_lens_cpu=seq_lens.cpu(),
-                        seq_lens_list=seq_lens_list,
-                        actual_seq_lengths_q=actual_seq_lengths_q,
-                        block_tables=block_tables,
-                        slot_mapping=slot_mapping,
-                        causal=True,
-                        num_actual_tokens=num_tokens,
-                        num_decode_tokens=num_tokens,
-                        num_prefills=0,
-                        num_decodes=num_tokens,
-                    )
-
-                    if self.runner.drafter is not None and self.runner.drafter.attn_layer_names:
-                        per_layer_metadata = {}
-                        for layer_name in self.runner.drafter.attn_layer_names:
-                            per_layer_metadata[layer_name] = attn_metadata
-                        attn_metadata = per_layer_metadata
-
+            num_reqs = tensor_dict.get("mtp_num_reqs", num_tokens)
+            if isinstance(num_reqs, torch.Tensor):
+                num_reqs = num_reqs.item()
+            spec_step_idx = model_kwargs.get("spec_step_idx", 0)
+            attn_metadata = self.runner._build_mtp_cloud_attn_metadata(
+                num_tokens, positions, num_reqs, spec_step_idx
+            )
             with set_ascend_forward_context(
                 attn_metadata=attn_metadata,
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
                 is_draft_model=True,
+                draft_attn_metadatas=[attn_metadata],
             ):
                 output = segments["c"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)

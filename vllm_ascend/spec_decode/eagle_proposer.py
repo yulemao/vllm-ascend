@@ -1957,10 +1957,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     draft_block_table = self.runner.input_batch.block_table[self.runner.drafter.kv_cache_gid]
                     block_tables = draft_block_table.block_table.gpu[:num_tokens]
                     block_size = draft_block_table.block_size
-                    block_numbers = (positions // block_size).long()
+                    positions_device = positions.to(block_tables.device)
+                    block_numbers = (positions_device // block_size).long()
                     block_ids = block_tables.gather(dim=1, index=block_numbers.view(-1, 1))
                     block_ids = block_ids.view(-1)
-                    slot_mapping = (block_ids * block_size + positions % block_size).to(torch.int32)
+                    slot_mapping = (block_ids * block_size + positions_device % block_size).to(torch.int32)
 
                 if slot_mapping is not None:
                     attn_metadata = AscendMetadata(

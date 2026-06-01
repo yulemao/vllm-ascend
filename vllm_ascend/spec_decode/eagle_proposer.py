@@ -1928,14 +1928,30 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             model_kwargs["intermediate_tensors"] = intermediate
             for key in ("input_ids", "inputs_embeds", "hidden_states"):
                 model_kwargs.pop(key, None)
+            spec_step_idx = 0
             if "spec_step_idx" in tensor_dict:
-                model_kwargs["spec_step_idx"] = tensor_dict["spec_step_idx"].item()
+                spec_step_idx = tensor_dict["spec_step_idx"].item()
+                model_kwargs["spec_step_idx"] = spec_step_idx
             if "positions" in tensor_dict:
                 model_kwargs["positions"] = tensor_dict["positions"]
             positions = model_kwargs.get("positions", None)
             num_tokens = positions.shape[0] if positions is not None else 0
+
+            # Build attention metadata for the MTP decoder layers on
+            # the cloud side.  Without this, the Ascend attention
+            # backend silently returns zeros, corrupting hidden states.
+            draft_attn_metadata = None
+            if (
+                self.runner is not None
+                and hasattr(self.runner, "_build_mtp_cloud_attn_metadata")
+                and positions is not None
+            ):
+                draft_attn_metadata = self.runner._build_mtp_cloud_attn_metadata(
+                    positions, spec_step_idx
+                )
+
             with set_ascend_forward_context(
-                attn_metadata=None,
+                attn_metadata=draft_attn_metadata,
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
                 is_draft_model=True,

@@ -835,6 +835,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         token_indices_to_sample_len = token_indices_to_sample.shape[0]
         self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
 
+        # Stash reject-corrected attention metadata for edge-cloud MTP so
+        # that the cloud side can build correct attention metadata.
+        if (
+            self.method == "mtp"
+            and self.runner is not None
+            and getattr(self.runner, "_edge_cloud_enabled", False)
+        ):
+            self._mtp_cloud_attn_meta = {
+                "seq_lens": common_attn_metadata.seq_lens,
+                "seq_lens_cpu": common_attn_metadata.seq_lens_cpu,
+                "_seq_lens_cpu": common_attn_metadata._seq_lens_cpu,
+                "slot_mapping": common_attn_metadata.slot_mapping,
+                "query_start_loc": common_attn_metadata.query_start_loc,
+                "query_start_loc_cpu": common_attn_metadata.query_start_loc_cpu,
+                "num_actual_tokens": num_tokens,
+            }
+
         with set_ascend_forward_context(
             multi_steps_attn_metadata[0] if multi_steps_attn_metadata else None,
             self.vllm_config,
@@ -1892,6 +1909,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 output["spec_step_idx"] = torch.tensor(
                     model_kwargs["spec_step_idx"], dtype=torch.int64, device="cpu"
                 )
+            # Pass reject-corrected attention metadata to cloud so it can
+            # build accurate attention metadata after tokens are rejected.
+            if hasattr(self, "_mtp_cloud_attn_meta") and self._mtp_cloud_attn_meta is not None:
+                meta = self._mtp_cloud_attn_meta
+                for key in ("seq_lens", "seq_lens_cpu", "_seq_lens_cpu",
+                            "slot_mapping", "query_start_loc", "query_start_loc_cpu"):
+                    val = meta.get(key)
+                    if val is not None:
+                        output[key] = val
+                output["num_actual_tokens"] = torch.tensor(
+                    meta["num_actual_tokens"], dtype=torch.int64, device="cpu"
+                )
             if get_pp_group().world_size == 2:
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v
@@ -1940,6 +1969,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Build attention metadata for the MTP decoder layers on
             # the cloud side.  Without this, the Ascend attention
             # backend silently returns zeros, corrupting hidden states.
+            # Use reject-corrected metadata sent from edge if available.
+            cloud_meta = {}
+            for key in ("seq_lens", "seq_lens_cpu", "_seq_lens_cpu",
+                        "slot_mapping", "query_start_loc", "query_start_loc_cpu"):
+                if key in tensor_dict:
+                    cloud_meta[key] = tensor_dict[key]
+            if "num_actual_tokens" in tensor_dict:
+                cloud_meta["num_actual_tokens"] = tensor_dict["num_actual_tokens"].item()
+
             draft_attn_metadata = None
             if (
                 self.runner is not None
@@ -1947,7 +1985,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 and positions is not None
             ):
                 draft_attn_metadata = self.runner._build_mtp_cloud_attn_metadata(
-                    positions, spec_step_idx
+                    positions, spec_step_idx, cloud_meta
                 )
 
             with set_ascend_forward_context(

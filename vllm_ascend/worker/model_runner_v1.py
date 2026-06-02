@@ -2504,6 +2504,7 @@ class NPUModelRunner(GPUModelRunner):
         self,
         positions: torch.Tensor,
         spec_step_idx: int,
+        cloud_meta: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Build per-layer attention metadata for the MTP cloud decoder.
 
@@ -2545,21 +2546,28 @@ class NPUModelRunner(GPUModelRunner):
         # draft token per step.
         batch_size = num_reqs
 
-        # For the first draft step, the draft model processes the same
-        # tokens as the target model (num_tokens = batch_size *
-        # decode_threshold for decode).  For subsequent steps, only
-        # batch_size tokens are processed.  The cloud side only runs
-        # the decoder layer (not embed/fc/norm), so it always
-        # receives batch_size * decode_threshold tokens for step 0 and
-        # batch_size tokens for step > 0.
-        if spec_step_idx == 0:
-            num_tokens = batch_size * self.decode_threshold
-        else:
-            num_tokens = batch_size
-
-        # Update common_attn_metadata fields for this draft step.
+        # Use the actual number of tokens carried by positions,
+        # which already accounts for rejected tokens on the edge side.
+        # When cloud_meta is provided, also overwrite seq_lens,
+        # slot_mapping and query_start_loc with the reject-corrected
+        # values so the Ascend attention backend reads the right KV.
+        num_tokens = positions.shape[0]
         common_attn_metadata.num_actual_tokens = num_tokens
         common_attn_metadata.num_input_tokens = num_tokens
+
+        if cloud_meta is not None:
+            if "seq_lens" in cloud_meta:
+                common_attn_metadata.seq_lens = cloud_meta["seq_lens"]
+            if "seq_lens_cpu" in cloud_meta:
+                common_attn_metadata.seq_lens_cpu = cloud_meta["seq_lens_cpu"]
+            if "_seq_lens_cpu" in cloud_meta:
+                common_attn_metadata._seq_lens_cpu = cloud_meta["_seq_lens_cpu"]
+            if "slot_mapping" in cloud_meta:
+                common_attn_metadata.slot_mapping = cloud_meta["slot_mapping"]
+            if "query_start_loc" in cloud_meta:
+                common_attn_metadata.query_start_loc = cloud_meta["query_start_loc"]
+            if "query_start_loc_cpu" in cloud_meta:
+                common_attn_metadata.query_start_loc_cpu = cloud_meta["query_start_loc_cpu"]
 
         if spec_step_idx > 0:
             # For steps after the first, each request has exactly one

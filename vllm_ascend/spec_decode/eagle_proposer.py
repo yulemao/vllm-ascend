@@ -169,6 +169,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # since final block table tensor is not ready in __init__, it is delayed until dummy_run
         self.block_table_tensor_clone: torch.Tensor | None = None
 
+        # Edge-cloud MTP: saved common metadata for packing draft attention
+        # tensors when draft_attn_groups is empty on the edge side.
+        self._edge_cloud_mtp_block_tables: torch.Tensor | None = None
+        self._edge_cloud_mtp_batch_size: int = 0
+        self._edge_cloud_mtp_token_indices: torch.Tensor | None = None
+
         self._runnable = self._run_merged_draft
         self.is_multimodal_model = self.vllm_config.model_config.is_multimodal_model
         if self.uses_mrope:
@@ -704,6 +710,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         common_attn_metadata.query_start_loc = self.query_start_loc_group[0][: num_reqs_padded + 1]
 
         common_attn_metadata.num_input_tokens = num_input_tokens
+
+        # Save common metadata for edge-cloud MTP so that the edge side
+        # can pack slot_mapping / seq_lens / block_tables / query_start_loc
+        # for the cloud when draft attention layers are absent on edge.
+        if (
+            self.method == "mtp"
+            and self.runner is not None
+            and getattr(self.runner, "_edge_cloud_enabled", False)
+        ):
+            self._edge_cloud_mtp_block_tables = (
+                common_attn_metadata.block_table_tensor
+            )
+            self._edge_cloud_mtp_batch_size = batch_size
+            self._edge_cloud_mtp_token_indices = (
+                common_attn_metadata.query_start_loc[1:] - 1
+            )
+
         if self.draft_attn_groups:
             # FIXME(woosuk): The below two ops cause synchronization. Optimize.
             assert len(self.draft_attn_groups) > 0
@@ -1915,6 +1938,42 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         output[f"draft_query_start_loc_{step_idx}"] = (
                             md.query_start_loc
                         )
+            else:
+                # Edge-cloud MTP: draft_attn_groups is empty on the edge
+                # side (MTP layers are on cloud). Derive slot_mapping,
+                # seq_lens, block_tables and query_start_loc from saved
+                # common metadata and pre-populated groups.
+                spec_step_idx = model_kwargs.get("spec_step_idx", 0)
+                batch_size = self._edge_cloud_mtp_batch_size
+                if batch_size > 0:
+                    draft_indices = self._edge_cloud_mtp_token_indices
+                    if self.uses_mrope:
+                        positions = self.mrope_positions[:, draft_indices]
+                        # Use the first RoPE dimension for slot mapping.
+                        pos_for_slots = positions[0]
+                    else:
+                        pos_for_slots = self.positions[draft_indices]
+                    block_size = self.kernel_block_size
+
+                    block_numbers = pos_for_slots // block_size
+                    block_table = self._edge_cloud_mtp_block_tables
+                    block_ids = (
+                        block_table[:batch_size]
+                        .gather(dim=1, index=block_numbers.view(-1, 1))
+                        .view(-1)
+                    )
+                    slot_mapping = (
+                        block_ids * block_size + pos_for_slots % block_size
+                    )
+
+                    output["draft_slot_mapping_0"] = slot_mapping
+                    output["draft_seq_lens_0"] = (
+                        self.seq_lens_group[0][:batch_size] + spec_step_idx
+                    )
+                    output["draft_query_start_loc_0"] = torch.arange(
+                        batch_size + 1, dtype=torch.int32, device=self.device
+                    )
+                    output["draft_block_tables_0"] = block_table[:batch_size]
 
             if get_pp_group().world_size == 2:
                 send_work = get_pp_group().isend_tensor_dict(

@@ -2483,83 +2483,6 @@ class NPUModelRunner(GPUModelRunner):
         )
         return async_output
 
-    def _build_mtp_attn_metadata(
-        self,
-        num_tokens: int,
-        positions: torch.Tensor,
-    ) -> dict[str, Any] | None:
-        """Build attention metadata for MTP draft model layers.
-
-        On the cloud side of edge-cloud MTP, the draft decoder layers are
-        real and need proper attention metadata so the Ascend attention
-        backend does not short-circuit with all-zero output (see
-        AscendAttentionBackendImpl.forward).
-        """
-        if (self.drafter is None
-            or not hasattr(self.drafter, "draft_attn_groups")
-            or not self.drafter.draft_attn_groups):
-            return None
-
-        try:
-            num_reqs = self.input_batch.num_reqs
-            if num_reqs == 0 or num_tokens == 0 or num_tokens % num_reqs != 0:
-                return None
-
-            kv_cache_gid = self.drafter.kv_cache_gid
-            if kv_cache_gid < 0 or kv_cache_gid >= len(self.input_batch.block_table):
-                return None
-
-            tokens_per_req = num_tokens // num_reqs
-            query_start_loc = torch.arange(
-                num_reqs + 1, dtype=torch.int32, device=self.device
-            ) * tokens_per_req
-
-            blk_table = self.input_batch.block_table[kv_cache_gid]
-            blk_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
-            slot_mapping = blk_table.slot_mapping.gpu[:num_tokens]
-            block_table_tensor = blk_table.get_device_tensor()[:num_reqs]
-
-            seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs]
-            common_attn_metadata = AscendCommonAttentionMetadata(
-                query_start_loc=query_start_loc,
-                query_start_loc_cpu=query_start_loc.cpu(),
-                seq_lens=self.seq_lens[:num_reqs],
-                _seq_lens_cpu=seq_lens_cpu,
-                seq_lens_cpu=seq_lens_cpu,
-                seq_lens_cpu_upper_bound=seq_lens_cpu,
-                num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
-                num_reqs=num_reqs,
-                num_actual_tokens=num_tokens,
-                max_query_len=tokens_per_req,
-                max_seq_len=int(seq_lens_cpu.max().item()),
-                block_table_tensor=block_table_tensor,
-                slot_mapping=slot_mapping,
-                causal=True,
-                num_input_tokens=num_tokens,
-                actual_seq_lengths_q=self.actual_seq_lengths_q,
-                positions=positions,
-                attn_state=self.attn_state,
-                decode_token_per_req=self.decode_token_per_req,
-            )
-
-            builder = self.drafter.draft_attn_groups[0].get_metadata_builder()
-            attn_metadata = builder.build(
-                common_prefix_len=0,
-                common_attn_metadata=common_attn_metadata,
-            )
-
-            per_layer_attn_metadata: dict[str, Any] = {}
-            for layer_name in self.drafter.attn_layer_names:
-                per_layer_attn_metadata[layer_name] = attn_metadata
-
-            return per_layer_attn_metadata
-        except Exception:
-            logger.warning(
-                "Failed to build MTP attention metadata, "
-                "falling back to None (all-zero attention output)."
-            )
-            return None
-
     def _run_mtp_cloud_segment(self) -> None:
         from vllm_ascend.distributed.parallel_state import edge_cloud_broadcast_recv
 
@@ -2592,11 +2515,8 @@ class NPUModelRunner(GPUModelRunner):
             # Run cloud segment (all MTP decoder layers are on cloud)
             segment = self._edge_cloud_mtp_segments["c"]
             num_tokens = positions.shape[0] if positions is not None else 0
-
-            mtp_attn_metadata = self._build_mtp_attn_metadata(num_tokens, positions)
-
             with set_ascend_forward_context(
-                attn_metadata=mtp_attn_metadata,
+                attn_metadata=None,
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
                 is_draft_model=True,

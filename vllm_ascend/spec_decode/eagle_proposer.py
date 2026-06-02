@@ -1934,8 +1934,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 model_kwargs["positions"] = tensor_dict["positions"]
             positions = model_kwargs.get("positions", None)
             num_tokens = positions.shape[0] if positions is not None else 0
+            mtp_attn_metadata = getattr(
+                self.runner, "_build_mtp_attn_metadata", lambda _n, _p: None
+            )(num_tokens, positions)
             with set_ascend_forward_context(
-                attn_metadata=None,
+                attn_metadata=mtp_attn_metadata,
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
                 is_draft_model=True,

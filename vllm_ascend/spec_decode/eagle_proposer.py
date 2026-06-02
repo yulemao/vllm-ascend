@@ -3,7 +3,6 @@ import copy
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -829,18 +828,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         multi_steps_attn_metadata.append(per_layer_attn_metadata)
         else:
             # Edge-cloud MTP edge: draft attention layers are on the cloud
-            # side (PPMissingLayer on edge). We still need to build minimal
-            # per-layer metadata so the edge can forward it to the cloud
-            # for cloud-side attention.
-            per_layer_attn_metadata = {}
-            for layer_name in self.attn_layer_names:
-                per_layer_attn_metadata[layer_name] = SimpleNamespace(
-                    slot_mapping=common_attn_metadata.slot_mapping[:common_attn_metadata.num_actual_tokens],
-                    seq_lens=common_attn_metadata.seq_lens,
-                    block_tables=common_attn_metadata.block_table_tensor,
-                    query_start_loc=common_attn_metadata.query_start_loc,
-                )
-            multi_steps_attn_metadata = [per_layer_attn_metadata]
+            # side (PPMissingLayer on edge), so no attention metadata is needed.
+            multi_steps_attn_metadata = []
             attn_metadata_i = None
 
         token_indices_to_sample_len = token_indices_to_sample.shape[0]

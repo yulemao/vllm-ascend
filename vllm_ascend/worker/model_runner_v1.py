@@ -97,6 +97,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer_gpu import copy_num_valid_draft_tokens
+from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
@@ -2600,6 +2601,31 @@ class NPUModelRunner(GPUModelRunner):
             common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
                 self.drafter.token_arange_np[: batch_size + 1]
             ).clone()
+
+            # Recompute slot_mapping for the draft positions.
+            # The saved slot_mapping maps to KV cache slots for the
+            # target model's decode step. Draft tokens sit at positions
+            # incremented by spec_step_idx+1 and must access the
+            # corresponding KV cache slots. Using the target model's
+            # stale slot_mapping causes the attention layers to read
+            # from and write to the wrong KV cache entries, producing
+            # garbage tokens that can still pass verification (100%
+            # acceptance), causing an output loop.
+            max_model_len = self.model_config.max_model_len
+            draft_positions = positions[:batch_size]
+            exceeds_max_model_len = draft_positions >= max_model_len
+            clamped = torch.where(exceeds_max_model_len, 0, draft_positions)
+
+            block_size = self.drafter.kernel_block_size
+            block_numbers = clamped // block_size
+            block_ids = common_attn_metadata.block_table_tensor[
+                :batch_size
+            ].gather(dim=1, index=block_numbers.view(-1, 1)).view(-1)
+            new_slot_mapping = (
+                block_ids * block_size + clamped % block_size
+            ).to(torch.int32)
+            new_slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
+            common_attn_metadata.slot_mapping = new_slot_mapping
         else:
             common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
 

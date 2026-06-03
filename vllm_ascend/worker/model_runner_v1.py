@@ -2608,8 +2608,17 @@ class NPUModelRunner(GPUModelRunner):
             common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
                 self.drafter.token_arange_np[: batch_size + 1]
             ).clone()
-        else:
+            # Subsequent speculative steps are always decode-only.
             common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
+        else:
+            # For the first speculative step, preserve the original attn_state
+            # from the target model's forward pass (e.g. PrefillNoCache during
+            # the prefill phase, SpecDecoding during decode).  Overwriting it
+            # with SpecDecoding unconditionally causes the cloud-side draft
+            # model to read from an uninitialized KV cache, which corrupts
+            # hidden states and leads to 100% draft-hit dead loops.
+            if common_attn_metadata.attn_state is None:
+                common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
 
         # Build per-layer attention metadata using draft_attn_groups.
         per_layer_attn_metadata: dict[str, Any] = {}

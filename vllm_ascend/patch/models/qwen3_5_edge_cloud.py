@@ -189,8 +189,6 @@ def _forward_edge_cloud_segment_qwen3_5_mtp(
         )
 
     if not is_last_segment:
-        if residual is None:
-            residual = torch.zeros_like(hidden_states)
         return IntermediateTensors(
             {"hidden_states": hidden_states, "residual": residual}
         )

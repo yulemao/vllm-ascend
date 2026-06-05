@@ -4751,8 +4751,18 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     if not isinstance(layer, PPMissingLayer)
                 }
+                # Collect draft-model layer names so we don't accidentally
+                # filter them out below.
+                draft_layer_names: set[str] = set()
+                if hasattr(self, "drafter") and self.drafter is not None:
+                    draft_layer_names = getattr(self.drafter, "_draft_attn_layer_names", set())
+
                 filtered_spec: dict[str, KVCacheSpec] = {}
                 for layer_name, spec in kv_cache_spec.items():
+                    # Always preserve draft-model layers (MTP/EAGLE/etc.)
+                    if layer_name in draft_layer_names:
+                        filtered_spec[layer_name] = spec
+                        continue
                     match = re.search(r"layers\.(\d+)", layer_name)
                     if match is None or int(match.group(1)) in local_layer_indices:
                         filtered_spec[layer_name] = spec

@@ -2483,84 +2483,6 @@ class NPUModelRunner(GPUModelRunner):
         )
         return async_output
 
-    def _build_mtp_cloud_attention_metadata(
-        self,
-        positions: torch.Tensor,
-    ) -> dict[str, Any]:
-        """Build attention metadata for the MTP cloud segment in edge-cloud mode.
-
-        In edge-cloud MTP, the cloud side runs only the decoder layers for
-        speculative tokens. This method constructs an independent DecodeOnly
-        attention metadata from the current input batch state, without
-        re-using the decode-phase metadata directly.
-        """
-        num_tokens = positions.shape[0]
-        num_reqs = num_tokens
-
-        # Build query_start_loc for MTP: each request contributes exactly 1 token.
-        query_start_loc_cpu = torch.arange(num_reqs + 1, dtype=torch.int32, device="cpu")
-        query_start_loc = query_start_loc_cpu.to(self.device)
-
-        # Recompute slot_mapping using MTP positions so that reshape_and_cache
-        # writes KV to the correct slots for the speculative tokens.
-        self.input_batch.block_table.compute_slot_mapping(
-            num_reqs, query_start_loc, positions
-        )
-
-        # Get seq_lens from the current runner state.
-        seq_lens = self.seq_lens[:num_reqs]
-        optimistic_seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs]
-
-        # Build block_table and slot_mapping for each KV cache group.
-        block_table_tensor = self.input_batch.block_table[0].get_device_tensor()[:num_reqs]
-        slot_mapping = self.input_batch.block_table[0].slot_mapping.gpu[:num_tokens]
-
-        max_seq_len = int(optimistic_seq_lens_cpu.max().item())
-
-        cm = AscendCommonAttentionMetadata(
-            query_start_loc=query_start_loc,
-            query_start_loc_cpu=query_start_loc_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu=optimistic_seq_lens_cpu,
-            _seq_lens_cpu=optimistic_seq_lens_cpu,
-            seq_lens_cpu_upper_bound=optimistic_seq_lens_cpu,
-            num_reqs=num_reqs,
-            num_actual_tokens=num_tokens,
-            max_query_len=1,
-            max_seq_len=max_seq_len,
-            block_table_tensor=block_table_tensor,
-            slot_mapping=slot_mapping,
-            causal=True,
-            num_input_tokens=num_tokens,
-            actual_seq_lengths_q=[1] * num_reqs,
-            positions=positions,
-            attn_state=AscendAttentionState.DecodeOnly,
-            decode_token_per_req=1,
-        )
-
-        # Build per-layer metadata using the same builders as normal decode.
-        attn_metadata: dict[str, Any] = {}
-        for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
-            if kv_cache_gid > 0:
-                cm_gid = copy(cm)
-                cm_gid.block_table_tensor = self.input_batch.block_table[kv_cache_gid].get_device_tensor()[:num_reqs]
-                cm_gid.slot_mapping = self.input_batch.block_table[kv_cache_gid].slot_mapping.gpu[:num_tokens]
-            else:
-                cm_gid = cm
-
-            for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
-                attn_group = self.attn_groups[kv_cache_gid][attn_gid]
-                builder = attn_group.get_metadata_builder(0)
-                attn_metadata_i = builder.build(
-                    common_prefix_len=0,
-                    common_attn_metadata=cm_gid,
-                    fast_build=True,
-                )
-                for layer_name in attn_group.layer_names:
-                    attn_metadata[layer_name] = attn_metadata_i
-
-        return attn_metadata
-
     def _run_mtp_cloud_segment(self) -> None:
         from vllm_ascend.distributed.parallel_state import edge_cloud_broadcast_recv
 
@@ -2593,9 +2515,8 @@ class NPUModelRunner(GPUModelRunner):
             # Run cloud segment (all MTP decoder layers are on cloud)
             segment = self._edge_cloud_mtp_segments["c"]
             num_tokens = positions.shape[0] if positions is not None else 0
-            attn_metadata = self._build_mtp_cloud_attention_metadata(positions) if positions is not None else None
             with set_ascend_forward_context(
-                attn_metadata=attn_metadata,
+                attn_metadata=None,
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
                 is_draft_model=True,

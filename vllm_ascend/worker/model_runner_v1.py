@@ -2333,17 +2333,22 @@ class NPUModelRunner(GPUModelRunner):
                     and self.model_config.is_hybrid
                     and self._last_scheduler_output is not None
                 ):
-                    from vllm_ascend.distributed.parallel_state import (
-                        edge_cloud_broadcast_recv,
-                    )
+                    pp_group = get_pp_group()
+                    if pp_group.world_size == 2:
+                        tensor_dict, recv_handles, recv_postprocess = (
+                            pp_group.irecv_tensor_dict()
+                        )
+                        for handle in recv_handles:
+                            handle.wait()
+                        for postprocess in recv_postprocess:
+                            postprocess()
+                    else:
+                        tensor_dict = None
 
-                    tensor_dict, recv_handles, recv_postprocess = (
-                        edge_cloud_broadcast_recv()
+                    tensor_dict = get_tp_group().broadcast_object(
+                        tensor_dict, src=0
                     )
-                    for handle in recv_handles:
-                        handle.wait()
-                    for postprocess in recv_postprocess:
-                        postprocess()
+                    assert tensor_dict is not None
                     num_accepted = tensor_dict["num_accepted_tokens"].to(self.device)
                     num_reqs = num_accepted.size(0)
                     self.num_accepted_tokens.gpu[:num_reqs] = num_accepted
@@ -2481,11 +2486,12 @@ class NPUModelRunner(GPUModelRunner):
             ):
                 num_reqs = sampler_output.sampled_token_ids.size(0)
                 num_accepted = (sampler_output.sampled_token_ids != -1).sum(dim=1).cpu()
-                send_work = get_pp_group().isend_tensor_dict(
-                    {"num_accepted_tokens": num_accepted}
-                )
-                for handle in send_work:
-                    handle.wait()
+                if get_pp_group().world_size == 2:
+                    send_work = get_pp_group().isend_tensor_dict(
+                        {"num_accepted_tokens": num_accepted}
+                    )
+                    for handle in send_work:
+                        handle.wait()
 
             # vLLM v0.18 defers KV connector finalization during target-model
             # forward when speculative decoding is enabled. Finalize here after

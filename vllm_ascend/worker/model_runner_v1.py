@@ -2333,8 +2333,12 @@ class NPUModelRunner(GPUModelRunner):
                     and self.model_config.is_hybrid
                     and self._last_scheduler_output is not None
                 ):
+                    from vllm_ascend.distributed.parallel_state import (
+                        edge_cloud_broadcast_recv,
+                    )
+
                     tensor_dict, recv_handles, recv_postprocess = (
-                        get_pp_group().irecv_tensor_dict()
+                        edge_cloud_broadcast_recv()
                     )
                     for handle in recv_handles:
                         handle.wait()

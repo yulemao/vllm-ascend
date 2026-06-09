@@ -542,6 +542,15 @@ class NPUModelRunner(GPUModelRunner):
             self.cudagraph_batch_sizes = []
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
+
+        # Saved in execute_model() so sample_tokens() can access scheduler_output
+        # for edge-cloud mamba state sync (especially on the cloud side).
+        self._last_scheduler_output: "SchedulerOutput | None" = None
+
+        # Saved on the cloud side during execute_model() for use by
+        # _run_mtp_cloud_segment() which runs later in sample_tokens().
+        self._cloud_spec_decode_common_attn_metadata: AscendCommonAttentionMetadata | None = None
+        self._cloud_spec_decode_num_reqs: int = 0
         self.enable_hamming_sparse = (self.ascend_config.enable_hamming_sparse is True)
         self.enable_hamming_sparse = self.enable_hamming_sparse and not vllm_config.speculative_config
         if self.enable_hamming_sparse is True:
@@ -1873,7 +1882,10 @@ class NPUModelRunner(GPUModelRunner):
                 self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
-       
+
+        # Save scheduler_output for edge-cloud mamba state sync in sample_tokens().
+        self._last_scheduler_output = scheduler_output
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
@@ -2094,6 +2106,18 @@ class NPUModelRunner(GPUModelRunner):
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 )
 
+                # Save spec_decode_common_attn_metadata for cloud-side
+                # MTP draft proposal.  On the cloud side,
+                # execute_model_state is None (cloud is not the last PP
+                # rank), so the metadata would otherwise be lost.
+                if (
+                    self._edge_cloud_enabled
+                    and self.edge_cloud_cfg.role == "cloud"
+                    and spec_decode_common_attn_metadata is not None
+                ):
+                    self._cloud_spec_decode_common_attn_metadata = spec_decode_common_attn_metadata
+                    self._cloud_spec_decode_num_reqs = num_reqs
+
             (
                 input_ids,
                 inputs_embeds,
@@ -2297,6 +2321,49 @@ class NPUModelRunner(GPUModelRunner):
                     and "c" in self._edge_cloud_mtp_segments
                 ):
                     self._run_mtp_cloud_segment()
+
+                # Edge-cloud sync: receive num_accepted_tokens from edge for
+                # hybrid model mamba state update.  Cloud runs all GDN layers
+                # but its sample_tokens() returns early, so it never calls
+                # _update_states_after_model_execute() without this patch.
+                if (
+                    self._edge_cloud_enabled
+                    and self.edge_cloud_cfg.role == "cloud"
+                    and self.speculative_config
+                    and self.model_config.is_hybrid
+                    and self._last_scheduler_output is not None
+                ):
+                    tensor_dict, recv_handles, recv_postprocess = (
+                        get_pp_group().irecv_tensor_dict()
+                    )
+                    for handle in recv_handles:
+                        handle.wait()
+                    for postprocess in recv_postprocess:
+                        postprocess()
+                    num_accepted = tensor_dict["num_accepted_tokens"].to(self.device)
+                    num_reqs = num_accepted.size(0)
+                    self.num_accepted_tokens.gpu[:num_reqs] = num_accepted
+                    if self.cache_config.mamba_cache_mode == "align":
+                        for i, num_tokens in enumerate(
+                            self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
+                        ):
+                            self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
+                        mamba_utils.postprocess_mamba(
+                            self._last_scheduler_output,
+                            self.kv_cache_config,
+                            self.cache_config,
+                            self.input_batch,
+                            self.requests,
+                            self.mamba_state_idx,
+                            self.compilation_config.static_forward_context,
+                            self.model.get_mamba_state_copy_func(),
+                            self._get_mamba_copy_bufs(),
+                        )
+                    else:
+                        self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                            self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+                        )
+
                 return None  # noqa
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
@@ -2400,6 +2467,22 @@ class NPUModelRunner(GPUModelRunner):
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
 
+            # Edge-cloud sync: send num_accepted_tokens to cloud so that cloud
+            # can run _update_states_after_model_execute() for hybrid models.
+            if (
+                self._edge_cloud_enabled
+                and self.edge_cloud_cfg.role != "cloud"
+                and self.speculative_config
+                and self.model_config.is_hybrid
+            ):
+                num_reqs = sampler_output.sampled_token_ids.size(0)
+                num_accepted = (sampler_output.sampled_token_ids != -1).sum(dim=1).cpu()
+                send_work = get_pp_group().isend_tensor_dict(
+                    {"num_accepted_tokens": num_accepted}
+                )
+                for handle in send_work:
+                    handle.wait()
+
             # vLLM v0.18 defers KV connector finalization during target-model
             # forward when speculative decoding is enabled. Finalize here after
             # draft model runs so KV pool save/put can complete.
@@ -2483,6 +2566,162 @@ class NPUModelRunner(GPUModelRunner):
         )
         return async_output
 
+    def _build_mtp_cloud_attn_metadata(
+        self,
+        positions: torch.Tensor,
+        spec_step_idx: int,
+        cloud_meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Build per-layer attention metadata for the MTP cloud decoder.
+
+        On the cloud side, the MTP decoder layers are real (not
+        PPMissingLayer) and need proper attention metadata to produce
+        correct outputs.  Without it, the Ascend attention backend
+        silently returns zeros, corrupting hidden states and causing
+        low draft hit rates.
+
+        Uses the spec_decode_common_attn_metadata saved during
+        execute_model() and the drafter's draft_attn_groups to build
+        per-layer metadata for each speculative step.
+        """
+        if (
+            not hasattr(self, "_cloud_spec_decode_common_attn_metadata")
+            or self._cloud_spec_decode_common_attn_metadata is None
+        ):
+            return None
+
+        if (
+            self.drafter is None
+            or not hasattr(self.drafter, "draft_attn_groups")
+            or not self.drafter.draft_attn_groups
+        ):
+            return None
+
+        common_attn_metadata = self._cloud_spec_decode_common_attn_metadata
+        num_reqs = getattr(self, "_cloud_spec_decode_num_reqs", 0)
+
+        # Adapt common_attn_metadata for draft model positions.
+        # The positions come from the edge side and reflect the draft
+        # model's token positions for the current speculative step.
+        common_attn_metadata = self.drafter.shallow_copy_metadata(
+            common_attn_metadata
+        )
+        common_attn_metadata.positions = positions
+
+        # Compute batch_size: each decode request contributes one
+        # draft token per step.
+        batch_size = num_reqs
+
+        # Use the actual number of tokens carried by positions,
+        # which already accounts for rejected tokens on the edge side.
+        # When cloud_meta is provided, also overwrite seq_lens,
+        # slot_mapping and query_start_loc with the reject-corrected
+        # values so the Ascend attention backend reads the right KV.
+        num_tokens = positions.shape[0]
+        common_attn_metadata.num_actual_tokens = num_tokens
+        common_attn_metadata.num_input_tokens = num_tokens
+
+        if cloud_meta is not None:
+            if "seq_lens" in cloud_meta:
+                common_attn_metadata.seq_lens = cloud_meta["seq_lens"]
+            if "seq_lens_cpu" in cloud_meta:
+                common_attn_metadata.seq_lens_cpu = cloud_meta["seq_lens_cpu"]
+            if "_seq_lens_cpu" in cloud_meta:
+                common_attn_metadata._seq_lens_cpu = cloud_meta["_seq_lens_cpu"]
+            if "slot_mapping" in cloud_meta:
+                common_attn_metadata.slot_mapping = cloud_meta["slot_mapping"]
+            if "query_start_loc" in cloud_meta:
+                common_attn_metadata.query_start_loc = cloud_meta["query_start_loc"]
+            if "query_start_loc_cpu" in cloud_meta:
+                common_attn_metadata.query_start_loc_cpu = cloud_meta["query_start_loc_cpu"]
+
+        # Rebuild query_start_loc for every spec step so it is always
+        # consistent with num_actual_tokens.  The edge sends
+        # query_start_loc computed from the target model's forward,
+        # which reflects decode_token_per_req tokens per request.
+        # When the actual number of tokens delivered via positions
+        # differs (e.g. after SP reduction or reject corrections),
+        # the mismatch causes the attention builder to slice
+        # slot_mapping incorrectly, writing draft K/V to the main
+        # model's KV cache slots and corrupting subsequent decode
+        # steps (100% draft-hit dead loop).
+        if batch_size > 0 and num_tokens % batch_size == 0:
+            tokens_per_req = num_tokens // batch_size
+            common_attn_metadata.query_start_loc = (
+                self.drafter.arange[: batch_size + 1] * tokens_per_req
+            )
+            common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
+                self.drafter.token_arange_np[: batch_size + 1] * tokens_per_req
+            ).clone()
+        else:
+            common_attn_metadata.query_start_loc = self.drafter.arange[
+                : batch_size + 1
+            ]
+            common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
+                self.drafter.token_arange_np[: batch_size + 1]
+            ).clone()
+
+        if spec_step_idx > 0:
+            # For steps after the first, each request has exactly one
+            # query token and the sequence length has grown by
+            # spec_step_idx compared to the target model.
+            common_attn_metadata.max_query_len = 1
+            common_attn_metadata.decode_token_per_req = 1
+
+            # Increment seq_lens to account for previously accepted
+            # draft tokens.  The target model's seq_lens already
+            # includes one accepted token; each additional draft step
+            # adds one more.
+            common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
+            common_attn_metadata.seq_lens[:batch_size] += spec_step_idx
+            if common_attn_metadata.seq_lens_cpu is not None:
+                common_attn_metadata.seq_lens_cpu = (
+                    common_attn_metadata.seq_lens_cpu.clone()
+                )
+                common_attn_metadata.seq_lens_cpu[:batch_size] += spec_step_idx
+            if common_attn_metadata._seq_lens_cpu is not None:
+                common_attn_metadata._seq_lens_cpu = (
+                    common_attn_metadata._seq_lens_cpu.clone()
+                )
+                common_attn_metadata._seq_lens_cpu[:batch_size] += spec_step_idx
+            if common_attn_metadata.num_computed_tokens_cpu is not None:
+                common_attn_metadata.num_computed_tokens_cpu = (
+                    common_attn_metadata.num_computed_tokens_cpu.clone()
+                )
+                common_attn_metadata.num_computed_tokens_cpu[:batch_size] += (
+                    spec_step_idx
+                )
+
+            # Subsequent speculative steps are always decode-only.
+            common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
+        else:
+            # For the first speculative step, preserve the original attn_state
+            # from the target model's forward pass (e.g. PrefillNoCache during
+            # the prefill phase, SpecDecoding during decode).  Overwriting it
+            # with SpecDecoding unconditionally causes the cloud-side draft
+            # model to read from an uninitialized KV cache, which corrupts
+            # hidden states and leads to 100% draft-hit dead loops.
+            if common_attn_metadata.attn_state is None:
+                common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
+
+        # Build per-layer attention metadata using draft_attn_groups.
+        per_layer_attn_metadata: dict[str, Any] = {}
+        for attn_group in self.drafter.draft_attn_groups:
+            builder = attn_group.get_metadata_builder()
+            if spec_step_idx == 0:
+                attn_meta = builder.build(
+                    0, common_attn_metadata
+                )
+            else:
+                attn_meta = builder.build_for_drafting(
+                    common_attn_metadata=common_attn_metadata,
+                    draft_index=spec_step_idx,
+                )
+            for layer_name in attn_group.layer_names:
+                per_layer_attn_metadata[layer_name] = attn_meta
+
+        return per_layer_attn_metadata
+
     def _run_mtp_cloud_segment(self) -> None:
         from vllm_ascend.distributed.parallel_state import edge_cloud_broadcast_recv
 
@@ -2509,14 +2748,36 @@ class NPUModelRunner(GPUModelRunner):
                 "intermediate_tensors": intermediate,
                 "positions": positions,
             }
+            spec_step_idx = 0
             if "spec_step_idx" in tensor_dict:
-                model_kwargs["spec_step_idx"] = tensor_dict["spec_step_idx"].item()
+                spec_step_idx = tensor_dict["spec_step_idx"].item()
+                model_kwargs["spec_step_idx"] = spec_step_idx
+
+            # Extract reject-corrected attention metadata sent from edge
+            # so the cloud builds accurate attention metadata after tokens
+            # are rejected.
+            cloud_meta = {}
+            for key in ("seq_lens", "seq_lens_cpu", "_seq_lens_cpu",
+                        "slot_mapping", "query_start_loc",
+                        "query_start_loc_cpu"):
+                if key in tensor_dict:
+                    cloud_meta[key] = tensor_dict[key]
+            if "num_actual_tokens" in tensor_dict:
+                cloud_meta["num_actual_tokens"] = tensor_dict[
+                    "num_actual_tokens"].item()
+
+            # Build attention metadata for the MTP decoder layers.
+            # Without this, the Ascend attention backend silently
+            # returns zeros, corrupting hidden states.
+            draft_attn_metadata = self._build_mtp_cloud_attn_metadata(
+                positions, spec_step_idx, cloud_meta
+            )
 
             # Run cloud segment (all MTP decoder layers are on cloud)
             segment = self._edge_cloud_mtp_segments["c"]
             num_tokens = positions.shape[0] if positions is not None else 0
             with set_ascend_forward_context(
-                attn_metadata=None,
+                attn_metadata=draft_attn_metadata,
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
                 is_draft_model=True,
@@ -4574,8 +4835,18 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     if not isinstance(layer, PPMissingLayer)
                 }
+                # Collect draft-model layer names so we don't accidentally
+                # filter them out below.
+                draft_layer_names: set[str] = set()
+                if hasattr(self, "drafter") and self.drafter is not None:
+                    draft_layer_names = getattr(self.drafter, "_draft_attn_layer_names", set())
+
                 filtered_spec: dict[str, KVCacheSpec] = {}
                 for layer_name, spec in kv_cache_spec.items():
+                    # Always preserve draft-model layers (MTP/EAGLE/etc.)
+                    if layer_name in draft_layer_names:
+                        filtered_spec[layer_name] = spec
+                        continue
                     match = re.search(r"layers\.(\d+)", layer_name)
                     if match is None or int(match.group(1)) in local_layer_indices:
                         filtered_spec[layer_name] = spec

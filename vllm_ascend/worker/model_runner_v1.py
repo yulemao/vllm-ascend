@@ -2665,32 +2665,6 @@ class NPUModelRunner(GPUModelRunner):
             if "query_start_loc_cpu" in cloud_meta:
                 common_attn_metadata.query_start_loc_cpu = cloud_meta["query_start_loc_cpu"]
 
-        # Rebuild query_start_loc for every spec step so it is always
-        # consistent with num_actual_tokens.  The edge sends
-        # query_start_loc computed from the target model's forward,
-        # which reflects decode_token_per_req tokens per request.
-        # When the actual number of tokens delivered via positions
-        # differs (e.g. after SP reduction or reject corrections),
-        # the mismatch causes the attention builder to slice
-        # slot_mapping incorrectly, writing draft K/V to the main
-        # model's KV cache slots and corrupting subsequent decode
-        # steps (100% draft-hit dead loop).
-        if batch_size > 0 and num_tokens % batch_size == 0:
-            tokens_per_req = num_tokens // batch_size
-            common_attn_metadata.query_start_loc = (
-                self.drafter.arange[: batch_size + 1] * tokens_per_req
-            )
-            common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
-                self.drafter.token_arange_np[: batch_size + 1] * tokens_per_req
-            ).clone()
-        else:
-            common_attn_metadata.query_start_loc = self.drafter.arange[
-                : batch_size + 1
-            ]
-            common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
-                self.drafter.token_arange_np[: batch_size + 1]
-            ).clone()
-
         if spec_step_idx > 0:
             # For steps after the first, each request has exactly one
             # query token and the sequence length has grown by

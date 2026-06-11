@@ -97,6 +97,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer_gpu import copy_num_valid_draft_tokens
+from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
@@ -2704,6 +2705,55 @@ class NPUModelRunner(GPUModelRunner):
 
             # Subsequent speculative steps are always decode-only.
             common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
+
+            # Edge sends the SAME (first-pass) snapshot of
+            # slot_mapping / query_start_loc / num_actual_tokens /
+            # actual_seq_lengths_q for every speculative step.  From
+            # the second step onward the cloud must rebuild them to
+            # reflect a decode-only batch where each request owns
+            # exactly one query token.  Without this rebuild the
+            # attention backend reads stale offsets, picks the wrong
+            # KV slot and num_decode_tokens (derived inside
+            # split_decodes_and_prefills) ends up matching the
+            # first-pass num_actual_tokens instead of batch_size.
+            device = common_attn_metadata.seq_lens.device
+            new_query_start_loc_cpu = torch.arange(
+                batch_size + 1, dtype=torch.int32, device="cpu"
+            )
+            common_attn_metadata.query_start_loc_cpu = new_query_start_loc_cpu
+            common_attn_metadata.query_start_loc = new_query_start_loc_cpu.to(
+                device, non_blocking=True
+            )
+            common_attn_metadata.num_actual_tokens = batch_size
+            common_attn_metadata.num_input_tokens = num_input_tokens
+            common_attn_metadata.actual_seq_lengths_q = list(
+                range(1, batch_size + 1)
+            )
+
+            # Recompute slot_mapping from the freshly received positions
+            # and the (still valid) block_table.  Each decode token maps
+            # to position // block_size -> slot offset within the block.
+            block_table_tensor = common_attn_metadata.block_table_tensor
+            if (
+                block_table_tensor is not None
+                and positions is not None
+                and self.drafter is not None
+                and hasattr(self.drafter, "kernel_block_size")
+            ):
+                block_size = self.drafter.kernel_block_size
+                pos_flat = positions if positions.dim() == 1 else positions[0]
+                pos_flat = pos_flat[:batch_size]
+                exceeds = pos_flat >= self.model_config.max_model_len
+                clamped = torch.where(exceeds, torch.zeros_like(pos_flat), pos_flat)
+                block_numbers = clamped // block_size
+                block_ids = block_table_tensor[:batch_size].gather(
+                    dim=1, index=block_numbers.view(-1, 1).long()
+                ).view(-1)
+                new_slot_mapping = (
+                    block_ids * block_size + clamped % block_size
+                ).to(torch.int32)
+                new_slot_mapping.masked_fill_(exceeds, PADDING_SLOT_ID)
+                common_attn_metadata.slot_mapping = new_slot_mapping
         else:
             # For the first speculative step, preserve the original attn_state
             # from the target model's forward pass (e.g. PrefillNoCache during

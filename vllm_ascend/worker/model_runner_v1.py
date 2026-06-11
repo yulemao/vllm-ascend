@@ -2702,50 +2702,6 @@ class NPUModelRunner(GPUModelRunner):
                     spec_step_idx
                 )
 
-            # Update query_start_loc for single-token decode queries.
-            # After the first step each request contributes exactly one token.
-            qsl_len = num_input_tokens + 1
-            device = common_attn_metadata.query_start_loc.device
-            common_attn_metadata.query_start_loc = torch.arange(
-                qsl_len, dtype=torch.int32, device=device
-            )
-            if common_attn_metadata.query_start_loc_cpu is not None:
-                common_attn_metadata.query_start_loc_cpu = torch.arange(
-                    qsl_len, dtype=torch.int32, device="cpu"
-                )
-
-            # num_actual_tokens is the real number of draft tokens
-            # (one per request); num_input_tokens may include padding.
-            common_attn_metadata.num_actual_tokens = batch_size
-
-            # Recompute slot_mapping for the current positions.
-            if (
-                self.drafter is not None
-                and hasattr(self.drafter, "kernel_block_size")
-            ):
-                block_size = self.drafter.kernel_block_size
-                real_positions = positions[:batch_size]
-                exceeds = real_positions >= self.vllm_config.model_config.max_model_len
-                clamped_positions = torch.where(exceeds, 0, real_positions)
-                block_numbers = clamped_positions // block_size
-                # Use the runner's live block table instead of the cached
-                # common_attn_metadata.block_table_tensor, because the latter
-                # may have been resized (e.g. by _adjust_tensor in the
-                # proposer) and no longer covers all requests.
-                block_table = self.input_batch.block_table[0].get_device_tensor()[:batch_size]
-                block_ids = block_table.gather(dim=1, index=block_numbers.view(-1, 1))
-                block_ids = block_ids.view(-1)
-                real_slot_mapping = block_ids * block_size + clamped_positions % block_size
-                real_slot_mapping.masked_fill_(exceeds, -1)
-                if num_input_tokens > batch_size:
-                    slot_mapping = torch.full(
-                        (num_input_tokens,), -1, dtype=torch.int32, device=positions.device
-                    )
-                    slot_mapping[:batch_size] = real_slot_mapping.to(torch.int32)
-                else:
-                    slot_mapping = real_slot_mapping.to(torch.int32)
-                common_attn_metadata.slot_mapping = slot_mapping
-
             # Subsequent speculative steps are always decode-only.
             common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
         else:

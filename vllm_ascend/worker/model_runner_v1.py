@@ -710,7 +710,8 @@ class NPUModelRunner(GPUModelRunner):
         )
         target_device = torch.device(load_device)
 
-        self.model = self._initialize_edge_cloud_model_structure()
+        with torch.device(target_device):
+            self.model = self._initialize_edge_cloud_model_structure()
 
         transformer_model = LayerShardLoader._get_transformer_model(self.model)
         self.num_layers = len(transformer_model.layers)

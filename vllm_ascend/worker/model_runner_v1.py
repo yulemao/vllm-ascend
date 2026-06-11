@@ -2648,9 +2648,14 @@ class NPUModelRunner(GPUModelRunner):
         # When cloud_meta is provided, also overwrite seq_lens,
         # slot_mapping and query_start_loc with the reject-corrected
         # values so the Ascend attention backend reads the right KV.
-        num_tokens = positions.shape[0]
-        common_attn_metadata.num_actual_tokens = num_tokens
-        common_attn_metadata.num_input_tokens = num_tokens
+        num_input_tokens = positions.shape[-1]
+        num_actual_tokens = (
+            cloud_meta.get("num_actual_tokens", num_input_tokens)
+            if cloud_meta is not None
+            else num_input_tokens
+        )
+        common_attn_metadata.num_actual_tokens = num_actual_tokens
+        common_attn_metadata.num_input_tokens = num_input_tokens
 
         if cloud_meta is not None:
             if "seq_lens" in cloud_meta:
@@ -2780,7 +2785,7 @@ class NPUModelRunner(GPUModelRunner):
 
             # Run cloud segment (all MTP decoder layers are on cloud)
             segment = self._edge_cloud_mtp_segments["c"]
-            num_tokens = positions.shape[0] if positions is not None else 0
+            num_tokens = positions.shape[-1] if positions is not None else 0
             with set_ascend_forward_context(
                 attn_metadata=draft_attn_metadata,
                 vllm_config=self.vllm_config,

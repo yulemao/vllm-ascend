@@ -1964,7 +1964,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if "positions" in tensor_dict:
                 model_kwargs["positions"] = tensor_dict["positions"]
             positions = model_kwargs.get("positions", None)
-            num_tokens = positions.shape[0] if positions is not None else 0
+            num_tokens = positions.shape[-1] if positions is not None else 0
 
             # Build attention metadata for the MTP decoder layers on
             # the cloud side.  Without this, the Ascend attention

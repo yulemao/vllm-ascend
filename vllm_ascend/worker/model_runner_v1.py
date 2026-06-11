@@ -2722,14 +2722,17 @@ class NPUModelRunner(GPUModelRunner):
             if (
                 self.drafter is not None
                 and hasattr(self.drafter, "kernel_block_size")
-                and common_attn_metadata.block_table_tensor is not None
             ):
                 block_size = self.drafter.kernel_block_size
                 real_positions = positions[:batch_size]
                 exceeds = real_positions >= self.vllm_config.model_config.max_model_len
                 clamped_positions = torch.where(exceeds, 0, real_positions)
                 block_numbers = clamped_positions // block_size
-                block_table = common_attn_metadata.block_table_tensor[:batch_size]
+                # Use the runner's live block table instead of the cached
+                # common_attn_metadata.block_table_tensor, because the latter
+                # may have been resized (e.g. by _adjust_tensor in the
+                # proposer) and no longer covers all requests.
+                block_table = self.input_batch.block_table[0].get_device_tensor()[:batch_size]
                 block_ids = block_table.gather(dim=1, index=block_numbers.view(-1, 1))
                 block_ids = block_ids.view(-1)
                 real_slot_mapping = block_ids * block_size + clamped_positions % block_size

@@ -4026,36 +4026,6 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
-
-        # === Debug: check whether target model and MTP share physical KV cache ===
-        if kv_caches:
-            target_layer_name = None
-            mtp_layer_name = None
-            for name in kv_caches.keys():
-                if "layers.11" in name and "self_attn" in name and "mtp" not in name:
-                    target_layer_name = name
-                if "mtp" in name and "layers.0" in name and "self_attn" in name:
-                    mtp_layer_name = name
-            if target_layer_name and mtp_layer_name:
-                target_entry = kv_caches[target_layer_name]
-                mtp_entry = kv_caches[mtp_layer_name]
-                target_k = target_entry[0] if isinstance(target_entry, tuple) else target_entry
-                mtp_k = mtp_entry[0] if isinstance(mtp_entry, tuple) else mtp_entry
-                logger.info(
-                    "[KVCacheDebug] target_layer=%s ptr=%s shape=%s | "
-                    "mtp_layer=%s ptr=%s shape=%s | same_physical=%s",
-                    target_layer_name, target_k.data_ptr(), target_k.shape,
-                    mtp_layer_name, mtp_k.data_ptr(), mtp_k.shape,
-                    target_k.data_ptr() == mtp_k.data_ptr(),
-                )
-            else:
-                logger.info(
-                    "[KVCacheDebug] target_layer_name=%s mtp_layer_name=%s "
-                    "all_keys=%s", target_layer_name, mtp_layer_name,
-                    list(kv_caches.keys()),
-                )
-        # =====================================================================
-
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
         if self.speculative_config and (

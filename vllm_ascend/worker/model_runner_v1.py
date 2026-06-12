@@ -1949,24 +1949,6 @@ class NPUModelRunner(GPUModelRunner):
                 # Update persistent batch states.
                 deferred_state_corrections_fn = self._update_states(scheduler_output)
 
-                # Edge-cloud embed_only + async spec decode: execute_model
-                # is called a second time with the same scheduler_output.
-                # _update_states above overwrites num_computed_tokens_cpu
-                # with the scheduler's optimistic value, undoing the GPU
-                # correction applied in the first call's _prepare_inputs.
-                # Sync the corrected GPU values back to CPU so the second
-                # _prepare_inputs sees the right state.
-                if (
-                    self._edge_cloud_enabled
-                    and self.edge_cloud_cfg.mode == "embedding_only"
-                    and self.edge_cloud_cfg.role == "edge"
-                    and self.use_async_spec_decode
-                ):
-                    num_reqs = self.input_batch.num_reqs
-                    self.input_batch.num_computed_tokens_cpu_tensor[
-                        :num_reqs
-                    ].copy_(self.num_computed_tokens[:num_reqs], non_blocking=True)
-
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
                         scheduler_output,
@@ -2366,17 +2348,12 @@ class NPUModelRunner(GPUModelRunner):
                 # hybrid model mamba state update.  Cloud runs all GDN layers
                 # but its sample_tokens() returns early, so it never calls
                 # _update_states_after_model_execute() without this patch.
-                # Also receive valid_sampled_token_count for async spec decode
-                # correction of num_computed_tokens after token rejection.
                 if (
                     self._edge_cloud_enabled
                     and self.edge_cloud_cfg.role == "cloud"
                     and self.speculative_config
-                    and (
-                        (self.model_config.is_hybrid
-                         and self._last_scheduler_output is not None)
-                        or self.use_async_spec_decode
-                    )
+                    and self.model_config.is_hybrid
+                    and self._last_scheduler_output is not None
                 ):
                     pp_group = get_pp_group()
                     if pp_group.world_size == 2:
@@ -2394,37 +2371,29 @@ class NPUModelRunner(GPUModelRunner):
                         tensor_dict, src=0
                     )
                     assert tensor_dict is not None
-                    if (
-                        self.model_config.is_hybrid
-                        and "num_accepted_tokens" in tensor_dict
-                    ):
-                        num_accepted = tensor_dict["num_accepted_tokens"].to(self.device)
-                        num_reqs = num_accepted.size(0)
-                        self.num_accepted_tokens.gpu[:num_reqs] = num_accepted
-                        if self.cache_config.mamba_cache_mode == "align":
-                            for i, num_tokens in enumerate(
-                                self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
-                            ):
-                                self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
-                            mamba_utils.postprocess_mamba(
-                                self._last_scheduler_output,
-                                self.kv_cache_config,
-                                self.cache_config,
-                                self.input_batch,
-                                self.requests,
-                                self.mamba_state_idx,
-                                self.compilation_config.static_forward_context,
-                                self.model.get_mamba_state_copy_func(),
-                                self._get_mamba_copy_bufs(),
-                            )
-                        else:
-                            self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-                                self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
-                            )
-                    if "valid_sampled_token_count" in tensor_dict:
-                        self.valid_sampled_token_count_gpu = tensor_dict[
-                            "valid_sampled_token_count"
-                        ].to(self.device)
+                    num_accepted = tensor_dict["num_accepted_tokens"].to(self.device)
+                    num_reqs = num_accepted.size(0)
+                    self.num_accepted_tokens.gpu[:num_reqs] = num_accepted
+                    if self.cache_config.mamba_cache_mode == "align":
+                        for i, num_tokens in enumerate(
+                            self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
+                        ):
+                            self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
+                        mamba_utils.postprocess_mamba(
+                            self._last_scheduler_output,
+                            self.kv_cache_config,
+                            self.cache_config,
+                            self.input_batch,
+                            self.requests,
+                            self.mamba_state_idx,
+                            self.compilation_config.static_forward_context,
+                            self.model.get_mamba_state_copy_func(),
+                            self._get_mamba_copy_bufs(),
+                        )
+                    else:
+                        self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                            self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+                        )
 
                 return None  # noqa
             # In case of PP with kv transfer, we need to pass through the
@@ -2531,29 +2500,18 @@ class NPUModelRunner(GPUModelRunner):
 
             # Edge-cloud sync: send num_accepted_tokens to cloud so that cloud
             # can run _update_states_after_model_execute() for hybrid models.
-            # Also send valid_sampled_token_count for async spec decode
-            # correction of num_computed_tokens after token rejection.
             if (
                 self._edge_cloud_enabled
                 and self.edge_cloud_cfg.role != "cloud"
                 and self.speculative_config
-                and (
-                    self.model_config.is_hybrid
-                    or self.use_async_spec_decode
-                )
+                and self.model_config.is_hybrid
             ):
-                sync_dict: dict[str, Any] = {}
-                if self.model_config.is_hybrid:
-                    num_reqs = sampler_output.sampled_token_ids.size(0)
-                    num_accepted = (sampler_output.sampled_token_ids != -1).sum(dim=1).cpu()
-                    sync_dict["num_accepted_tokens"] = num_accepted
-                if (
-                    self.use_async_spec_decode
-                    and self.valid_sampled_token_count_gpu is not None
-                ):
-                    sync_dict["valid_sampled_token_count"] = self.valid_sampled_token_count_gpu
-                if sync_dict and get_pp_group().world_size == 2:
-                    send_work = get_pp_group().isend_tensor_dict(sync_dict)
+                num_reqs = sampler_output.sampled_token_ids.size(0)
+                num_accepted = (sampler_output.sampled_token_ids != -1).sum(dim=1).cpu()
+                if get_pp_group().world_size == 2:
+                    send_work = get_pp_group().isend_tensor_dict(
+                        {"num_accepted_tokens": num_accepted}
+                    )
                     for handle in send_work:
                         handle.wait()
 

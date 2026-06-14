@@ -552,11 +552,6 @@ class NPUModelRunner(GPUModelRunner):
         # _run_mtp_cloud_segment() which runs later in sample_tokens().
         self._cloud_spec_decode_common_attn_metadata: AscendCommonAttentionMetadata | None = None
         self._cloud_spec_decode_num_reqs: int = 0
-        # Stash edge-sent num_computed_tokens correction on cloud side
-        # (req_id -> num_rejected mapping), so that _prepare_inputs can correct
-        # the optimistic CPU value after async spec decode rejection.
-        self._cloud_rejected_req_ids: list[str] | None = None
-        self._cloud_num_rejected_cpu: torch.Tensor | None = None
         self.enable_hamming_sparse = (self.ascend_config.enable_hamming_sparse is True)
         self.enable_hamming_sparse = self.enable_hamming_sparse and not vllm_config.speculative_config
         if self.enable_hamming_sparse is True:
@@ -1229,42 +1224,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
                 non_blocking=True,
             )
-
-        # Edge-cloud cloud-side correction: edge sent num_rejected for the
-        # previous draft round. Scheduler delivered the optimistic
-        # num_computed_tokens (assumes all drafts were accepted), so subtract
-        # the rejected count for each request still present in the batch.
-        # Without this, cloud's seq_lens / slot_mapping for the main model
-        # and the MTP draft are oversized by the rejected count for exactly
-        # one round (the next round recovers because the scheduler catches up).
-        if (
-            self._edge_cloud_enabled
-            and self.edge_cloud_cfg.role == "cloud"
-            and self._cloud_num_rejected_cpu is not None
-            and self._cloud_rejected_req_ids is not None
-        ):
-            prev_idx_map = {
-                rid: i for i, rid in enumerate(self._cloud_rejected_req_ids)
-            }
-            rej_np = np.zeros(num_reqs, dtype=np.int32)
-            rej_src = self._cloud_num_rejected_cpu.numpy()
-            for i, rid in enumerate(self.input_batch.req_ids[:num_reqs]):
-                src = prev_idx_map.get(rid)
-                if src is not None:
-                    rej_np[i] = rej_src[src]
-            if rej_np.any():
-                rej_t = torch.from_numpy(rej_np).to(
-                    self.device, non_blocking=True
-                )
-                self.num_computed_tokens[:num_reqs].sub_(rej_t)
-                # Mirror to CPU so downstream readers (e.g. attention
-                # builders that consult num_computed_tokens_cpu) stay in sync.
-                self.input_batch.num_computed_tokens_cpu_tensor[
-                    :num_reqs
-                ].copy_(self.num_computed_tokens[:num_reqs], non_blocking=True)
-            # Consume the correction so it applies exactly once.
-            self._cloud_num_rejected_cpu = None
-            self._cloud_rejected_req_ids = None
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
         self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
@@ -2436,43 +2395,6 @@ class NPUModelRunner(GPUModelRunner):
                             self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
                         )
 
-                # Edge-cloud sync: receive num_rejected so the next round's
-                # _prepare_inputs can correct the optimistic num_computed_tokens
-                # (otherwise cloud's seq_lens/slot_mapping are oversized by the
-                # rejected count for exactly one round).
-                if (
-                    self._edge_cloud_enabled
-                    and self.edge_cloud_cfg.role == "cloud"
-                    and self.speculative_config
-                    and self.use_async_spec_decode
-                ):
-                    pp_group = get_pp_group()
-                    if pp_group.world_size == 2:
-                        tensor_dict, recv_handles, recv_postprocess = (
-                            pp_group.irecv_tensor_dict()
-                        )
-                        for handle in recv_handles:
-                            handle.wait()
-                        for postprocess in recv_postprocess:
-                            postprocess()
-                    else:
-                        tensor_dict = None
-                    tensor_dict = get_tp_group().broadcast_object(
-                        tensor_dict, src=0
-                    )
-                    if (
-                        tensor_dict is not None
-                        and "cloud_num_rejected" in tensor_dict
-                        and tensor_dict["cloud_num_rejected"].numel() > 0
-                    ):
-                        num_rejected_cpu = tensor_dict["cloud_num_rejected"]
-                        self._cloud_num_rejected_cpu = num_rejected_cpu
-                        # Snapshot req_ids so we can map next round's batch
-                        # order (which may differ after condense/reorder).
-                        self._cloud_rejected_req_ids = list(
-                            self.input_batch.req_ids[:num_rejected_cpu.size(0)]
-                        )
-
                 return None  # noqa
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
@@ -2592,41 +2514,6 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     for handle in send_work:
                         handle.wait()
-
-            # Edge-cloud sync: send num_rejected tokens to cloud so that
-            # cloud can correct its optimistic num_computed_tokens for
-            # async spec decode (one-round lag fix).
-            if (
-                self._edge_cloud_enabled
-                and self.edge_cloud_cfg.role != "cloud"
-                and self.speculative_config
-                and self.use_async_spec_decode
-                and get_pp_group().world_size == 2
-            ):
-                if (
-                    self.valid_sampled_token_count_gpu is not None
-                    and spec_decode_metadata is not None
-                ):
-                    num_reqs = self.valid_sampled_token_count_gpu.size(0)
-                    num_draft_t = torch.tensor(
-                        spec_decode_metadata.num_draft_tokens[:num_reqs],
-                        dtype=torch.int32,
-                    )
-                    valid_counts = (
-                        self.valid_sampled_token_count_gpu[:num_reqs].cpu()
-                    )
-                    num_rejected_t = (
-                        num_draft_t + 1 - valid_counts.int()
-                    ).clamp(min=0)
-                else:
-                    # No spec metadata this step (e.g. prefill): send an empty
-                    # tensor to keep the send/recv pair aligned on the cloud.
-                    num_rejected_t = torch.zeros(0, dtype=torch.int32)
-                send_work = get_pp_group().isend_tensor_dict(
-                    {"cloud_num_rejected": num_rejected_t}
-                )
-                for handle in send_work:
-                    handle.wait()
 
             # vLLM v0.18 defers KV connector finalization during target-model
             # forward when speculative decoding is enabled. Finalize here after

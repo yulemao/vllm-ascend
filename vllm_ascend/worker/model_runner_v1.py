@@ -2344,14 +2344,15 @@ class NPUModelRunner(GPUModelRunner):
                 ):
                     self._run_mtp_cloud_segment()
 
-                # Edge-cloud sync: receive rejection-corrected batch state
-                # from edge so that cloud's attention metadata uses the right
-                # sequence lengths / slot_mapping in the next decode round.
-                # For hybrid models we also update mamba state.
+                # Edge-cloud sync: receive num_accepted_tokens from edge for
+                # hybrid model mamba state update.  Cloud runs all GDN layers
+                # but its sample_tokens() returns early, so it never calls
+                # _update_states_after_model_execute() without this patch.
                 if (
                     self._edge_cloud_enabled
                     and self.edge_cloud_cfg.role == "cloud"
                     and self.speculative_config
+                    and self.model_config.is_hybrid
                     and self._last_scheduler_output is not None
                 ):
                     pp_group = get_pp_group()
@@ -2370,52 +2371,29 @@ class NPUModelRunner(GPUModelRunner):
                         tensor_dict, src=0
                     )
                     assert tensor_dict is not None
-                    num_computed = tensor_dict["num_computed_tokens"]
-                    num_reqs = num_computed.size(0)
-
-                    # Update cloud's persistent batch state to match edge.
-                    self.input_batch.num_computed_tokens_cpu[
-                        :num_reqs
-                    ] = num_computed.numpy()
-                    self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].copy_(
-                        num_computed, non_blocking=True
-                    )
-                    self.num_computed_tokens[:num_reqs].copy_(
-                        num_computed.to(self.device, non_blocking=True),
-                        non_blocking=True,
-                    )
-                    for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-                        req_state = self.requests.get(req_id)
-                        if req_state is not None:
-                            req_state.num_computed_tokens = int(
-                                self.input_batch.num_computed_tokens_cpu[i]
-                            )
-
-                    if self.model_config.is_hybrid:
-                        num_accepted = tensor_dict["num_accepted_tokens"].to(
-                            self.device
+                    num_accepted = tensor_dict["num_accepted_tokens"].to(self.device)
+                    num_reqs = num_accepted.size(0)
+                    self.num_accepted_tokens.gpu[:num_reqs] = num_accepted
+                    if self.cache_config.mamba_cache_mode == "align":
+                        for i, num_tokens in enumerate(
+                            self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
+                        ):
+                            self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
+                        mamba_utils.postprocess_mamba(
+                            self._last_scheduler_output,
+                            self.kv_cache_config,
+                            self.cache_config,
+                            self.input_batch,
+                            self.requests,
+                            self.mamba_state_idx,
+                            self.compilation_config.static_forward_context,
+                            self.model.get_mamba_state_copy_func(),
+                            self._get_mamba_copy_bufs(),
                         )
-                        self.num_accepted_tokens.gpu[:num_reqs] = num_accepted
-                        if self.cache_config.mamba_cache_mode == "align":
-                            for i, num_tokens in enumerate(
-                                self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
-                            ):
-                                self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
-                            mamba_utils.postprocess_mamba(
-                                self._last_scheduler_output,
-                                self.kv_cache_config,
-                                self.cache_config,
-                                self.input_batch,
-                                self.requests,
-                                self.mamba_state_idx,
-                                self.compilation_config.static_forward_context,
-                                self.model.get_mamba_state_copy_func(),
-                                self._get_mamba_copy_bufs(),
-                            )
-                        else:
-                            self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-                                self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
-                            )
+                    else:
+                        self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                            self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+                        )
 
                 return None  # noqa
             # In case of PP with kv transfer, we need to pass through the
@@ -2520,50 +2498,20 @@ class NPUModelRunner(GPUModelRunner):
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
 
-            # Edge-cloud sync: send the rejection-corrected
-            # num_computed_tokens (and num_accepted_tokens for hybrid models)
-            # to cloud so that cloud can keep its batch state in sync.
-            # Without this, the cloud side uses optimistic sequence lengths for
-            # one decode round after MTP/EAGLE rejection, which inflates
-            # seq_lens / slot_mapping in its attention metadata.
+            # Edge-cloud sync: send num_accepted_tokens to cloud so that cloud
+            # can run _update_states_after_model_execute() for hybrid models.
             if (
                 self._edge_cloud_enabled
                 and self.edge_cloud_cfg.role != "cloud"
                 and self.speculative_config
+                and self.model_config.is_hybrid
             ):
                 num_reqs = sampler_output.sampled_token_ids.size(0)
-                num_accepted = (
-                    sampler_output.sampled_token_ids != -1
-                ).sum(dim=1).cpu().numpy().astype(np.int32)
-
-                # Compute the corrected per-request num_computed_tokens on the
-                # edge side. At this point input_batch already holds the length
-                # after the *previous* iteration's rejection correction. We just
-                # need to add the tokens that were actually accepted/generated
-                # in this iteration (num_accepted for speculative requests,
-                # scheduled tokens for non-speculative requests).
-                new_num_computed = self.input_batch.num_computed_tokens_cpu[
-                    :num_reqs
-                ].copy()
-                scheduled_spec = scheduler_output.scheduled_spec_decode_tokens
-                num_scheduled = scheduler_output.num_scheduled_tokens
-                for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-                    draft_tokens = scheduled_spec.get(req_id)
-                    if draft_tokens:
-                        new_num_computed[i] += num_accepted[i]
-                    else:
-                        new_num_computed[i] += num_scheduled[req_id]
-
-                send_dict = {
-                    "num_computed_tokens": torch.from_numpy(
-                        new_num_computed
-                    ).contiguous(),
-                    "num_accepted_tokens": torch.from_numpy(
-                        num_accepted
-                    ).contiguous(),
-                }
+                num_accepted = (sampler_output.sampled_token_ids != -1).sum(dim=1).cpu()
                 if get_pp_group().world_size == 2:
-                    send_work = get_pp_group().isend_tensor_dict(send_dict)
+                    send_work = get_pp_group().isend_tensor_dict(
+                        {"num_accepted_tokens": num_accepted}
+                    )
                     for handle in send_work:
                         handle.wait()
 

@@ -88,7 +88,6 @@ from vllm.v1.outputs import (
     make_empty_encoder_model_runner_output,
 )
 
-from vllm_ascend.distributed.parallel_state import edge_cloud_broadcast_recv
 from vllm_ascend.utils import vllm_version_is
 
 if not vllm_version_is("0.20.2"):
@@ -1607,91 +1606,6 @@ class NPUModelRunner(GPUModelRunner):
             self.valid_sampled_token_count_gpu = valid_sampled_tokens_count # type: ignore[no-redef]
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
-    def _send_reject_correction_to_cloud(self, num_reqs: int) -> None:
-        """Send reject-corrected token counts to the cloud side.
-
-        In edge-cloud embed_only mode the cloud does not run
-        _bookkeeping_sync, so its prev_req_id_to_index is stale and the
-        async-spec GPU correction is skipped.  Send the per-request
-        accepted-token count and the prev_req_id_to_index snapshot from
-        the edge so the cloud can correct its optimistic num_computed_tokens
-        in the next execute_model.
-        """
-        if (
-            not self._edge_cloud_enabled
-            or self.edge_cloud_cfg.role == "cloud"
-            or not self.use_async_spec_decode
-            or self.speculative_config is None
-            or get_pp_group().world_size != 2
-        ):
-            return
-
-        if (
-            self.valid_sampled_token_count_gpu is None
-            or self.input_batch.prev_req_id_to_index is None
-        ):
-            return
-
-        correction = {
-            "valid_sampled_token_count": self.valid_sampled_token_count_gpu[:num_reqs].contiguous(),
-            "prev_req_id_to_index": self.input_batch.prev_req_id_to_index,
-        }
-        send_work = get_pp_group().isend_tensor_dict(correction)
-        for handle in send_work:
-            handle.wait()
-
-    def _apply_cloud_reject_correction(
-        self,
-        old_prev_draft_lens: dict[str, int],
-        old_prev_num_computed: dict[str, int],
-    ) -> None:
-        """Correct cloud-side optimistic num_computed_tokens after rejects.
-
-        Uses the accepted-token counts and prev_req_id_to_index snapshot
-        received from the edge in the previous sample_tokens step.
-
-        The scheduler already corrects request.num_computed_tokens after a
-        rejection, so the scheduler output delivered to the cloud may already
-        contain the corrected count. Only correct when the delivered count is
-        still optimistic (larger than the expected corrected count), to avoid
-        over-correcting from the second decode step onward.
-        """
-        correction = getattr(self, "_cloud_reject_correction", None)
-        self._cloud_reject_correction = None
-        if correction is None:
-            return
-
-        counts = correction.get("valid_sampled_token_count")
-        prev_map = correction.get("prev_req_id_to_index")
-        if counts is None or prev_map is None:
-            return
-
-        for i, req_id in enumerate(self.input_batch.req_ids):
-            prev_index = prev_map.get(req_id)
-            if prev_index is None:
-                continue
-            accepted = int(counts[prev_index].item())
-            old_draft_len = old_prev_draft_lens.get(req_id, 0)
-            if old_draft_len <= 0:
-                continue
-            rejected = old_draft_len + 1 - accepted
-            if rejected <= 0:
-                continue
-
-            prev_num_computed = old_prev_num_computed.get(req_id, 0)
-            expected = prev_num_computed + accepted
-            current = int(self.input_batch.num_computed_tokens_cpu_tensor[i].item())
-            if current <= expected:
-                # Scheduler already delivered the corrected count.
-                continue
-
-            corrected = expected
-            self.input_batch.num_computed_tokens_cpu_tensor[i] = corrected
-            self.input_batch.num_computed_tokens_cpu[i] = corrected
-            req_state = self.requests.get(req_id)
-            if req_state is not None:
-                req_state.num_computed_tokens = corrected
-
     # TODO: Once the PCP features are complete, it will fully inherit the classes from the VLLM community.
     def propose_draft_token_ids(
         self,
@@ -2013,28 +1927,6 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
-                # On the cloud side of edge-cloud embed_only, capture the old
-                # prev_num_draft_len values before _update_states overwrites
-                # them.  Combined with the reject-corrected counts received from
-                # the edge in sample_tokens(), this lets us fix the optimistic
-                # num_computed_tokens that caused inflated seq_len/slot_mapping.
-                cloud_old_prev_draft_lens = None
-                cloud_prev_num_computed = None
-                if (
-                    self._edge_cloud_enabled
-                    and self.edge_cloud_cfg.role == "cloud"
-                    and self.use_async_spec_decode
-                    and self.speculative_config is not None
-                ):
-                    cloud_old_prev_draft_lens = {
-                        req_id: self.requests[req_id].prev_num_draft_len
-                        for req_id in self.input_batch.req_ids
-                    }
-                    cloud_prev_num_computed = {
-                        req_id: self.requests[req_id].num_computed_tokens
-                        for req_id in self.input_batch.req_ids
-                    }
-
                 # Fix up prev_req_id_to_index for requests that were discarded
                 # in the previous sample_tokens step. If a request has
                 # prev_num_draft_len > 0 but is missing from
@@ -2056,11 +1948,6 @@ class NPUModelRunner(GPUModelRunner):
 
                 # Update persistent batch states.
                 deferred_state_corrections_fn = self._update_states(scheduler_output)
-
-                if cloud_old_prev_draft_lens is not None:
-                    self._apply_cloud_reject_correction(
-                        cloud_old_prev_draft_lens, cloud_prev_num_computed
-                    )
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -2508,27 +2395,6 @@ class NPUModelRunner(GPUModelRunner):
                             self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
                         )
 
-                # Edge-cloud sync: receive reject-corrected token counts from
-                # the edge so the cloud can fix its optimistic num_computed_tokens
-                # after MTP draft tokens are rejected.  Without this correction
-                # the cloud's main-model and MTP attention metadata are inflated
-                # by the number of rejected tokens for one decode round.
-                if (
-                    self._edge_cloud_enabled
-                    and self.edge_cloud_cfg.role == "cloud"
-                    and self.use_async_spec_decode
-                    and self.speculative_config is not None
-                ):
-                    tensor_dict, recv_handles, recv_postprocess = (
-                        edge_cloud_broadcast_recv()
-                    )
-                    for handle in recv_handles:
-                        handle.wait()
-                    for postprocess in recv_postprocess:
-                        postprocess()
-                    if tensor_dict:
-                        self._cloud_reject_correction = tensor_dict
-
                 return None  # noqa
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
@@ -2648,17 +2514,6 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     for handle in send_work:
                         handle.wait()
-
-            # Edge-cloud sync: send the accepted-token counts and
-            # prev_req_id_to_index snapshot to the cloud so it can correct
-            # optimistic num_computed_tokens after rejected MTP tokens.
-            if (
-                self._edge_cloud_enabled
-                and self.edge_cloud_cfg.role != "cloud"
-                and self.use_async_spec_decode
-                and self.speculative_config is not None
-            ):
-                self._send_reject_correction_to_cloud(self.input_batch.num_reqs)
 
             # vLLM v0.18 defers KV connector finalization during target-model
             # forward when speculative decoding is enabled. Finalize here after

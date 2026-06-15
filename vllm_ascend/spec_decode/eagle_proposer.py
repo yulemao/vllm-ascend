@@ -832,44 +832,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             multi_steps_attn_metadata = []
             attn_metadata_i = None
 
+        token_indices_to_sample_len = token_indices_to_sample.shape[0]
+        self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
+
         # Stash reject-corrected attention metadata for edge-cloud MTP so
         # that the cloud side can build correct attention metadata.
-        # The padded drafter keeps rejected tokens as padding; the cloud decoder
-        # must use the corrected metadata so it does not read/write KV slots for
-        # rejected tokens.  We keep the physical positions/hidden_states at the
-        # original padded size so the cloud ACL graph shape stays unchanged.
         if (
             self.method == "mtp"
             and self.runner is not None
             and getattr(self.runner, "_edge_cloud_enabled", False)
-            and num_rejected_tokens_gpu is not None
         ):
-            (
-                self._mtp_cloud_attn_meta,
-                token_indices_to_sample,
-            ) = self._make_edge_cloud_mtp_reject_corrected_meta(
-                common_attn_metadata,
-                num_rejected_tokens_gpu,
-                num_tokens,
-            )
-            # Update the in-flight metadata so the cloud-bound attention metadata
-            # reflects the accepted prefix.
-            common_attn_metadata.seq_lens = self._mtp_cloud_attn_meta["seq_lens"]
-            common_attn_metadata.seq_lens_cpu = self._mtp_cloud_attn_meta["seq_lens_cpu"]
-            common_attn_metadata._seq_lens_cpu = self._mtp_cloud_attn_meta["_seq_lens_cpu"]
-            common_attn_metadata.slot_mapping = self._mtp_cloud_attn_meta["slot_mapping"]
-            common_attn_metadata.query_start_loc = self._mtp_cloud_attn_meta["query_start_loc"]
-            common_attn_metadata.query_start_loc_cpu = self._mtp_cloud_attn_meta[
-                "query_start_loc_cpu"
-            ]
-            common_attn_metadata.num_actual_tokens = self._mtp_cloud_attn_meta[
-                "num_actual_tokens"
-            ]
-        else:
-            self._mtp_cloud_attn_meta = None
-
-        token_indices_to_sample_len = token_indices_to_sample.shape[0]
-        self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
+            self._mtp_cloud_attn_meta = {
+                "seq_lens": common_attn_metadata.seq_lens,
+                "seq_lens_cpu": common_attn_metadata.seq_lens_cpu,
+                "_seq_lens_cpu": common_attn_metadata._seq_lens_cpu,
+                "slot_mapping": common_attn_metadata.slot_mapping,
+                "query_start_loc": common_attn_metadata.query_start_loc,
+                "query_start_loc_cpu": common_attn_metadata.query_start_loc_cpu,
+                "num_actual_tokens": num_tokens,
+            }
 
         with set_ascend_forward_context(
             multi_steps_attn_metadata[0] if multi_steps_attn_metadata else None,
@@ -1912,92 +1893,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             draft_attn_metadatas=draft_attn_metadatas,
         )
 
-    def _make_edge_cloud_mtp_reject_corrected_meta(
-        self,
-        common_attn_metadata: CommonAttentionMetadata,
-        num_rejected_tokens_gpu: torch.Tensor,
-        num_tokens: int,
-    ) -> tuple[dict[str, Any], torch.Tensor]:
-        """Build reject-corrected attention metadata for edge-cloud MTP.
-
-        The padded drafter keeps rejected tokens as padding and only masks
-        them at sampling time.  When the MTP decoder layers run on the cloud
-        side, the cloud attention backend does not see that mask and would
-        attend to / write KV slots for the rejected tokens, corrupting the
-        draft hidden states.  This helper shrinks the *metadata* (query_start_loc,
-        seq_lens, slot_mapping, num_actual_tokens) to the accepted prefix.
-
-        The physical positions/hidden_states/residual tensors are left at the
-        original padded size.  The cloud decoder replays the same ACL graph shape
-        as the no-reject case and simply ignores the rejected-token rows, which
-        is exactly what the local padded drafter does.
-        """
-        num_actual_reqs = common_attn_metadata.num_reqs
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        q_lens_cpu = (
-            query_start_loc_cpu[1 : num_actual_reqs + 1]
-            - query_start_loc_cpu[:num_actual_reqs]
-        )
-        num_rejected_cpu = num_rejected_tokens_gpu[:num_actual_reqs].cpu().numpy()
-        q_lens_np = q_lens_cpu.numpy()
-        valid_counts_np = q_lens_np - num_rejected_cpu
-
-        # Build the new query_start_loc (cumulative accepted counts).
-        new_query_start_loc_cpu = torch.zeros_like(query_start_loc_cpu)
-        cum = 0
-        for i in range(num_actual_reqs):
-            count = int(valid_counts_np[i])
-            cum += count
-            new_query_start_loc_cpu[i + 1] = cum
-        new_num_actual_tokens = int(new_query_start_loc_cpu[num_actual_reqs].item())
-
-        # Flat indices of accepted tokens in the original padded tensor.
-        accepted_indices: list[int] = []
-        for i in range(num_actual_reqs):
-            start = int(query_start_loc_cpu[i].item())
-            count = int(valid_counts_np[i])
-            if count > 0:
-                accepted_indices.extend(range(start, start + count))
-        accepted_indices_t = torch.tensor(
-            accepted_indices,
-            dtype=torch.int64,
-            device=common_attn_metadata.slot_mapping.device,
-        )
-
-        # Recompute seq_lens / _seq_lens_cpu by subtracting the rejected tokens.
-        new_seq_lens = common_attn_metadata.seq_lens.clone()
-        new_seq_lens[:num_actual_reqs] -= num_rejected_tokens_gpu[:num_actual_reqs].to(
-            new_seq_lens.device
-        )
-
-        def _shrink_seq_lens_cpu(src: torch.Tensor | None) -> torch.Tensor | None:
-            if src is None:
-                return None
-            dst = src.clone()
-            dst[:num_actual_reqs] -= num_rejected_tokens_gpu[:num_actual_reqs].to(dst.device)
-            return dst
-
-        new_query_start_loc = new_query_start_loc_cpu.to(
-            common_attn_metadata.query_start_loc.device, non_blocking=True
-        )
-
-        corrected_meta = {
-            "seq_lens": new_seq_lens,
-            "seq_lens_cpu": _shrink_seq_lens_cpu(common_attn_metadata.seq_lens_cpu),
-            "_seq_lens_cpu": _shrink_seq_lens_cpu(common_attn_metadata._seq_lens_cpu),
-            "slot_mapping": common_attn_metadata.slot_mapping[accepted_indices_t],
-            "query_start_loc": new_query_start_loc,
-            "query_start_loc_cpu": new_query_start_loc_cpu,
-            "num_actual_tokens": new_num_actual_tokens,
-        }
-
-        # token_indices_to_sample now points to the last accepted token within
-        # the shrunken tensor.
-        new_token_indices_to_sample = (
-            new_query_start_loc[1 : num_actual_reqs + 1] - 1
-        )
-        return corrected_meta, new_token_indices_to_sample
-
     def _run_mtp_edge_cloud(self, **model_kwargs) -> torch.Tensor:
         segments = self.runner._edge_cloud_mtp_segments
         role = self.runner.edge_cloud_cfg.role
@@ -2007,13 +1902,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             output = segments["a"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)
 
-            # Include positions/spec_step_idx so cloud can run the correct
-            # decoder layer.  We keep the physical tensors at the original
-            # padded size; the cloud side will use the reject-corrected metadata
-            # (sent below) to ignore rejected-token rows.
+            # Include positions and spec_step_idx so cloud can run the correct
+            # decoder layer.
             output["positions"] = model_kwargs["positions"]
-
-            # Include spec_step_idx so cloud can run the correct decoder layer.
             if "spec_step_idx" in model_kwargs:
                 output["spec_step_idx"] = torch.tensor(
                     model_kwargs["spec_step_idx"], dtype=torch.int64, device="cpu"

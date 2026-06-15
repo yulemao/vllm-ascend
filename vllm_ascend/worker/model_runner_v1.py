@@ -2395,18 +2395,6 @@ class NPUModelRunner(GPUModelRunner):
                             self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
                         )
 
-                # The cloud side does not run sampling / bookkeeping, so stale
-                # async-spec-decode state from a previous step must be cleared.
-                # Otherwise the next _prepare_inputs on the cloud could apply an
-                # outdated GPU correction to num_computed_tokens.
-                if (
-                    self._edge_cloud_enabled
-                    and self.edge_cloud_cfg.role == "cloud"
-                ):
-                    self.valid_sampled_token_count_gpu = None
-                    self.input_batch.prev_sampled_token_ids = None
-                    self.input_batch.prev_req_id_to_index = None
-
                 return None  # noqa
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
@@ -2415,14 +2403,6 @@ class NPUModelRunner(GPUModelRunner):
 
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
-            # Clear stale async-spec-decode state on the cloud side as well.
-            if (
-                self._edge_cloud_enabled
-                and self.edge_cloud_cfg.role == "cloud"
-            ):
-                self.valid_sampled_token_count_gpu = None
-                self.input_batch.prev_sampled_token_ids = None
-                self.input_batch.prev_req_id_to_index = None
             return output
 
         # Unpack ephemeral state.

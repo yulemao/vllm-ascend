@@ -1643,11 +1643,18 @@ class NPUModelRunner(GPUModelRunner):
     def _apply_cloud_reject_correction(
         self,
         old_prev_draft_lens: dict[str, int],
+        old_prev_num_computed: dict[str, int],
     ) -> None:
         """Correct cloud-side optimistic num_computed_tokens after rejects.
 
         Uses the accepted-token counts and prev_req_id_to_index snapshot
         received from the edge in the previous sample_tokens step.
+
+        The scheduler already corrects request.num_computed_tokens after a
+        rejection, so the scheduler output delivered to the cloud may already
+        contain the corrected count. Only correct when the delivered count is
+        still optimistic (larger than the expected corrected count), to avoid
+        over-correcting from the second decode step onward.
         """
         correction = getattr(self, "_cloud_reject_correction", None)
         self._cloud_reject_correction = None
@@ -1670,7 +1677,15 @@ class NPUModelRunner(GPUModelRunner):
             rejected = old_draft_len + 1 - accepted
             if rejected <= 0:
                 continue
-            corrected = int(self.input_batch.num_computed_tokens_cpu_tensor[i].item()) - rejected
+
+            prev_num_computed = old_prev_num_computed.get(req_id, 0)
+            expected = prev_num_computed + accepted
+            current = int(self.input_batch.num_computed_tokens_cpu_tensor[i].item())
+            if current <= expected:
+                # Scheduler already delivered the corrected count.
+                continue
+
+            corrected = expected
             self.input_batch.num_computed_tokens_cpu_tensor[i] = corrected
             self.input_batch.num_computed_tokens_cpu[i] = corrected
             req_state = self.requests.get(req_id)
@@ -2004,6 +2019,7 @@ class NPUModelRunner(GPUModelRunner):
                 # the edge in sample_tokens(), this lets us fix the optimistic
                 # num_computed_tokens that caused inflated seq_len/slot_mapping.
                 cloud_old_prev_draft_lens = None
+                cloud_prev_num_computed = None
                 if (
                     self._edge_cloud_enabled
                     and self.edge_cloud_cfg.role == "cloud"
@@ -2012,6 +2028,10 @@ class NPUModelRunner(GPUModelRunner):
                 ):
                     cloud_old_prev_draft_lens = {
                         req_id: self.requests[req_id].prev_num_draft_len
+                        for req_id in self.input_batch.req_ids
+                    }
+                    cloud_prev_num_computed = {
+                        req_id: self.requests[req_id].num_computed_tokens
                         for req_id in self.input_batch.req_ids
                     }
 
@@ -2038,7 +2058,9 @@ class NPUModelRunner(GPUModelRunner):
                 deferred_state_corrections_fn = self._update_states(scheduler_output)
 
                 if cloud_old_prev_draft_lens is not None:
-                    self._apply_cloud_reject_correction(cloud_old_prev_draft_lens)
+                    self._apply_cloud_reject_correction(
+                        cloud_old_prev_draft_lens, cloud_prev_num_computed
+                    )
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(

@@ -1987,37 +1987,6 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
 
-                # Edge-cloud: the cloud side receives the edge-corrected
-                # num_computed_tokens so it can avoid the async-scheduling
-                # optimistic drift. Without this, the cloud builds attention
-                # metadata (seq_lens / positions / slot_mapping) that is larger
-                # than the actual post-rejection sequence length by exactly the
-                # number of rejected speculative tokens.
-                if (
-                    self._edge_cloud_enabled
-                    and self.edge_cloud_cfg.role == "cloud"
-                    and intermediate_tensors is not None
-                    and isinstance(intermediate_tensors, IntermediateTensors)
-                ):
-                    ec_num_computed = intermediate_tensors.tensors.pop(
-                        "_ec_num_computed_tokens", None
-                    )
-                    if ec_num_computed is not None:
-                        ec_num_computed = ec_num_computed[:num_reqs]
-                        # Update CPU buffer first with a blocking copy so the
-                        # positions/slot_mapping computation below reads the
-                        # corrected value.
-                        self.input_batch.num_computed_tokens_cpu_tensor[
-                            :num_reqs
-                        ].copy_(ec_num_computed)
-                        self.num_computed_tokens[:num_reqs].copy_(
-                            ec_num_computed.to(self.device, non_blocking=True)
-                        )
-                        # Cloud does not run sampling; make sure we do not
-                        # double-correct using stale draft-model state.
-                        self.valid_sampled_token_count_gpu = None
-                        self.input_batch.prev_req_id_to_index = None
-
                 (
                     logits_indices,
                     spec_decode_metadata,
@@ -3126,25 +3095,6 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = run_model()
             self._update_full_graph_params_if_needed(
                 forward_context, num_tokens_padded, positions
-            )
-
-        # Edge-cloud: the edge side corrects num_computed_tokens on GPU in
-        # async scheduling, but the cloud side does not run sampling and
-        # therefore cannot correct the optimistic CPU value itself. Pass the
-        # corrected value along with the first edge segment's output so the
-        # cloud can build accurate attention metadata (seq_lens, positions,
-        # slot_mapping) for the current decode step.
-        if (
-            self._edge_cloud_enabled
-            and self.edge_cloud_cfg.role == "edge"
-            and intermediate_tensors is None
-            and isinstance(hidden_states, IntermediateTensors)
-        ):
-            num_reqs = self.input_batch.num_reqs
-            # Use a blocking CPU copy: this tensor is sent to the cloud process
-            # and must be ready before the PP transfer.
-            hidden_states["_ec_num_computed_tokens"] = (
-                self.num_computed_tokens[:num_reqs].cpu()
             )
 
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):

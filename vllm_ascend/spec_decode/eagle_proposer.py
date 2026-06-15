@@ -1921,6 +1921,26 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 output["num_actual_tokens"] = torch.tensor(
                     meta["num_actual_tokens"], dtype=torch.int64, device="cpu"
                 )
+
+            # Pass reject-corrected acceptance counts to cloud so it can fix
+            # the optimistic num_computed_tokens used by the main model in the
+            # next decode round.  Only send when the counts were produced by
+            # the current sampling step (valid_sampled_token_count_gpu is set
+            # by _copy_valid_sampled_token_count during propose_draft_token_ids).
+            if (
+                self.runner is not None
+                and getattr(self.runner, "valid_sampled_token_count_gpu", None) is not None
+                and self.runner.valid_sampled_token_count_cpu is not None
+                and self.runner.valid_sampled_token_count_event is not None
+            ):
+                self.runner.valid_sampled_token_count_event.synchronize()
+                num_reqs = self.runner.input_batch.num_reqs
+                output["valid_sampled_token_count"] = (
+                    self.runner.valid_sampled_token_count_cpu[:num_reqs]
+                )
+                output["valid_sampled_token_count_req_ids"] = (
+                    self.runner.input_batch.req_ids
+                )
             if get_pp_group().world_size == 2:
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v

@@ -552,6 +552,14 @@ class NPUModelRunner(GPUModelRunner):
         # _run_mtp_cloud_segment() which runs later in sample_tokens().
         self._cloud_spec_decode_common_attn_metadata: AscendCommonAttentionMetadata | None = None
         self._cloud_spec_decode_num_reqs: int = 0
+
+        # Saved on the cloud side during sample_tokens() to carry the edge's
+        # reject-corrected acceptance counts into the next execute_model().
+        # This lets the cloud fix its optimistic num_computed_tokens when
+        # edge-cloud embed_only mode skips _bookkeeping_sync on the cloud.
+        self._cloud_valid_sampled_token_count: torch.Tensor | None = None
+        self._cloud_valid_sampled_token_count_req_ids: list[str] | None = None
+
         self.enable_hamming_sparse = (self.ascend_config.enable_hamming_sparse is True)
         self.enable_hamming_sparse = self.enable_hamming_sparse and not vllm_config.speculative_config
         if self.enable_hamming_sparse is True:
@@ -1949,6 +1957,21 @@ class NPUModelRunner(GPUModelRunner):
                 # Update persistent batch states.
                 deferred_state_corrections_fn = self._update_states(scheduler_output)
 
+                # In edge-cloud mode the cloud returns early from sample_tokens()
+                # and never runs _bookkeeping_sync, so the async spec-decode GPU
+                # correction kernel is skipped.  The edge sends the actual
+                # valid_sampled_token_count for each request during MTP draft
+                # proposal; apply it here to fix the cloud's optimistic
+                # num_computed_tokens before _prepare_inputs builds positions,
+                # seq_lens and slot_mapping for the main model and MTP.
+                if (
+                    self._edge_cloud_enabled
+                    and self.edge_cloud_cfg.role == "cloud"
+                    and self.speculative_config is not None
+                    and self.speculative_config.method == "mtp"
+                ):
+                    self._apply_cloud_reject_correction()
+
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
                         scheduler_output,
@@ -2826,6 +2849,17 @@ class NPUModelRunner(GPUModelRunner):
                 cloud_meta["num_actual_tokens"] = tensor_dict[
                     "num_actual_tokens"].item()
 
+            # Receive reject-corrected acceptance counts from the edge so the
+            # cloud can fix its optimistic num_computed_tokens in the next
+            # execute_model() forward.
+            if "valid_sampled_token_count" in tensor_dict:
+                self._cloud_valid_sampled_token_count = tensor_dict[
+                    "valid_sampled_token_count"
+                ]
+                self._cloud_valid_sampled_token_count_req_ids = tensor_dict.get(
+                    "valid_sampled_token_count_req_ids", None
+                )
+
             # Build attention metadata for the MTP decoder layers.
             # Without this, the Ascend attention backend silently
             # returns zeros, corrupting hidden states.
@@ -2853,6 +2887,60 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 for handle in send_work:
                     handle.wait()
+
+    def _apply_cloud_reject_correction(self) -> None:
+        """Correct optimistic num_computed_tokens on the cloud side.
+
+        In edge-cloud embed_only mode the cloud returns early from
+        sample_tokens() and never runs _bookkeeping_sync, so the async
+        spec-decode GPU correction kernel in _prepare_inputs is skipped.
+        The cloud therefore uses the scheduler's optimistic
+        num_computed_tokens (it assumes all draft tokens from the previous
+        iteration were accepted).  The edge sends the actual
+        valid_sampled_token_count per request during MTP draft proposal;
+        subtract the rejected-token count so the next main-model/MTP
+        forward uses the right positions, seq_lens and slot_mapping.
+        """
+        counts = self._cloud_valid_sampled_token_count
+        req_ids = self._cloud_valid_sampled_token_count_req_ids
+
+        # Clear the stash immediately so a correction is applied exactly once.
+        self._cloud_valid_sampled_token_count = None
+        self._cloud_valid_sampled_token_count_req_ids = None
+
+        if counts is None or req_ids is None or counts.numel() == 0:
+            return
+
+        counts_cpu = counts if counts.is_cpu else counts.cpu()
+        counts_np = counts_cpu.numpy()
+
+        for edge_idx, req_id in enumerate(req_ids):
+            cloud_idx = self.input_batch.req_id_to_index.get(req_id)
+            if cloud_idx is None:
+                continue
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            prev_draft_len = getattr(req_state, "prev_num_draft_len", 0)
+            if prev_draft_len <= 0:
+                continue
+            accepted = int(counts_np[edge_idx])
+            rejected = prev_draft_len + 1 - accepted
+            if rejected <= 0:
+                continue
+            old_num_computed = int(
+                self.input_batch.num_computed_tokens_cpu_tensor[cloud_idx].item()
+            )
+            new_num_computed = old_num_computed - rejected
+            self.input_batch.num_computed_tokens_cpu_tensor[cloud_idx] = (
+                new_num_computed
+            )
+            req_state.num_computed_tokens = new_num_computed
+            # _update_states advances num_tokens_no_spec optimistically on
+            # non-last PP ranks (the cloud). Keep it in sync with the corrected
+            # num_computed_tokens so future state updates see consistent counts.
+            if int(self.input_batch.num_tokens_no_spec[cloud_idx]) == old_num_computed:
+                self.input_batch.num_tokens_no_spec[cloud_idx] = new_num_computed
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):

@@ -547,16 +547,6 @@ class NPUModelRunner(GPUModelRunner):
         # Saved in execute_model() so sample_tokens() can access scheduler_output
         # for edge-cloud mamba state sync (especially on the cloud side).
         self._last_scheduler_output: "SchedulerOutput | None" = None
-        # Edge-cloud: cloud does not sample, so we must carry the reject-corrected
-        # num_computed_tokens from sample_tokens() into the next execute_model()
-        # after _update_states() has overwritten it with the optimistic scheduler
-        # output.
-        self._edge_cloud_corrected_num_computed_tokens: dict[str, int] = {}
-        # Edge-cloud embed_only: the embed segment already corrected
-        # num_computed_tokens on GPU.  The tail segment's _update_states() would
-        # re-overwrite the CPU copy with the optimistic scheduler output; use this
-        # flag to restore the corrected GPU->CPU state in the tail segment.
-        self._edge_cloud_num_computed_corrected: bool = False
 
         # Saved on the cloud side during execute_model() for use by
         # _run_mtp_cloud_segment() which runs later in sample_tokens().
@@ -1959,60 +1949,6 @@ class NPUModelRunner(GPUModelRunner):
                 # Update persistent batch states.
                 deferred_state_corrections_fn = self._update_states(scheduler_output)
 
-                # Edge-cloud: _update_states() just overwrote input_batch state
-                # with the scheduler's optimistic num_computed_tokens. On the cloud
-                # side we did not sample, so apply the reject-corrected lengths that
-                # were saved in sample_tokens() before the next forward builds
-                # attention metadata.
-                if (
-                    self._edge_cloud_enabled
-                    and self.edge_cloud_cfg.role == "cloud"
-                    and self._edge_cloud_corrected_num_computed_tokens
-                ):
-                    num_reqs = self.input_batch.num_reqs
-                    for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-                        corrected = self._edge_cloud_corrected_num_computed_tokens.get(
-                            req_id
-                        )
-                        if corrected is None:
-                            continue
-                        self.input_batch.num_computed_tokens_cpu[i] = corrected
-                        self.input_batch.num_computed_tokens_cpu_tensor[i] = corrected
-                        req_state = self.requests.get(req_id)
-                        if req_state is not None:
-                            req_state.num_computed_tokens = corrected
-                    self.num_computed_tokens[:num_reqs].copy_(
-                        self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
-                        non_blocking=True,
-                    )
-                    self._edge_cloud_corrected_num_computed_tokens.clear()
-
-                # Edge-cloud embed_only tail segment: the embed segment already
-                # corrected num_computed_tokens on GPU and saved the corrected
-                # value to CPU. _update_states() just overwrote the CPU copy
-                # with the optimistic scheduler output, so restore it before the
-                # tail segment builds attention metadata / cloud_meta.
-                if (
-                    self._edge_cloud_enabled
-                    and self.edge_cloud_cfg.role == "edge"
-                    and self.edge_cloud_cfg.mode == "embedding_only"
-                    and self._edge_cloud_num_computed_corrected
-                ):
-                    num_reqs = self.input_batch.num_reqs
-                    self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].copy_(
-                        self.num_computed_tokens[:num_reqs], non_blocking=True
-                    )
-                    for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-                        self.input_batch.num_computed_tokens_cpu[i] = int(
-                            self.input_batch.num_computed_tokens_cpu_tensor[i]
-                        )
-                        req_state = self.requests.get(req_id)
-                        if req_state is not None:
-                            req_state.num_computed_tokens = int(
-                                self.input_batch.num_computed_tokens_cpu[i]
-                            )
-                    self._edge_cloud_num_computed_corrected = False
-
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
                         scheduler_output,
@@ -2318,10 +2254,6 @@ class NPUModelRunner(GPUModelRunner):
                             :num_reqs
                         ].copy_(self.num_computed_tokens[:num_reqs], non_blocking=True)
                         self.valid_sampled_token_count_gpu = None
-                        # Mark that the corrected GPU num_computed_tokens is now
-                        # authoritative, so the tail segment can restore it after
-                        # its _update_states() re-overwrites the CPU copy.
-                        self._edge_cloud_num_computed_corrected = True
 
                     return hidden_states
                 if not get_pp_group().is_last_rank:
@@ -2420,10 +2352,7 @@ class NPUModelRunner(GPUModelRunner):
                     self._edge_cloud_enabled
                     and self.edge_cloud_cfg.role == "cloud"
                     and self.speculative_config
-                    and (
-                        self.model_config.is_hybrid
-                        or self.speculative_config.method == "mtp"
-                    )
+                    and self.model_config.is_hybrid
                     and self._last_scheduler_output is not None
                 ):
                     pp_group = get_pp_group()
@@ -2445,47 +2374,11 @@ class NPUModelRunner(GPUModelRunner):
                     num_accepted = tensor_dict["num_accepted_tokens"].to(self.device)
                     num_reqs = num_accepted.size(0)
                     self.num_accepted_tokens.gpu[:num_reqs] = num_accepted
-
                     if self.cache_config.mamba_cache_mode == "align":
                         for i, num_tokens in enumerate(
                             self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
                         ):
                             self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
-                    else:
-                        self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-                            self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
-                        )
-
-                    # Edge-cloud: the cloud does not sample, so the async-spec-decode
-                    # correction in _prepare_inputs is skipped. Compute the actual
-                    # accepted length here and save it for the next execute_model(),
-                    # because _update_states() will overwrite input_batch state with
-                    # the optimistic scheduler output.
-                    num_accepted_cpu = self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
-                    num_scheduled_cpu = self.num_scheduled_tokens.np[:num_reqs]
-                    num_rejected = num_scheduled_cpu - num_accepted_cpu
-                    # Only adjust requests that were actually scheduled this step.
-                    num_rejected = np.where(num_scheduled_cpu > 0, num_rejected, 0)
-
-                    corrected_num_computed = (
-                        self.input_batch.num_computed_tokens_cpu[:num_reqs] - num_rejected
-                    )
-                    self._edge_cloud_corrected_num_computed_tokens = {
-                        req_id: int(corrected_num_computed[i])
-                        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs])
-                    }
-
-                    # Correct req_state.num_computed_tokens before mamba postprocess,
-                    # because postprocess uses it to decide GDN state copies.
-                    for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-                        req_state = self.requests[req_id]
-                        if req_state.num_computed_tokens > 0:
-                            req_state.num_computed_tokens -= int(num_rejected[i])
-
-                    if (
-                        self.model_config.is_hybrid
-                        and self.cache_config.mamba_cache_mode == "align"
-                    ):
                         mamba_utils.postprocess_mamba(
                             self._last_scheduler_output,
                             self.kv_cache_config,
@@ -2496,6 +2389,10 @@ class NPUModelRunner(GPUModelRunner):
                             self.compilation_config.static_forward_context,
                             self.model.get_mamba_state_copy_func(),
                             self._get_mamba_copy_bufs(),
+                        )
+                    else:
+                        self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                            self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
                         )
 
                 return None  # noqa
@@ -2607,10 +2504,7 @@ class NPUModelRunner(GPUModelRunner):
                 self._edge_cloud_enabled
                 and self.edge_cloud_cfg.role != "cloud"
                 and self.speculative_config
-                and (
-                    self.model_config.is_hybrid
-                    or self.speculative_config.method == "mtp"
-                )
+                and self.model_config.is_hybrid
             ):
                 num_reqs = sampler_output.sampled_token_ids.size(0)
                 num_accepted = (sampler_output.sampled_token_ids != -1).sum(dim=1).cpu()

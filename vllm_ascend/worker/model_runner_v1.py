@@ -1949,33 +1949,6 @@ class NPUModelRunner(GPUModelRunner):
                 # Update persistent batch states.
                 deferred_state_corrections_fn = self._update_states(scheduler_output)
 
-                # Edge-cloud embed_only: the cloud does not sample, so it has no
-                # valid_sampled_token_count to correct the optimistic
-                # num_computed_tokens from async scheduling. The edge sends the
-                # corrected per-request num_computed_tokens along with the
-                # embedding output; apply it before building attention metadata.
-                if (
-                    self._edge_cloud_enabled
-                    and self.edge_cloud_cfg.role == "cloud"
-                    and self.edge_cloud_cfg.mode == "embedding_only"
-                    and intermediate_tensors is not None
-                ):
-                    edge_num_computed = intermediate_tensors.tensors.get(
-                        "num_computed_tokens"
-                    )
-                    if edge_num_computed is not None:
-                        num_reqs_edge = edge_num_computed.shape[0]
-                        if num_reqs_edge > 0:
-                            self.num_computed_tokens[:num_reqs_edge].copy_(
-                                edge_num_computed
-                            )
-                            self.input_batch.num_computed_tokens_cpu_tensor[
-                                :num_reqs_edge
-                            ].copy_(edge_num_computed, non_blocking=True)
-                        # Remove the metadata tensor so downstream PP slicing
-                        # only operates on hidden-state tensors.
-                        del intermediate_tensors.tensors["num_computed_tokens"]
-
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
                         scheduler_output,
@@ -2281,19 +2254,6 @@ class NPUModelRunner(GPUModelRunner):
                             :num_reqs
                         ].copy_(self.num_computed_tokens[:num_reqs], non_blocking=True)
                         self.valid_sampled_token_count_gpu = None
-
-                    # Embed-only edge sends the reject-corrected
-                    # num_computed_tokens to the cloud so the cloud builds
-                    # attention metadata from the real token counts instead of
-                    # the optimistic async-scheduling values.
-                    if (
-                        self.edge_cloud_cfg.mode == "embedding_only"
-                        and self.edge_cloud_cfg.role == "edge"
-                    ):
-                        num_reqs = self.input_batch.num_reqs
-                        hidden_states["num_computed_tokens"] = self.num_computed_tokens[
-                            :num_reqs
-                        ].clone()
 
                     return hidden_states
                 if not get_pp_group().is_last_rank:

@@ -2374,11 +2374,49 @@ class NPUModelRunner(GPUModelRunner):
                     num_accepted = tensor_dict["num_accepted_tokens"].to(self.device)
                     num_reqs = num_accepted.size(0)
                     self.num_accepted_tokens.gpu[:num_reqs] = num_accepted
+
+                    # Update CPU-side accepted token counts for mamba / state use.
                     if self.cache_config.mamba_cache_mode == "align":
                         for i, num_tokens in enumerate(
                             self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
                         ):
                             self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
+                    else:
+                        self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                            self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+                        )
+
+                    # Edge-cloud: the cloud does not sample, so the async-spec-decode
+                    # correction in _prepare_inputs is skipped. We must manually
+                    # subtract rejected tokens from the cloud-side num_computed_tokens
+                    # so that the next iteration's attention metadata (seq_lens,
+                    # slot_mapping) and the MTP draft metadata are reject-corrected.
+                    num_accepted_cpu = self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
+                    num_scheduled_cpu = self.num_scheduled_tokens.np[:num_reqs]
+                    num_rejected = num_scheduled_cpu - num_accepted_cpu
+                    # Only adjust requests that were actually scheduled this step.
+                    num_rejected = np.where(num_scheduled_cpu > 0, num_rejected, 0)
+
+                    corrected_num_computed = (
+                        self.input_batch.num_computed_tokens_cpu[:num_reqs] - num_rejected
+                    )
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs] = corrected_num_computed
+                    self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].copy_(
+                        torch.from_numpy(corrected_num_computed), non_blocking=True
+                    )
+                    self.num_computed_tokens[:num_reqs].copy_(
+                        self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+                        non_blocking=True,
+                    )
+
+                    # Sync the local request state as well; mamba postprocess below
+                    # uses req_state.num_computed_tokens to decide state copies.
+                    for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                        req_state = self.requests[req_id]
+                        if req_state.num_computed_tokens > 0:
+                            req_state.num_computed_tokens -= int(num_rejected[i])
+
+                    if self.cache_config.mamba_cache_mode == "align":
                         mamba_utils.postprocess_mamba(
                             self._last_scheduler_output,
                             self.kv_cache_config,
@@ -2389,10 +2427,6 @@ class NPUModelRunner(GPUModelRunner):
                             self.compilation_config.static_forward_context,
                             self.model.get_mamba_state_copy_func(),
                             self._get_mamba_copy_bufs(),
-                        )
-                    else:
-                        self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-                            self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
                         )
 
                 return None  # noqa

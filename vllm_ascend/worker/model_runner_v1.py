@@ -789,37 +789,6 @@ class NPUModelRunner(GPUModelRunner):
             ):
                 self._setup_edge_cloud_mtp(self.drafter.model)
 
-    def _apply_edge_cloud_corrected_num_computed_tokens(
-        self,
-        corrected: torch.Tensor,
-    ) -> None:
-        """Apply edge-side corrected num_computed_tokens on the cloud.
-
-        In edge-cloud embedding_only mode, the edge's first prepare applies the
-        async spec-decode reject correction to num_computed_tokens. The cloud
-        does not sample, so it cannot apply that correction itself. If left
-        uncorrected, the cloud builds attention metadata (seq_lens,
-        slot_mapping, etc.) from the optimistic scheduler output, which is
-        larger than the actual accepted length by exactly the number of
-        rejected tokens. The edge packs the corrected num_computed_tokens
-        into the intermediate tensors it sends to the cloud; we apply it here
-        before the cloud's _prepare_inputs uses it.
-        """
-        num_reqs = self.input_batch.num_reqs
-        if corrected.numel() != num_reqs:
-            logger.warning(
-                "[EdgeCloud] Received corrected num_computed_tokens size %d "
-                "does not match num_reqs %d; ignoring.",
-                corrected.numel(),
-                num_reqs,
-            )
-            return
-        # The CPU tensor and its numpy view share memory, so updating the
-        # tensor also updates the numpy array that _prepare_inputs reads.
-        self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].copy_(
-            corrected
-        )
-
     def _setup_edge_cloud_mtp(self, mtp_model: nn.Module) -> None:
         predictor = LayerShardLoader._get_mtp_model(mtp_model)
         if predictor is None:
@@ -1919,26 +1888,6 @@ class NPUModelRunner(GPUModelRunner):
         # Save scheduler_output for edge-cloud mamba state sync in sample_tokens().
         self._last_scheduler_output = scheduler_output
 
-        # In edge-cloud embedding_only mode, the edge sends the corrected
-        # num_computed_tokens (after async spec-decode reject correction) in
-        # the intermediate tensors. Pop it here so that downstream preprocess
-        # does not treat it as a hidden-state tensor, and apply it after
-        # _update_states so the cloud's _prepare_inputs builds attention
-        # metadata from the corrected state instead of the optimistic scheduler
-        # output.
-        edge_cloud_corrected_num_computed_tokens: torch.Tensor | None = None
-        if (
-            self._edge_cloud_enabled
-            and self.edge_cloud_cfg.role == "cloud"
-            and self.edge_cloud_cfg.mode == "embedding_only"
-            and intermediate_tensors is not None
-        ):
-            tensors = intermediate_tensors.tensors
-            if "_edge_cloud_num_computed_tokens" in tensors:
-                edge_cloud_corrected_num_computed_tokens = tensors.pop(
-                    "_edge_cloud_num_computed_tokens"
-                )
-
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
@@ -1999,11 +1948,6 @@ class NPUModelRunner(GPUModelRunner):
 
                 # Update persistent batch states.
                 deferred_state_corrections_fn = self._update_states(scheduler_output)
-
-                if edge_cloud_corrected_num_computed_tokens is not None:
-                    self._apply_edge_cloud_corrected_num_computed_tokens(
-                        edge_cloud_corrected_num_computed_tokens
-                    )
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -2310,18 +2254,6 @@ class NPUModelRunner(GPUModelRunner):
                             :num_reqs
                         ].copy_(self.num_computed_tokens[:num_reqs], non_blocking=True)
                         self.valid_sampled_token_count_gpu = None
-
-                        # Pack the corrected num_computed_tokens for the cloud.
-                        # The cloud does not sample, so it cannot apply the
-                        # async spec-decode reject correction itself and would
-                        # otherwise build attention metadata from the optimistic
-                        # scheduler output. Sending the corrected GPU values lets
-                        # the cloud align its seq_lens/slot_mapping with edge.
-                        # Use the GPU tensor directly so we do not race with the
-                        # non-blocking CPU sync above.
-                        hidden_states.tensors[
-                            "_edge_cloud_num_computed_tokens"
-                        ] = self.num_computed_tokens[:num_reqs].clone()
 
                     return hidden_states
                 if not get_pp_group().is_last_rank:

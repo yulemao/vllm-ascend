@@ -1201,29 +1201,34 @@ class NPUModelRunner(GPUModelRunner):
         # CPU values are optimistic (all drafts accepted). The kernel
         # corrects on GPU using the previous step's
         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
-        if (
-            self.use_async_spec_decode
-            and self.valid_sampled_token_count_gpu is not None
-            and prev_req_id_to_index
-        ):
-            self.prev_positions.copy_to_gpu(num_reqs)
-            self.prev_num_draft_tokens.copy_to_gpu()
-            cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
-                device=self.device, non_blocking=True
-            )
-            update_num_computed_tokens_for_batch_change(
-                self.num_computed_tokens,
-                self.num_accepted_tokens.gpu[:num_reqs],
-                self.prev_positions.gpu[:num_reqs],
-                self.valid_sampled_token_count_gpu,
-                self.prev_num_draft_tokens.gpu,
-                cpu_values,
-            )
-        else:
-            self.num_computed_tokens[:num_reqs].copy_(
-                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
-                non_blocking=True,
-            )
+        # In edge-cloud embedding_only mode, the tail segment reuses the
+        # num_computed_tokens already corrected by the head segment, so skip
+        # both the kernel and the CPU fallback copy to avoid re-introducing
+        # the scheduler's optimistic value.
+        if not self._is_edge_cloud_embed_only_tail:
+            if (
+                self.use_async_spec_decode
+                and self.valid_sampled_token_count_gpu is not None
+                and prev_req_id_to_index
+            ):
+                self.prev_positions.copy_to_gpu(num_reqs)
+                self.prev_num_draft_tokens.copy_to_gpu()
+                cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
+                    device=self.device, non_blocking=True
+                )
+                update_num_computed_tokens_for_batch_change(
+                    self.num_computed_tokens,
+                    self.num_accepted_tokens.gpu[:num_reqs],
+                    self.prev_positions.gpu[:num_reqs],
+                    self.valid_sampled_token_count_gpu,
+                    self.prev_num_draft_tokens.gpu,
+                    cpu_values,
+                )
+            else:
+                self.num_computed_tokens[:num_reqs].copy_(
+                    self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+                    non_blocking=True,
+                )
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
         self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
@@ -1888,6 +1893,19 @@ class NPUModelRunner(GPUModelRunner):
         # Save scheduler_output for edge-cloud mamba state sync in sample_tokens().
         self._last_scheduler_output = scheduler_output
 
+        # In edge-cloud embedding_only mode, execute_model is called twice for the
+        # same scheduler_output: head segment (intermediate_tensors is None) and
+        # tail segment (intermediate_tensors is not None). The tail segment should
+        # reuse the num_computed_tokens corrected by the head segment, instead of
+        # re-running update_num_computed_tokens_for_batch_change or copying the
+        # potentially optimistic CPU value back to GPU.
+        self._is_edge_cloud_embed_only_tail = (
+            self._edge_cloud_enabled
+            and self.edge_cloud_cfg.mode == "embedding_only"
+            and self.edge_cloud_cfg.role == "edge"
+            and intermediate_tensors is not None
+        )
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
@@ -2235,25 +2253,6 @@ class NPUModelRunner(GPUModelRunner):
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     self._finalize_dump_data()
-
-                    # Edge-cloud embed_only: execute_model is called a second
-                    # time for the tail segment with the same scheduler_output.
-                    # _prepare_inputs would run
-                    # update_num_computed_tokens_for_batch_change again and
-                    # double-count the correction (num_computed_tokens already
-                    # holds the corrected value).  Sync back to CPU so the
-                    # second call's fallback copy path sees the right state,
-                    # then clear the GPU stash so the kernel is skipped.
-                    if (
-                        self.use_async_spec_decode
-                        and self.edge_cloud_cfg.mode == "embedding_only"
-                        and self.edge_cloud_cfg.role == "edge"
-                    ):
-                        num_reqs = self.input_batch.num_reqs
-                        self.input_batch.num_computed_tokens_cpu_tensor[
-                            :num_reqs
-                        ].copy_(self.num_computed_tokens[:num_reqs], non_blocking=True)
-                        self.valid_sampled_token_count_gpu = None
 
                     return hidden_states
                 if not get_pp_group().is_last_rank:

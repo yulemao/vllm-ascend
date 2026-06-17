@@ -2690,12 +2690,14 @@ class NPUModelRunner(GPUModelRunner):
         # Compute batch_size: each decode request contributes one
         # draft token per step.
         batch_size = num_reqs
+        common_attn_metadata.num_reqs = batch_size
 
         # Use the actual number of tokens carried by positions,
         # which already accounts for rejected tokens on the edge side.
-        # When cloud_meta is provided, also overwrite seq_lens,
-        # slot_mapping and query_start_loc with the reject-corrected
-        # values so the Ascend attention backend reads the right KV.
+        # When cloud_meta is provided, also overwrite seq_lens and
+        # query_start_loc with the reject-corrected values.  slot_mapping
+        # is recomputed locally below because physical block ids differ
+        # between edge and cloud PP ranks.
         num_input_tokens = positions.shape[-1]
         num_actual_tokens = (
             cloud_meta.get("num_actual_tokens", num_input_tokens)
@@ -2712,8 +2714,10 @@ class NPUModelRunner(GPUModelRunner):
                 common_attn_metadata.seq_lens_cpu = cloud_meta["seq_lens_cpu"]
             if "_seq_lens_cpu" in cloud_meta:
                 common_attn_metadata._seq_lens_cpu = cloud_meta["_seq_lens_cpu"]
-            if "slot_mapping" in cloud_meta:
-                common_attn_metadata.slot_mapping = cloud_meta["slot_mapping"]
+            # Do NOT use the edge-side slot_mapping verbatim: physical block ids
+            # are local to each PP rank, so an edge slot index points to the
+            # wrong physical slot on the cloud.  We recompute the slot mapping
+            # below from the cloud's own block table.
             if "query_start_loc" in cloud_meta:
                 common_attn_metadata.query_start_loc = cloud_meta["query_start_loc"]
             if "query_start_loc_cpu" in cloud_meta:
@@ -2754,15 +2758,14 @@ class NPUModelRunner(GPUModelRunner):
             common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
 
             # Edge sends the SAME (first-pass) snapshot of
-            # slot_mapping / query_start_loc / num_actual_tokens /
-            # actual_seq_lengths_q for every speculative step.  From
-            # the second step onward the cloud must rebuild them to
-            # reflect a decode-only batch where each request owns
-            # exactly one query token.  Without this rebuild the
-            # attention backend reads stale offsets, picks the wrong
-            # KV slot and num_decode_tokens (derived inside
-            # split_decodes_and_prefills) ends up matching the
-            # first-pass num_actual_tokens instead of batch_size.
+            # query_start_loc / num_actual_tokens / actual_seq_lengths_q
+            # for every speculative step.  From the second step onward the
+            # cloud must rebuild them to reflect a decode-only batch where
+            # each request owns exactly one query token.  Without this rebuild
+            # the attention backend reads stale offsets, picks the wrong KV
+            # slot and num_decode_tokens (derived inside split_decodes_and_prefills)
+            # ends up matching the first-pass num_actual_tokens instead of
+            # batch_size.
             device = common_attn_metadata.seq_lens.device
             new_query_start_loc_cpu = torch.arange(
                 batch_size + 1, dtype=torch.int32, device="cpu"
@@ -2773,34 +2776,10 @@ class NPUModelRunner(GPUModelRunner):
             )
             common_attn_metadata.num_actual_tokens = batch_size
             common_attn_metadata.num_input_tokens = num_input_tokens
+            common_attn_metadata.num_reqs = batch_size
             common_attn_metadata.actual_seq_lengths_q = list(
                 range(1, batch_size + 1)
             )
-
-            # Recompute slot_mapping from the freshly received positions
-            # and the (still valid) block_table.  Each decode token maps
-            # to position // block_size -> slot offset within the block.
-            block_table_tensor = common_attn_metadata.block_table_tensor
-            if (
-                block_table_tensor is not None
-                and positions is not None
-                and self.drafter is not None
-                and hasattr(self.drafter, "kernel_block_size")
-            ):
-                block_size = self.drafter.kernel_block_size
-                pos_flat = positions if positions.dim() == 1 else positions[0]
-                pos_flat = pos_flat[:batch_size]
-                exceeds = pos_flat >= self.model_config.max_model_len
-                clamped = torch.where(exceeds, torch.zeros_like(pos_flat), pos_flat)
-                block_numbers = clamped // block_size
-                block_ids = block_table_tensor[:batch_size].gather(
-                    dim=1, index=block_numbers.view(-1, 1).long()
-                ).view(-1)
-                new_slot_mapping = (
-                    block_ids * block_size + clamped % block_size
-                ).to(torch.int32)
-                new_slot_mapping.masked_fill_(exceeds, PADDING_SLOT_ID)
-                common_attn_metadata.slot_mapping = new_slot_mapping
         else:
             # For the first speculative step, preserve the original attn_state
             # from the target model's forward pass (e.g. PrefillNoCache during
@@ -2810,6 +2789,57 @@ class NPUModelRunner(GPUModelRunner):
             # hidden states and leads to 100% draft-hit dead loops.
             if common_attn_metadata.attn_state is None:
                 common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
+
+        # Recompute slot_mapping from the freshly received positions and the
+        # cloud's current block table.  Physical block ids are local to each PP
+        # rank, so we must not reuse the edge-side slot_mapping snapshot.
+        # Refresh the block table first: the saved snapshot predates the target
+        # model forward and any blocks that were allocated for speculative
+        # tokens.
+        if (
+            self.input_batch is not None
+            and len(self.input_batch.block_table) > 0
+        ):
+            current_block_table = self.input_batch.block_table[0].get_device_tensor()
+            if current_block_table is not None:
+                # Keep the same number of request rows as the saved metadata so
+                # builders that slice to num_reqs still see a consistent shape.
+                common_attn_metadata.block_table_tensor = current_block_table[:num_reqs]
+
+        block_table_tensor = common_attn_metadata.block_table_tensor
+        if (
+            block_table_tensor is not None
+            and positions is not None
+            and self.drafter is not None
+            and hasattr(self.drafter, "kernel_block_size")
+        ):
+            block_size = self.drafter.kernel_block_size
+            pos_flat = positions if positions.dim() == 1 else positions[0]
+            pos_flat = pos_flat[:batch_size]
+            exceeds = pos_flat >= self.model_config.max_model_len
+            clamped = torch.where(exceeds, torch.zeros_like(pos_flat), pos_flat)
+            block_numbers = clamped // block_size
+            block_ids = block_table_tensor[:batch_size].gather(
+                dim=1, index=block_numbers.view(-1, 1).long()
+            ).view(-1)
+            new_slot_mapping = (
+                block_ids * block_size + clamped % block_size
+            ).to(torch.int32)
+            new_slot_mapping.masked_fill_(exceeds, PADDING_SLOT_ID)
+
+            # Pad to num_actual_tokens so reshape_and_cache can slice safely
+            # when the cloud batch contains cudagraph padding on the first pass.
+            expected_len = common_attn_metadata.num_actual_tokens
+            if new_slot_mapping.shape[0] < expected_len:
+                padded_slot_mapping = torch.full(
+                    (expected_len,),
+                    PADDING_SLOT_ID,
+                    dtype=new_slot_mapping.dtype,
+                    device=new_slot_mapping.device,
+                )
+                padded_slot_mapping[:batch_size] = new_slot_mapping
+                new_slot_mapping = padded_slot_mapping
+            common_attn_metadata.slot_mapping = new_slot_mapping
 
         # Build per-layer attention metadata using draft_attn_groups.
         per_layer_attn_metadata: dict[str, Any] = {}

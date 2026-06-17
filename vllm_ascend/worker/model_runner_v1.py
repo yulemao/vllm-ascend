@@ -2773,12 +2773,9 @@ class NPUModelRunner(GPUModelRunner):
             )
             common_attn_metadata.num_actual_tokens = batch_size
             common_attn_metadata.num_input_tokens = num_input_tokens
-            # From the second speculative step onward each request contributes
-            # exactly one decode query token, so every entry must be 1.  Using
-            # range(1, batch_size + 1) incorrectly treats the i-th request as
-            # having i + 1 query tokens, which corrupts attention for all rows
-            # except the first and makes edge-cloud MTP hidden states diverge.
-            common_attn_metadata.actual_seq_lengths_q = [1] * batch_size
+            common_attn_metadata.actual_seq_lengths_q = list(
+                range(1, batch_size + 1)
+            )
 
             # Recompute slot_mapping from the freshly received positions
             # and the (still valid) block_table.  Each decode token maps

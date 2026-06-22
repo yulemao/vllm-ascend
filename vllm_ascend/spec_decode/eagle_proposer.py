@@ -911,23 +911,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         ):
             ret_hidden_states = self._run_mtp_edge_cloud(**model_kwargs)
             if self.runner.edge_cloud_cfg.role == "cloud":
-                # When num_speculative_tokens > 1, the edge side iterates
-                # through remaining draft steps (see the loop below), each
-                # requiring a fresh round-trip: edge embed+fc → send → cloud
-                # recv → decoder → send → edge recv → norm.  Cloud must
-                # participate in every round or the edge blocks on recv.
-                if self.num_speculative_tokens > 1:
-                    for draft_step in range(self.num_speculative_tokens - 1):
-                        # The cloud path populates intermediate_tensors,
-                        # positions, and spec_step_idx from the received
-                        # tensor_dict; pass placeholders for keys it will pop.
-                        cloud_kwargs: dict[str, Any] = {}
-                        if self.pass_hidden_states_to_model:
-                            cloud_kwargs["input_ids"] = None
-                            cloud_kwargs["hidden_states"] = None
-                        self._run_mtp_edge_cloud(**cloud_kwargs)
-                # Logits computation and token sampling happen exclusively on
-                # the edge side.
+                # Cloud only runs the decoder layers and returns intermediate
+                # hidden states to the edge.  Logits computation and token
+                # sampling happen exclusively on the edge side.  Additional
+                # speculative steps are handled in the _propose loop below,
+                # keeping edge/cloud round-trips paired there.
                 return torch.empty(0, dtype=torch.int64, device=self.device)
         else:
             ret_hidden_states = self.model(**model_kwargs)

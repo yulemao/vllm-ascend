@@ -2649,7 +2649,6 @@ class NPUModelRunner(GPUModelRunner):
         self,
         positions: torch.Tensor,
         spec_step_idx: int,
-        cloud_meta: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Build per-layer attention metadata for the MTP cloud decoder.
 
@@ -2693,31 +2692,10 @@ class NPUModelRunner(GPUModelRunner):
 
         # Use the actual number of tokens carried by positions,
         # which already accounts for rejected tokens on the edge side.
-        # When cloud_meta is provided, also overwrite seq_lens,
-        # slot_mapping and query_start_loc with the reject-corrected
-        # values so the Ascend attention backend reads the right KV.
         num_input_tokens = positions.shape[-1]
-        num_actual_tokens = (
-            cloud_meta.get("num_actual_tokens", num_input_tokens)
-            if cloud_meta is not None
-            else num_input_tokens
-        )
+        num_actual_tokens = num_input_tokens
         common_attn_metadata.num_actual_tokens = num_actual_tokens
         common_attn_metadata.num_input_tokens = num_input_tokens
-
-        if cloud_meta is not None:
-            if "seq_lens" in cloud_meta:
-                common_attn_metadata.seq_lens = cloud_meta["seq_lens"]
-            if "seq_lens_cpu" in cloud_meta:
-                common_attn_metadata.seq_lens_cpu = cloud_meta["seq_lens_cpu"]
-            if "_seq_lens_cpu" in cloud_meta:
-                common_attn_metadata._seq_lens_cpu = cloud_meta["_seq_lens_cpu"]
-            if "slot_mapping" in cloud_meta:
-                common_attn_metadata.slot_mapping = cloud_meta["slot_mapping"]
-            if "query_start_loc" in cloud_meta:
-                common_attn_metadata.query_start_loc = cloud_meta["query_start_loc"]
-            if "query_start_loc_cpu" in cloud_meta:
-                common_attn_metadata.query_start_loc_cpu = cloud_meta["query_start_loc_cpu"]
 
         if spec_step_idx > 0:
             # For steps after the first, each request has exactly one
@@ -2860,24 +2838,11 @@ class NPUModelRunner(GPUModelRunner):
                 spec_step_idx = tensor_dict["spec_step_idx"].item()
                 model_kwargs["spec_step_idx"] = spec_step_idx
 
-            # Extract reject-corrected attention metadata sent from edge
-            # so the cloud builds accurate attention metadata after tokens
-            # are rejected.
-            cloud_meta = {}
-            for key in ("seq_lens", "seq_lens_cpu", "_seq_lens_cpu",
-                        "slot_mapping", "query_start_loc",
-                        "query_start_loc_cpu"):
-                if key in tensor_dict:
-                    cloud_meta[key] = tensor_dict[key]
-            if "num_actual_tokens" in tensor_dict:
-                cloud_meta["num_actual_tokens"] = tensor_dict[
-                    "num_actual_tokens"].item()
-
             # Build attention metadata for the MTP decoder layers.
             # Without this, the Ascend attention backend silently
             # returns zeros, corrupting hidden states.
             draft_attn_metadata = self._build_mtp_cloud_attn_metadata(
-                positions, spec_step_idx, cloud_meta
+                positions, spec_step_idx
             )
 
             # Run cloud segment (all MTP decoder layers are on cloud)

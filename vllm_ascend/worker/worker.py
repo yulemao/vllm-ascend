@@ -441,6 +441,11 @@ class NPUWorker(WorkerBase):
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass:
             if is_cloud_device():
+                # Pre-compute input preparation while edge runs segment_a.
+                # This overlaps cloud's _update_states, _prepare_inputs,
+                # _determine_batch_execution_and_padding, and
+                # _build_attention_metadata with edge's segment_a forward.
+                self.model_runner.cloud_prepare_early(scheduler_output)
                 tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
                 intermediate_tensors = AsyncIntermediateTensors(
                     tensor_dict,
@@ -485,6 +490,7 @@ class NPUWorker(WorkerBase):
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
             )
+           
             output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
             if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
                 return output

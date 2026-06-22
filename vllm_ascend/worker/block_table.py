@@ -48,25 +48,32 @@ class BlockTable:
             self.use_hybrid_blocks = False
         else:
             # Find the first kernel size that divides physical_block_size evenly
+            # and is not larger than the physical block size itself.
             selected_kernel_size = None
             for kernel_size in kernel_sizes:
-                if kernel_size > 0 and self.physical_block_size % kernel_size == 0:
+                if (kernel_size > 0
+                        and kernel_size <= self.physical_block_size
+                        and self.physical_block_size % kernel_size == 0):
                     selected_kernel_size = kernel_size
                     break
 
             if selected_kernel_size is None:
-                raise ValueError(
-                    f"None of the kernel sizes {kernel_sizes} can divide "
-                    f"physical block size {self.physical_block_size} evenly"
-                )
-
-            self.block_size = selected_kernel_size
-            self.logical_block_size = selected_kernel_size
-            self.blocks_per_phys_block = self.physical_block_size // self.logical_block_size
-            if self.blocks_per_phys_block > 1:
-                self.use_hybrid_blocks = True
-            else:
+                # Fallback to no splitting when no valid kernel size is found.
+                # This can happen when the backend-reported supported sizes are
+                # larger than the actual KV-cache block size chosen by the
+                # profile run (e.g. edge-cloud mode with non-default block_size).
+                self.block_size = block_size
+                self.logical_block_size = block_size
+                self.blocks_per_phys_block = 1
                 self.use_hybrid_blocks = False
+            else:
+                self.block_size = selected_kernel_size
+                self.logical_block_size = selected_kernel_size
+                self.blocks_per_phys_block = self.physical_block_size // self.logical_block_size
+                if self.blocks_per_phys_block > 1:
+                    self.use_hybrid_blocks = True
+                else:
+                    self.use_hybrid_blocks = False
 
         if self.use_hybrid_blocks:
             logical_table_size = max_num_blocks_per_req * self.blocks_per_phys_block

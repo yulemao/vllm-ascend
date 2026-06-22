@@ -4342,51 +4342,51 @@ class NPUModelRunner(GPUModelRunner):
                     {k: v[:intermediate_tokens] for k, v in self.intermediate_tensors.items()}
                 )
 
-                need_dummy_logits = not is_profile and lmhead_tp_enable()
-                max_num_reqs_across_dp = max_num_reqs * self.uniform_decode_query_len
-                dummy_indices = torch.zeros(max_num_reqs_across_dp, dtype=torch.int32)
+            need_dummy_logits = not is_profile and lmhead_tp_enable()
+            max_num_reqs_across_dp = max_num_reqs * self.uniform_decode_query_len
+            dummy_indices = torch.zeros(max_num_reqs_across_dp, dtype=torch.int32)
 
-                with set_ascend_forward_context(
-                    attn_metadata,
-                    self.vllm_config,
+            with set_ascend_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens_padded,
+                num_tokens_across_dp=num_tokens_across_dp,
+                in_profile_run=is_profile,
+                num_actual_tokens=num_tokens_padded,
+                aclgraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=batch_desc,
+                model_instance=self.model,
+            ):
+                outputs = self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
+                )
+            if self.use_aux_hidden_state_outputs:
+                hidden_states, _ = outputs
+            elif isinstance(outputs, IntermediateTensors):
+                hidden_states = outputs["hidden_states"]
+            else:
+                hidden_states = outputs
+            dummy_compute_logits(hidden_states)
+
+            if self.drafter:
+                self.drafter.dummy_run(
                     num_tokens=num_tokens_padded,
+                    with_prefill=with_prefill,
+                    num_reqs=num_reqs_padded,
                     num_tokens_across_dp=num_tokens_across_dp,
-                    in_profile_run=is_profile,
-                    num_actual_tokens=num_tokens_padded,
                     aclgraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_desc,
-                    model_instance=self.model,
-                ):
-                    outputs = self._model_forward(
-                        num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
-                    )
-                if self.use_aux_hidden_state_outputs:
-                    hidden_states, _ = outputs
-                elif isinstance(outputs, IntermediateTensors):
-                    hidden_states = outputs["hidden_states"]
-                else:
-                    hidden_states = outputs
-                dummy_compute_logits(hidden_states)
+                    dummy_compute_logits=dummy_drafter_compute_logits,
+                    in_graph_capturing=not force_attention,
+                    is_profile=is_profile,
+                )
+            if is_profile and self.dynamic_eplb:
+                target = self.model.language_model if hasattr(self.model, "language_model") else self.model
+                target.clear_all_moe_loads()
+            if self.dynamic_eplb:
+                self.eplb_updator.forward_end()
 
-                if self.drafter:
-                    self.drafter.dummy_run(
-                        num_tokens=num_tokens_padded,
-                        with_prefill=with_prefill,
-                        num_reqs=num_reqs_padded,
-                        num_tokens_across_dp=num_tokens_across_dp,
-                        aclgraph_runtime_mode=cudagraph_runtime_mode,
-                        batch_descriptor=batch_desc,
-                        dummy_compute_logits=dummy_drafter_compute_logits,
-                        in_graph_capturing=not force_attention,
-                        is_profile=is_profile,
-                    )
-                if is_profile and self.dynamic_eplb:
-                    target = self.model.language_model if hasattr(self.model, "language_model") else self.model
-                    target.clear_all_moe_loads()
-                if self.dynamic_eplb:
-                    self.eplb_updator.forward_end()
-
-                self._finalize_dump_data(dump=False)
+            self._finalize_dump_data(dump=False)
             return hidden_states, hidden_states
 
 

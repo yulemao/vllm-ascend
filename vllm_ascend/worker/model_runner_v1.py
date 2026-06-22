@@ -768,6 +768,9 @@ class NPUModelRunner(GPUModelRunner):
             )
             self.segment_c_wrapper = self._wrap_segment_if_needed(self.segment_c)
 
+        if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+            self.update_stream: torch.npu.Stream = torch.npu.Stream()
+
         logger.info(
             "[EdgeCloud] Model loaded. num_layers=%d role=%s",
             self.num_layers,

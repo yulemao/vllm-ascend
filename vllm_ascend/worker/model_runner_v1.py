@@ -50,7 +50,6 @@ from vllm.distributed.parallel_state import is_edge_device, is_edge_cloud_pp_mod
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
-from vllm.model_executor.models.interfaces import supports_mrope
 from vllm.model_executor.model_loader import get_model, get_model_loader
 from vllm.model_executor.model_loader.utils import (
     initialize_model,
@@ -105,7 +104,6 @@ from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.cp_utils import (
     get_total_cp_world_size,
 )
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, GPUModelRunner
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
@@ -986,35 +984,6 @@ class NPUModelRunner(GPUModelRunner):
         self.query_start_loc.copy_to_gpu()
 
         return num_reqs_padded
-
-    def _init_mrope_positions(self, req_state: CachedRequestState):
-        """Initialize M-RoPE positions, handling edge-cloud embed_only mode.
-
-        In edge-cloud embed_only mode the cloud side may receive prompt_embeds
-        without real prompt_token_ids (the token list is empty). For M-RoPE,
-        prompt_embeds are treated as plain text positions, so we can build the
-        positions directly from the embed length and fall back to the generic
-        implementation when real token ids are present.
-        """
-        if (
-            self._edge_cloud_enabled
-            and self.edge_cloud_cfg.mode == "embedding_only"
-            and (req_state.prompt_token_ids is None
-                 or len(req_state.prompt_token_ids) == 0)
-            and req_state.prompt_embeds is not None
-            and len(req_state.prompt_embeds) > 0
-        ):
-            model = self.get_model()
-            assert supports_mrope(model), "M-RoPE support is not implemented."
-            num_prompt_tokens = len(req_state.prompt_embeds)
-            # Text-only M-RoPE: all three dimensions share the same positions.
-            positions = torch.arange(
-                num_prompt_tokens, dtype=torch.int64, device="cpu"
-            ).unsqueeze(0).expand(3, -1).contiguous()
-            req_state.mrope_positions = positions
-            req_state.mrope_position_delta = 0
-            return
-        super()._init_mrope_positions(req_state)
 
     def _prepare_inputs(
         self,

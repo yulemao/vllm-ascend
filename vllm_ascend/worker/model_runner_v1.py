@@ -355,6 +355,10 @@ class NPUModelRunner(GPUModelRunner):
         # because the drafter setup needs to know whether edge-cloud is enabled.
         self.edge_cloud_cfg = self.ascend_config.edge_cloud_config
         self._edge_cloud_enabled = self.edge_cloud_cfg.enabled
+        # This flag is set per-step in execute_model; initialize it here so
+        # that code paths reaching _prepare_inputs before the first execute_model
+        # call (e.g. profile_run or unit tests) do not hit AttributeError.
+        self._is_edge_cloud_embed_only_tail = False
         if self._edge_cloud_enabled:
             if not self.parallel_config.enable_edge_cloud:
                 raise ValueError(

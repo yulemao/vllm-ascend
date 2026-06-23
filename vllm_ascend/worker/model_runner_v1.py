@@ -472,11 +472,6 @@ class NPUModelRunner(GPUModelRunner):
             self.pcp_rank = 0
         if self.pcp_size > 1:
             self.model_config.max_model_len += 2 * self.pcp_size * self.max_num_reqs
-            # Keep self.max_model_len in sync with the padded model_config value;
-            # downstream code (e.g. may_reinitialize_input_batch) uses this field
-            # to size CPU/GPU buffers, so an outdated value leads to buffer
-            # overflows such as torch.index_select index out of range.
-            self.max_model_len = self.model_config.max_model_len
         max_buffer_num_tokens = self.max_num_tokens
         if self.pcp_size * self.dcp_size > 1:
             max_buffer_num_tokens = self.max_num_tokens + self.max_num_reqs * 2 * self.pcp_size
@@ -4406,13 +4401,6 @@ class NPUModelRunner(GPUModelRunner):
         hidden_states = hidden_states[logit_indices]
         output = self.model.compute_logits(hidden_states)
         return output
-
-    def update_max_model_len(self, max_model_len: int) -> None:
-        """Update max_model_len after auto-fit, keeping PCP padding in sync."""
-        if self.pcp_size > 1:
-            max_model_len += 2 * self.pcp_size * self.max_num_reqs
-        super().update_max_model_len(max_model_len)
-        self.model_config.max_model_len = max_model_len
 
     def profile_run(self) -> None:
         self.eplb_warmup()

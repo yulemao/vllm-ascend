@@ -3951,14 +3951,20 @@ class NPUModelRunner(GPUModelRunner):
                 )
 
             # add kvcomp_metadata into common_attn_metadata
+            # GDN attention builders may update cached inference tensors
+            # (e.g. causal_conv1d host pinned buffers) in-place; ensure we are
+            # under torch.inference_mode() even if the surrounding context
+            # somehow lost it.
             if for_cudagraph_capture:
-                attn_metadata_i = builder.build_for_cudagraph_capture(common_attn_metadata)
+                with torch.inference_mode():
+                    attn_metadata_i = builder.build_for_cudagraph_capture(common_attn_metadata)
             else:
-                attn_metadata_i = builder.build(
-                    common_prefix_len=cascade_attn_prefix_len,
-                    common_attn_metadata=common_attn_metadata,
-                    **extra_attn_metadata_args,
-                )
+                with torch.inference_mode():
+                    attn_metadata_i = builder.build(
+                        common_prefix_len=cascade_attn_prefix_len,
+                        common_attn_metadata=common_attn_metadata,
+                        **extra_attn_metadata_args,
+                    )
                 # NOTE(zxr): Due to the Triton operator does not deal with -1 padding in FullGraph mode,
                 # the padding needs to be changed from -1 to 0 to avoid writing invalid mamba block.
                 if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() \

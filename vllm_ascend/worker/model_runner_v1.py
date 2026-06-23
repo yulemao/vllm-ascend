@@ -1415,15 +1415,13 @@ class NPUModelRunner(GPUModelRunner):
             if (
                 hasattr(self, "_positions_out_of_range_mask")
                 and self._positions_out_of_range_mask.any()
-                and self.input_batch.block_table.block_tables
             ):
                 out_of_range_mask_gpu = torch.from_numpy(
                     self._positions_out_of_range_mask
                 ).to(self.device)
-                for blk_table in self.input_batch.block_table.block_tables:
-                    blk_table.slot_mapping.gpu[
-                        :total_num_scheduled_tokens
-                    ].masked_fill_(out_of_range_mask_gpu, PADDING_SLOT_ID)
+                self.input_batch.block_table.slot_mapping.gpu[
+                    :total_num_scheduled_tokens
+                ].masked_fill_(out_of_range_mask_gpu, PADDING_SLOT_ID)
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
             drift = self.num_computed_tokens[req_indices_gpu].to(

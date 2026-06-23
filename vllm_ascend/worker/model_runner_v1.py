@@ -1092,6 +1092,22 @@ class NPUModelRunner(GPUModelRunner):
         else:
             self.query_lens = torch.from_numpy(num_scheduled_tokens)
 
+        # Defensive clamp: edge-cloud MTP (and other speculative-decode
+        # corner cases) can hand us positions at or beyond max_model_len.
+        # Clamp them to the valid token-id index range so that the
+        # torch.index_select below and the later slot-mapping kernel stay
+        # in bounds.  Tokens landing on the clamped positions are masked
+        # to PAD_SLOT_ID after compute_slot_mapping.
+        max_token_idx = self.input_batch.token_ids_cpu.shape[1] - 1
+        self._positions_out_of_range_mask = positions_np > max_token_idx
+        if self._positions_out_of_range_mask.any():
+            logger.warning_once(
+                "Clamped %d positions to max_model_len-1; scheduled tokens "
+                "exceed token_ids_cpu bounds.",
+                int(self._positions_out_of_range_mask.sum()),
+            )
+        np.clip(positions_np, 0, max_token_idx, out=positions_np)
+
         # Get token indices.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
@@ -1361,6 +1377,17 @@ class NPUModelRunner(GPUModelRunner):
                 self.query_start_loc.gpu[: num_reqs + 1],
                 self.positions[:total_num_scheduled_tokens],
             )
+            # Mask the corresponding KV slots for any clamped positions.
+            if (
+                hasattr(self, "_positions_out_of_range_mask")
+                and self._positions_out_of_range_mask.any()
+            ):
+                out_of_range_mask_gpu = torch.from_numpy(
+                    self._positions_out_of_range_mask
+                ).to(self.device)
+                self.input_batch.block_table.slot_mapping.gpu[
+                    :total_num_scheduled_tokens
+                ].masked_fill_(out_of_range_mask_gpu, PADDING_SLOT_ID)
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
             drift = self.num_computed_tokens[req_indices_gpu].to(

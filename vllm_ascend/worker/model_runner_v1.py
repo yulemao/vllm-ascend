@@ -2170,6 +2170,7 @@ class NPUModelRunner(GPUModelRunner):
                 # MTP draft proposal.  On the cloud side,
                 # execute_model_state is None (cloud is not the last PP
                 # rank), so the metadata would otherwise be lost.
+                num_reqs = self.input_batch.num_reqs
                 if (
                     self._edge_cloud_enabled
                     and self.edge_cloud_cfg.role == "cloud"

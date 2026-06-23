@@ -3340,6 +3340,7 @@ class NPUModelRunner(GPUModelRunner):
             "cudagraph_stats": cudagraph_stats,
         }
 
+    @torch.inference_mode()
     def cloud_prepare_early(self, scheduler_output: "SchedulerOutput") -> None:
         """Pre-compute input preparation on cloud while edge runs segment_a.
 
@@ -3347,6 +3348,12 @@ class NPUModelRunner(GPUModelRunner):
         arrives, execute_model can skip _update_states, _prepare_inputs,
         _determine_batch_execution_and_padding, and _build_attention_metadata,
         going directly to _preprocess (sync_and_gather) + _model_forward.
+
+        This mirrors execute_model() and must run under torch.inference_mode()
+        so that attention metadata builders can perform in-place updates on
+        their cached CPU/NPU buffers (e.g. causal_conv1d host pinned buffers).
+        Without it, edge-cloud cloud_prepare_early may run outside inference
+        mode and hit "Inplace update to inference tensor outside InferenceMode".
         """
         assert self._edge_cloud_enabled, (
             "cloud_prepare_early should only be called in edge-cloud mode"

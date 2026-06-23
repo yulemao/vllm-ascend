@@ -887,16 +887,19 @@ class NPUModelRunner(GPUModelRunner):
         self._edge_cloud_mtp_segments = {}
 
         if self.edge_cloud_cfg.role == "edge":
-            self._edge_cloud_mtp_segments["a"] = self._create_segment_callable(
+            seg_a = self._create_segment_callable(
                 mtp_model, 0, 0, is_first_segment=True, is_last_segment=False
             )
-            self._edge_cloud_mtp_segments["e"] = self._create_segment_callable(
+            seg_e = self._create_segment_callable(
                 mtp_model, 0, 0, is_first_segment=False, is_last_segment=True
             )
+            self._edge_cloud_mtp_segments["a"] = self._wrap_segment_if_needed(seg_a)
+            self._edge_cloud_mtp_segments["e"] = self._wrap_segment_if_needed(seg_e)
         else:
-            self._edge_cloud_mtp_segments["c"] = self._create_segment_callable(
+            seg_c = self._create_segment_callable(
                 mtp_model, 0, 0, is_first_segment=False, is_last_segment=False
             )
+            self._edge_cloud_mtp_segments["c"] = self._wrap_segment_if_needed(seg_c)
 
     def _sync_metadata_across_dp(
         self,
@@ -2964,10 +2967,31 @@ class NPUModelRunner(GPUModelRunner):
             # Run cloud segment (all MTP decoder layers are on cloud)
             segment = self._edge_cloud_mtp_segments["c"]
             num_tokens = positions.shape[-1] if positions is not None else 0
+
+            # Determine cudagraph runtime mode for the MTP cloud segment so
+            # that ACLGraphWrapper can replay a captured graph during decode.
+            cudagraph_runtime_mode = CUDAGraphMode.NONE
+            batch_descriptor = BatchDescriptor(num_tokens)
+            if (
+                self.edge_cloud_cfg.enable_decode_graph
+                and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+                and num_tokens > 0
+            ):
+                cudagraph_runtime_mode, batch_descriptor = (
+                    self.cudagraph_dispatcher.dispatch(
+                        num_tokens=num_tokens,
+                        uniform_decode=True,
+                        has_lora=False,
+                    )
+                )
+
             with set_ascend_forward_context(
                 attn_metadata=draft_attn_metadata,
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
+                num_actual_tokens=num_tokens,
+                batch_descriptor=batch_descriptor,
+                aclgraph_runtime_mode=cudagraph_runtime_mode,
                 is_draft_model=True,
             ):
                 output = segment(**model_kwargs)
@@ -5502,6 +5526,17 @@ class NPUModelRunner(GPUModelRunner):
                         if self.speculative_config:
                             wrapper.init_draft_graph_params(self.cudagraph_batch_sizes)
 
+                # Also initialize graph params for edge-cloud MTP drafter segments.
+                if (
+                    self.speculative_config
+                    and self.speculative_config.method == "mtp"
+                    and hasattr(self, "_edge_cloud_mtp_segments")
+                ):
+                    for wrapper in self._edge_cloud_mtp_segments.values():
+                        if isinstance(wrapper, ACLGraphWrapper):
+                            wrapper.init_graph_params(self.cudagraph_batch_sizes)
+                            wrapper.init_draft_graph_params(self.cudagraph_batch_sizes)
+
     def _get_aclgraph_wrappers(self) -> list[ACLGraphWrapper]:
         """返回所有可能残留 profile 阶段图捕获结果的 ACLGraphWrapper。"""
         wrappers: list[ACLGraphWrapper] = []
@@ -5511,6 +5546,12 @@ class NPUModelRunner(GPUModelRunner):
             wrapper = getattr(self, attr, None)
             if isinstance(wrapper, ACLGraphWrapper):
                 wrappers.append(wrapper)
+        # Include edge-cloud MTP drafter segment wrappers so that
+        # capture_model() can clear any stale entries from them.
+        if hasattr(self, "_edge_cloud_mtp_segments"):
+            for wrapper in self._edge_cloud_mtp_segments.values():
+                if isinstance(wrapper, ACLGraphWrapper):
+                    wrappers.append(wrapper)
         return wrappers
 
     def capture_model(self) -> int:

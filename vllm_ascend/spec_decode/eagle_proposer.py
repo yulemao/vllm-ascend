@@ -340,7 +340,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight):
                     layer_module.shared_head.head = model.lm_head
 
-        if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
+        # Edge-cloud MTP splits the draft model into segments that are wrapped
+        # individually by the model runner. Wrapping the whole _run_merged_draft
+        # here would try to capture cross-process communication inside the graph,
+        # which is not supported, so skip it for that case.
+        is_edge_cloud_mtp = (
+            self.method == "mtp"
+            and self.runner is not None
+            and getattr(self.runner, "_edge_cloud_enabled", False)
+        )
+        if (
+            self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            and self.use_cuda_graph
+            and not is_edge_cloud_mtp
+        ):
             self.update_stream = torch.npu.Stream()
             self._runnable = ACLGraphWrapper(
                 self._run_merged_draft,

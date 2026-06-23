@@ -1963,10 +1963,32 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     positions, spec_step_idx
                 )
 
+            # Preserve the outer forward context's cudagraph mode/batch
+            # descriptor so that the cloud MTP segment can be captured/replayed
+            # together with the edge segments during warmup.  Reverting to NONE
+            # here would leave the cloud segment uncaptured and force a runtime
+            # capture, which can deadlock after graph capturing is disabled.
+            forward_context = get_forward_context()
+            if forward_context is not None:
+                cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
+                if hasattr(cudagraph_runtime_mode, "decode_mode"):
+                    cudagraph_runtime_mode = cudagraph_runtime_mode.decode_mode()
+                batch_descriptor = forward_context.batch_descriptor
+                num_actual_tokens = getattr(
+                    forward_context, "num_actual_tokens", num_tokens
+                )
+            else:
+                cudagraph_runtime_mode = CUDAGraphMode.NONE
+                batch_descriptor = BatchDescriptor(num_tokens)
+                num_actual_tokens = num_tokens
+
             with set_ascend_forward_context(
                 attn_metadata=draft_attn_metadata,
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
+                num_actual_tokens=num_actual_tokens,
+                batch_descriptor=batch_descriptor,
+                aclgraph_runtime_mode=cudagraph_runtime_mode,
                 is_draft_model=True,
             ):
                 output = segments["c"](**model_kwargs)

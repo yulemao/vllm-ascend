@@ -4631,6 +4631,12 @@ class NPUModelRunner(GPUModelRunner):
             self.need_accepted_tokens = False
             self.may_reinitialize_input_batch(kv_cache_config)
             self.kv_cache = {}
+            # Still initialize cudagraph dispatcher keys and ACL graph params,
+            # otherwise edge segments (and edge-cloud MTP segments) have no
+            # graph params and ACL graph capture/replay can hang.
+            self._check_and_update_cudagraph_mode(
+                [], kv_cache_config.kv_cache_groups
+            )
             logger.info(
                 "[EdgeCloud] embedding_only edge skipped KV cache tensor "
                 "allocation and attention backend initialization."

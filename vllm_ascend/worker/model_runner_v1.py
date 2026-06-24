@@ -899,6 +899,30 @@ class NPUModelRunner(GPUModelRunner):
             )
             self._edge_cloud_mtp_segments["c"] = self._wrap_segment_if_needed(seg_c)
 
+        # Allocate persistent intermediate buffers for MTP edge-cloud graphs.
+        # ACLGraphWrapper records input tensor addresses at capture time and
+        # replays against those addresses. edge_cloud_broadcast_recv() allocates
+        # new tensors every iteration, so we must copy received tensors into
+        # stable buffers before passing them to graph-wrapped segments.
+        predictor = LayerShardLoader._get_mtp_model(mtp_model)
+        if predictor is not None and hasattr(predictor, "make_empty_intermediate_tensors"):
+            max_actual_tokens = self.max_num_tokens
+            if enable_sp():
+                tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+                max_actual_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
+            self._edge_cloud_mtp_intermediate_tensors = (
+                predictor.make_empty_intermediate_tensors(
+                    batch_size=max_actual_tokens,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+            )
+            logger.info(
+                "[EdgeCloud] Allocated MTP intermediate buffers "
+                "hidden_states shape=%s",
+                list(self._edge_cloud_mtp_intermediate_tensors["hidden_states"].shape),
+            )
+
     def _sync_metadata_across_dp(
         self,
         num_tokens: int,
@@ -2888,13 +2912,22 @@ class NPUModelRunner(GPUModelRunner):
 
             # Build kwargs for cloud segment
             positions = intermediate.tensors.get("positions", None)
+            spec_step_idx = 0
+            if "spec_step_idx" in tensor_dict:
+                spec_step_idx = tensor_dict["spec_step_idx"].item()
+
+            # Copy received intermediate tensors into persistent buffers so that
+            # ACL graph replay sees stable input addresses.
+            num_tokens = positions.shape[-1] if positions is not None else 0
+            intermediate = self.sync_mtp_edge_cloud_intermediate_tensors(
+                num_tokens, intermediate
+            )
+
             model_kwargs = {
                 "intermediate_tensors": intermediate,
                 "positions": positions,
             }
-            spec_step_idx = 0
             if "spec_step_idx" in tensor_dict:
-                spec_step_idx = tensor_dict["spec_step_idx"].item()
                 model_kwargs["spec_step_idx"] = spec_step_idx
 
             # Build attention metadata for the MTP decoder layers.
@@ -2906,7 +2939,6 @@ class NPUModelRunner(GPUModelRunner):
 
             # Run cloud segment (all MTP decoder layers are on cloud)
             segment = self._edge_cloud_mtp_segments["c"]
-            num_tokens = positions.shape[-1] if positions is not None else 0
 
             # Determine cudagraph runtime mode for the MTP cloud segment so
             # that ACLGraphWrapper can replay a captured graph during decode.
@@ -3668,6 +3700,40 @@ class NPUModelRunner(GPUModelRunner):
         # (flashcomm1 does not scatter residual before PP send).
         return self.sync_and_slice_intermediate_tensors(
             num_tokens, intermediate_tensors, sync_self
+        )
+
+    def sync_mtp_edge_cloud_intermediate_tensors(
+        self,
+        num_tokens: int,
+        intermediate_tensors: IntermediateTensors,
+    ) -> IntermediateTensors:
+        """Copy freshly-received MTP intermediate tensors into stable buffers.
+
+        ACLGraphWrapper records input addresses at graph capture time and
+        replays against those addresses. edge_cloud_broadcast_recv() allocates
+        new tensors every call, so we mirror the main model's
+        sync_and_slice_intermediate_tensors behavior: copy into persistent
+        buffers once and then pass the buffers to the graph-wrapped segment.
+        """
+        assert self._edge_cloud_mtp_intermediate_tensors is not None
+        tp = self.vllm_config.parallel_config.tensor_parallel_size
+        copy_len = (num_tokens + tp - 1) // tp if enable_sp() else num_tokens
+
+        for k, v in intermediate_tensors.items():
+            if k not in self._edge_cloud_mtp_intermediate_tensors:
+                continue
+            dst = self._edge_cloud_mtp_intermediate_tensors[k][:copy_len]
+            recv_len = min(v.shape[0], copy_len)
+            if recv_len:
+                dst[:recv_len].copy_(v[:recv_len], non_blocking=True)
+            if recv_len < copy_len:
+                dst[recv_len:].zero_()
+
+        return IntermediateTensors(
+            {
+                k: v[:copy_len]
+                for k, v in self._edge_cloud_mtp_intermediate_tensors.items()
+            }
         )
 
     def _determine_batch_execution_and_padding(

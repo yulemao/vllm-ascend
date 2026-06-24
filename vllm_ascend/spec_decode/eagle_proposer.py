@@ -1925,6 +1925,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 postprocess()
             intermediate = IntermediateTensors(tensor_dict)
 
+            # Copy received tensors into persistent buffers so that the
+            # ACLGraphWrapper-wrapped segment_e sees stable input addresses.
+            positions = model_kwargs.get("positions")
+            num_tokens = positions.shape[-1] if positions is not None else 0
+            intermediate = (
+                self.runner._sync_edge_cloud_mtp_intermediate_tensors(
+                    num_tokens, intermediate
+                )
+            )
+
             # Edge last segment: norm
             model_kwargs["intermediate_tensors"] = intermediate
             for key in ("input_ids", "inputs_embeds", "hidden_states", "spec_step_idx"):
@@ -1942,6 +1952,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 postprocess()
             intermediate = IntermediateTensors(tensor_dict)
 
+            # Copy received tensors into persistent buffers so that the
+            # ACLGraphWrapper-wrapped segment_c sees stable input addresses.
+            positions = tensor_dict.get("positions")
+            num_tokens = positions.shape[-1] if positions is not None else 0
+            intermediate = (
+                self.runner._sync_edge_cloud_mtp_intermediate_tensors(
+                    num_tokens, intermediate
+                )
+            )
+
             model_kwargs["intermediate_tensors"] = intermediate
             for key in ("input_ids", "inputs_embeds", "hidden_states"):
                 model_kwargs.pop(key, None)
@@ -1949,8 +1969,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if "spec_step_idx" in tensor_dict:
                 spec_step_idx = tensor_dict["spec_step_idx"].item()
                 model_kwargs["spec_step_idx"] = spec_step_idx
-            if "positions" in tensor_dict:
-                model_kwargs["positions"] = tensor_dict["positions"]
+            if positions is not None:
+                model_kwargs["positions"] = positions
             positions = model_kwargs.get("positions", None)
             num_tokens = positions.shape[-1] if positions is not None else 0
 

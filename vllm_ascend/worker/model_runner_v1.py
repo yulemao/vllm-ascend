@@ -884,6 +884,29 @@ class NPUModelRunner(GPUModelRunner):
             delattr(self, "_edge_cloud_mtp_segments")
         self._edge_cloud_mtp_segments = {}
 
+        # Pre-allocate persistent intermediate buffers for MTP edge-cloud
+        # segments. ACLGraphWrapper requires stable input tensor addresses
+        # across graph replay, but edge_cloud_broadcast_recv() allocates fresh
+        # tensors every iteration. Copying received tensors into these buffers
+        # before calling graph-wrapped segments avoids stale-address crashes
+        # such as ACL error 507011.
+        if hasattr(self, "_edge_cloud_mtp_intermediate_buffers"):
+            delattr(self, "_edge_cloud_mtp_intermediate_buffers")
+        if hasattr(predictor, "make_empty_intermediate_tensors"):
+            max_mtp_tokens = self.max_num_tokens
+            if enable_sp():
+                tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+                max_mtp_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
+            self._edge_cloud_mtp_intermediate_buffers = (
+                predictor.make_empty_intermediate_tensors(
+                    batch_size=max_mtp_tokens,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+            )
+        else:
+            self._edge_cloud_mtp_intermediate_buffers = None
+
         if self.edge_cloud_cfg.role == "edge":
             seg_a = self._create_segment_callable(
                 mtp_model, 0, 0, is_first_segment=True, is_last_segment=False
@@ -898,6 +921,42 @@ class NPUModelRunner(GPUModelRunner):
                 mtp_model, 0, 0, is_first_segment=False, is_last_segment=False
             )
             self._edge_cloud_mtp_segments["c"] = self._wrap_segment_if_needed(seg_c)
+
+    def _sync_edge_cloud_mtp_intermediate_tensors(
+        self,
+        num_tokens: int,
+        intermediate_tensors: IntermediateTensors,
+    ) -> IntermediateTensors:
+        """Copy received MTP intermediate tensors into persistent buffers.
+
+        ACLGraphWrapper captures and replays graphs against fixed input
+        addresses. edge_cloud_broadcast_recv() returns freshly-allocated
+        tensors each iteration, so we copy them into pre-allocated buffers
+        (sized to max_num_tokens) and return sliced views with stable
+        addresses for the current num_tokens.
+        """
+        buffers = self._edge_cloud_mtp_intermediate_buffers
+        if buffers is None:
+            return intermediate_tensors
+
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        copy_len = (num_tokens + tp_size - 1) // tp_size if enable_sp() else num_tokens
+
+        synced: dict[str, torch.Tensor | Any] = {}
+        for key, value in intermediate_tensors.items():
+            if key not in buffers or not isinstance(value, torch.Tensor):
+                # positions/spec_step_idx or any non-tensor metadata pass through
+                synced[key] = value
+                continue
+            dst = buffers[key][:copy_len]
+            recv_len = min(value.shape[0], copy_len)
+            if recv_len:
+                dst[:recv_len].copy_(value[:recv_len], non_blocking=True)
+            if recv_len < copy_len:
+                dst[recv_len:].zero_()
+            synced[key] = dst
+
+        return IntermediateTensors(synced)
 
     def _sync_metadata_across_dp(
         self,
@@ -2894,6 +2953,14 @@ class NPUModelRunner(GPUModelRunner):
 
             # Build kwargs for cloud segment
             positions = intermediate.tensors.get("positions", None)
+            num_tokens = positions.shape[-1] if positions is not None else 0
+
+            # Copy received tensors into persistent buffers so that the
+            # ACLGraphWrapper-wrapped segment_c sees stable input addresses.
+            intermediate = self._sync_edge_cloud_mtp_intermediate_tensors(
+                num_tokens, intermediate
+            )
+
             model_kwargs = {
                 "intermediate_tensors": intermediate,
                 "positions": positions,

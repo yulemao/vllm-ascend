@@ -1093,6 +1093,19 @@ class NPUModelRunner(GPUModelRunner):
             num_scheduled_tokens, self.query_pos.np
         )
         positions_np = self._positions_np_buf[:total_num_scheduled_tokens]
+
+        # Debug: check num_computed_tokens_cpu before computing positions
+        _nct = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        _nct_max = np.max(_nct)
+        if _nct_max > self.input_batch.token_ids_cpu.shape[1]:
+            logger.error(
+                f"[DEBUG positions_np] num_computed_tokens_cpu[:{num_reqs}] "
+                f"has max={_nct_max}, values={_nct[:num_reqs]}. "
+                f"num_scheduled_tokens={num_scheduled_tokens[:num_reqs]}. "
+                f"total_num_scheduled_tokens={total_num_scheduled_tokens}. "
+                f"req_ids={self.input_batch.req_ids[:num_reqs]}"
+            )
+
         np.add(
             self.input_batch.num_computed_tokens_cpu[req_indices],
             self.query_pos.np[: cu_num_tokens[-1]],
@@ -1162,6 +1175,21 @@ class NPUModelRunner(GPUModelRunner):
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
         # where M is the max_model_len.
         token_indices = positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
+
+        # Debug: check token_indices before index_select
+        _ti_max = np.max(token_indices)
+        _flatten_len = self.input_batch.token_ids_cpu_tensor.flatten().shape[0]
+        if _ti_max >= _flatten_len:
+            _bad_idx = np.argmax(token_indices)
+            logger.error(
+                f"[DEBUG token_indices] max token_index={_ti_max} >= "
+                f"flatten_len={_flatten_len}. "
+                f"positions_np max={np.max(positions_np)}, "
+                f"positions_np[{_bad_idx}]={positions_np[_bad_idx]}, "
+                f"req_indices[{_bad_idx}]={req_indices[_bad_idx]}, "
+                f"max_model_len={self.input_batch.token_ids_cpu.shape[1]}."
+            )
+
         token_indices_tensor = torch.from_numpy(token_indices)
         # Prepare input_ids.
         # NOTE(woosuk): We use torch.index_select instead of np.take here

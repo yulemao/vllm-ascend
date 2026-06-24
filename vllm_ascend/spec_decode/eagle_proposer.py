@@ -1926,12 +1926,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             intermediate = IntermediateTensors(tensor_dict)
 
             # Edge last segment: norm
-            # Copy cloud-side decoder outputs into persistent buffers so that
-            # the ACL graph-wrapped segment_e replays against stable addresses.
-            num_tokens = model_kwargs["positions"].shape[-1]
-            intermediate = self.runner.sync_mtp_edge_cloud_intermediate_tensors(
-                num_tokens, intermediate
-            )
             model_kwargs["intermediate_tensors"] = intermediate
             for key in ("input_ids", "inputs_embeds", "hidden_states", "spec_step_idx"):
                 model_kwargs.pop(key, None)

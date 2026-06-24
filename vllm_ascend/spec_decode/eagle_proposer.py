@@ -1934,6 +1934,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     num_tokens, intermediate
                 )
             )
+            # Ensure the non-blocking copy into persistent buffers completes
+            # before ACL graph capture/replay starts.
+            torch.npu.current_stream().synchronize()
 
             # Edge last segment: norm
             model_kwargs["intermediate_tensors"] = intermediate
@@ -1961,6 +1964,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     num_tokens, intermediate
                 )
             )
+            # Ensure the non-blocking copy into persistent buffers completes
+            # before ACL graph capture/replay starts.
+            torch.npu.current_stream().synchronize()
 
             model_kwargs["intermediate_tensors"] = intermediate
             for key in ("input_ids", "inputs_embeds", "hidden_states"):

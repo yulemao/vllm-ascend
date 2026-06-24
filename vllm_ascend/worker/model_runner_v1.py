@@ -899,29 +899,14 @@ class NPUModelRunner(GPUModelRunner):
             )
             self._edge_cloud_mtp_segments["c"] = self._wrap_segment_if_needed(seg_c)
 
-        # Allocate persistent intermediate buffers for MTP edge-cloud graphs.
-        # ACLGraphWrapper records input tensor addresses at capture time and
-        # replays against those addresses. edge_cloud_broadcast_recv() allocates
-        # new tensors every iteration, so we must copy received tensors into
-        # stable buffers before passing them to graph-wrapped segments.
+        # Keep a reference to the MTP predictor so that persistent intermediate
+        # buffers can be allocated lazily during warmup (mirrors the main
+        # model's self.intermediate_tensors allocation in _dummy_run). Eager
+        # allocation here during model loading has been observed to hang on NPU.
         predictor = LayerShardLoader._get_mtp_model(mtp_model)
         if predictor is not None and hasattr(predictor, "make_empty_intermediate_tensors"):
-            max_actual_tokens = self.max_num_tokens
-            if enable_sp():
-                tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-                max_actual_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
-            self._edge_cloud_mtp_intermediate_tensors = (
-                predictor.make_empty_intermediate_tensors(
-                    batch_size=max_actual_tokens,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-            )
-            logger.info(
-                "[EdgeCloud] Allocated MTP intermediate buffers "
-                "hidden_states shape=%s",
-                list(self._edge_cloud_mtp_intermediate_tensors["hidden_states"].shape),
-            )
+            self._edge_cloud_mtp_predictor = predictor
+            self._edge_cloud_mtp_intermediate_tensors = None
 
     def _sync_metadata_across_dp(
         self,
@@ -3714,8 +3699,29 @@ class NPUModelRunner(GPUModelRunner):
         new tensors every call, so we mirror the main model's
         sync_and_slice_intermediate_tensors behavior: copy into persistent
         buffers once and then pass the buffers to the graph-wrapped segment.
+
+        The persistent buffers are allocated lazily on first call during
+        warmup, not during model loading, to avoid NPU allocation hangs.
         """
-        assert self._edge_cloud_mtp_intermediate_tensors is not None
+        assert self._edge_cloud_mtp_predictor is not None
+        if self._edge_cloud_mtp_intermediate_tensors is None:
+            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+            max_actual_tokens = self.max_num_tokens
+            if enable_sp():
+                max_actual_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
+            self._edge_cloud_mtp_intermediate_tensors = (
+                self._edge_cloud_mtp_predictor.make_empty_intermediate_tensors(
+                    batch_size=max_actual_tokens,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+            )
+            logger.info(
+                "[EdgeCloud] Allocated MTP intermediate buffers "
+                "hidden_states shape=%s",
+                list(self._edge_cloud_mtp_intermediate_tensors["hidden_states"].shape),
+            )
+
         tp = self.vllm_config.parallel_config.tensor_parallel_size
         copy_len = (num_tokens + tp - 1) // tp if enable_sp() else num_tokens
 

@@ -851,13 +851,13 @@ class NPUModelRunner(GPUModelRunner):
             with get_tp_context(self.drafter):
                 self.drafter.load_model(self.model)
 
-                if (
-                    self.speculative_config
-                    and self.speculative_config.method == "mtp"
-                    and hasattr(self.drafter, "model")
-                    and self.drafter.model is not None
-                ):
-                    self._setup_edge_cloud_mtp(self.drafter.model)
+            if (
+                self.speculative_config
+                and self.speculative_config.method == "mtp"
+                and hasattr(self.drafter, "model")
+                and self.drafter.model is not None
+            ):
+                self._setup_edge_cloud_mtp(self.drafter.model)
 
     def _setup_edge_cloud_mtp(self, mtp_model: nn.Module) -> None:
         predictor = LayerShardLoader._get_mtp_model(mtp_model)
@@ -895,7 +895,7 @@ class NPUModelRunner(GPUModelRunner):
         if hasattr(predictor, "make_empty_intermediate_tensors"):
             max_mtp_tokens = self.max_num_tokens
             if enable_sp():
-                tp_size = get_tensor_model_parallel_world_size()
+                tp_size = self.vllm_config.parallel_config.tensor_parallel_size
                 max_mtp_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
             self._edge_cloud_mtp_intermediate_buffers = (
                 predictor.make_empty_intermediate_tensors(
@@ -939,7 +939,7 @@ class NPUModelRunner(GPUModelRunner):
         if buffers is None:
             return intermediate_tensors
 
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         copy_len = (num_tokens + tp_size - 1) // tp_size if enable_sp() else num_tokens
 
         synced: dict[str, torch.Tensor | Any] = {}
@@ -2960,9 +2960,6 @@ class NPUModelRunner(GPUModelRunner):
             intermediate = self._sync_edge_cloud_mtp_intermediate_tensors(
                 num_tokens, intermediate
             )
-            # Ensure the non-blocking copy into persistent buffers completes
-            # before ACL graph capture/replay starts.
-            torch.npu.current_stream().synchronize()
 
             model_kwargs = {
                 "intermediate_tensors": intermediate,

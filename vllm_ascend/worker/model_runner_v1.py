@@ -2377,6 +2377,16 @@ class NPUModelRunner(GPUModelRunner):
                     # batch size (no cudagraph padding on edge), but cloud's
                     # pre-allocated buffer is sized to max_num_tokens. Pad here
                     # so that cloud's sync_and_slice copy_ succeeds.
+                    # Apply deferred state corrections before returning early
+                    # in edge-cloud mode. Without this, the deferred corrections
+                    # from _update_states (which correct num_computed_tokens_cpu
+                    # for rejected draft tokens) are lost, causing positions_np
+                    # to accumulate stale optimistic values and eventually exceed
+                    # max_model_len, triggering torch.index_select index OOB.
+                    if deferred_state_corrections_fn:
+                        deferred_state_corrections_fn()
+                        deferred_state_corrections_fn = None
+
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     self._finalize_dump_data()
@@ -2385,6 +2395,11 @@ class NPUModelRunner(GPUModelRunner):
                 if not get_pp_group().is_last_rank:
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
+                    # Apply deferred state corrections before returning early
+                    # in PP intermediate-tensor path (same reasoning as above).
+                    if deferred_state_corrections_fn:
+                        deferred_state_corrections_fn()
+                        deferred_state_corrections_fn = None
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     self._finalize_dump_data()

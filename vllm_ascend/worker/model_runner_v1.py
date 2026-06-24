@@ -320,6 +320,22 @@ class NPUModelRunner(GPUModelRunner):
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
 
+        # valid_sampled_token_count_cpu 在基类(GPUModelRunner)中是用 torch.empty
+        # 分配的——整段都是未初始化内存。它会由 _get_valid_sampled_token_count
+        # 读取（供 async spec decode 的延迟修正 correct_spec_decode_token_counts
+        # 使用），而 _copy_valid_sampled_token_count 每次只写入 [:num_reqs] 一段。
+        # 边云 embedding_only MTP + async scheduling 下，一旦因异步时序读到尚未写入
+        # 或越界的槽位，就会拿到未初始化脏值（实测可达 ~1.6e7），使
+        #   correction = optimistic_num_accepted - (garbage - 1)
+        # 变成极大负数，把 num_computed_tokens_cpu / req_state.num_computed_tokens
+        # 顶到 ~1.6e7 并跨迭代持久化，最终 positions_np 超过 max_model_len，触发
+        # torch.index_select index out of range。
+        # 这里把整个 buffer 预初始化为 num_spec_tokens + 1：该值令
+        # num_accepted = num_spec_tokens => correction = 0，即对任何"未被真正写入"
+        # 的槽位零影响，从源头杜绝读到未初始化内存。
+        if getattr(self, "valid_sampled_token_count_cpu", None) is not None:
+            self.valid_sampled_token_count_cpu.fill_(self.num_spec_tokens + 1)
+
         # NOTE: For FULL mode we change +1 to +2 to reserve extra space for padding.
         # See _pad_query_start_loc_for_fia.
         self.query_start_loc = self._make_buffer(
@@ -1759,19 +1775,35 @@ class NPUModelRunner(GPUModelRunner):
         if self.valid_sampled_token_count_event is None:
             return
 
+        # _get_valid_sampled_token_count 读取的范围是
+        # counts_cpu[: next_token_ids.shape[0]]（即 prev_sampled_token_ids 的长度）。
+        # 因此这里必须把"会被读取的整段"都覆盖成有效值，而不能只写
+        # [:valid_sampled_tokens_count.shape[0]]，否则该段之外的槽位会残留未初始化
+        # 或上一批的脏值，被延迟修正读到后会把 num_computed_tokens 顶飞。
+        # 正常情况下 next_token_ids 与 valid_sampled_tokens_count 的 shape[0] 相等；
+        # 若不等（防御），用"全接受"语义(num_spec_tokens+1 => correction=0)补齐。
+        n_read = next_token_ids.shape[0]
+        counts = valid_sampled_tokens_count
+        if counts.shape[0] != n_read:
+            counts = torch.full(
+                (n_read,), self.num_spec_tokens + 1,
+                dtype=counts.dtype, device=counts.device,
+            )
+            m = min(valid_sampled_tokens_count.shape[0], n_read)
+            counts[:m] = valid_sampled_tokens_count[:m]
+
         # Initialize a new stream to overlap the copy operation with
         # prepare_input of draft model.
-        with torch.npu.stream(self.valid_sampled_token_count_copy_stream):  
-            self.valid_sampled_token_count_copy_stream.wait_stream(torch.npu.current_stream())  
-            counts = valid_sampled_tokens_count
+        with torch.npu.stream(self.valid_sampled_token_count_copy_stream):
+            self.valid_sampled_token_count_copy_stream.wait_stream(torch.npu.current_stream())
             counts_cpu = self.valid_sampled_token_count_cpu
             assert counts_cpu is not None
-            counts_cpu[: counts.shape[0]].copy_(counts, non_blocking=True)
+            counts_cpu[:n_read].copy_(counts, non_blocking=True)
             self.valid_sampled_token_count_event.record()
 
         if self.use_async_spec_decode:
             # Stash for GPU-side correction in _prepare_inputs.
-            self.valid_sampled_token_count_gpu = valid_sampled_tokens_count # type: ignore[no-redef]
+            self.valid_sampled_token_count_gpu = counts # type: ignore[no-redef]
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
     # TODO: Once the PCP features are complete, it will fully inherit the classes from the VLLM community.

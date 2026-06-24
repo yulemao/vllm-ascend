@@ -2907,12 +2907,16 @@ class NPUModelRunner(GPUModelRunner):
             if "spec_step_idx" in tensor_dict:
                 spec_step_idx = tensor_dict["spec_step_idx"].item()
 
-            # Copy received intermediate tensors into persistent buffers so that
-            # ACL graph replay sees stable input addresses.
             num_tokens = positions.shape[-1] if positions is not None else 0
-            intermediate = self.sync_mtp_edge_cloud_intermediate_tensors(
-                num_tokens, intermediate
-            )
+
+            # Copy received intermediate tensors into persistent buffers so that
+            # ACL graph replay sees stable input addresses. Only needed when the
+            # cloud MTP segment is actually wrapped by ACLGraphWrapper.
+            segment = self._edge_cloud_mtp_segments["c"]
+            if isinstance(segment, ACLGraphWrapper):
+                intermediate = self.sync_mtp_edge_cloud_intermediate_tensors(
+                    num_tokens, intermediate
+                )
 
             model_kwargs = {
                 "intermediate_tensors": intermediate,
@@ -2929,7 +2933,6 @@ class NPUModelRunner(GPUModelRunner):
             )
 
             # Run cloud segment (all MTP decoder layers are on cloud)
-            segment = self._edge_cloud_mtp_segments["c"]
 
             # Determine cudagraph runtime mode for the MTP cloud segment so
             # that ACLGraphWrapper can replay a captured graph during decode.

@@ -944,14 +944,17 @@ class NPUModelRunner(GPUModelRunner):
 
         synced: dict[str, torch.Tensor | Any] = {}
         for key, value in intermediate_tensors.items():
-            if key not in buffers or not isinstance(value, torch.Tensor):
+            if key not in buffers.tensors or not isinstance(value, torch.Tensor):
                 # positions/spec_step_idx or any non-tensor metadata pass through
                 synced[key] = value
                 continue
             dst = buffers[key][:copy_len]
             recv_len = min(value.shape[0], copy_len)
             if recv_len:
-                dst[:recv_len].copy_(value[:recv_len], non_blocking=True)
+                # Use synchronous copy on the NPU to avoid async hangs that
+                # have been observed on the cloud side when non_blocking=True
+                # is combined with ACL graph replay.
+                dst[:recv_len].copy_(value[:recv_len])
             if recv_len < copy_len:
                 dst[recv_len:].zero_()
             synced[key] = dst

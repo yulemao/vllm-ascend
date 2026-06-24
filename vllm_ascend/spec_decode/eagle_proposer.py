@@ -1928,16 +1928,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Edge last segment: norm
             # Copy cloud-side decoder outputs into persistent buffers so that
             # the ACL graph-wrapped segment_e replays against stable addresses.
-            segment = segments["e"]
-            if isinstance(segment, ACLGraphWrapper):
-                num_tokens = model_kwargs["positions"].shape[-1]
-                intermediate = self.runner.sync_mtp_edge_cloud_intermediate_tensors(
-                    num_tokens, intermediate
-                )
+            num_tokens = model_kwargs["positions"].shape[-1]
+            intermediate = self.runner.sync_mtp_edge_cloud_intermediate_tensors(
+                num_tokens, intermediate
+            )
             model_kwargs["intermediate_tensors"] = intermediate
             for key in ("input_ids", "inputs_embeds", "hidden_states", "spec_step_idx"):
                 model_kwargs.pop(key, None)
-            final_output = segment(**model_kwargs)
+            final_output = segments["e"](**model_kwargs)
             return final_output
         else:
             # Cloud path: this should normally not be reached because cloud
@@ -1950,27 +1948,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 postprocess()
             intermediate = IntermediateTensors(tensor_dict)
 
-            positions = tensor_dict.get("positions", None)
-            spec_step_idx = 0
-            if "spec_step_idx" in tensor_dict:
-                spec_step_idx = tensor_dict["spec_step_idx"].item()
-
-            # Copy cloud-side decoder inputs into persistent buffers so that
-            # the ACL graph-wrapped segment_c replays against stable addresses.
-            segment = segments["c"]
-            if isinstance(segment, ACLGraphWrapper):
-                num_tokens = positions.shape[-1] if positions is not None else 0
-                intermediate = self.runner.sync_mtp_edge_cloud_intermediate_tensors(
-                    num_tokens, intermediate
-                )
-
             model_kwargs["intermediate_tensors"] = intermediate
             for key in ("input_ids", "inputs_embeds", "hidden_states"):
                 model_kwargs.pop(key, None)
+            spec_step_idx = 0
             if "spec_step_idx" in tensor_dict:
+                spec_step_idx = tensor_dict["spec_step_idx"].item()
                 model_kwargs["spec_step_idx"] = spec_step_idx
-            if positions is not None:
-                model_kwargs["positions"] = positions
+            if "positions" in tensor_dict:
+                model_kwargs["positions"] = tensor_dict["positions"]
+            positions = model_kwargs.get("positions", None)
             num_tokens = positions.shape[-1] if positions is not None else 0
 
             # Build attention metadata for the MTP decoder layers on
@@ -2014,7 +2001,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
                 is_draft_model=True,
             ):
-                output = segment(**model_kwargs)
+                output = segments["c"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)
 
             if get_pp_group().world_size == 2:

@@ -1088,80 +1088,6 @@ class NPUModelRunner(GPUModelRunner):
         with_prefill = attn_state not in [AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding]
         self.with_prefill = with_prefill
 
-        # Build prev_positions mapping: current pos -> prev pos (-1 if new).
-        # Used for gathering from previous iteration's GPU tensors.
-        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
-        self._compute_prev_positions(num_reqs)
-
-        # Sync num_accepted_tokens from CPU (set by
-        # _update_states_after_model_execute for hybrid models).
-        if self.num_accepted_tokens_event is not None:
-            self.num_accepted_tokens_event.synchronize()
-            # Async mode: condense() reordered indices, use prev_positions mapping
-            if self.use_async_scheduling and prev_req_id_to_index:
-                prev_idx = self.prev_positions.np[:num_reqs]
-                new_mask = prev_idx < 0
-                self.num_accepted_tokens.np[:num_reqs] = (
-                    self.input_batch.num_accepted_tokens_cpu[
-                        np.where(new_mask, 0, prev_idx)
-                    ]
-                )
-                self.num_accepted_tokens.np[:num_reqs][new_mask] = 1
-                self.input_batch.num_accepted_tokens_cpu[:num_reqs] = (
-                    self.num_accepted_tokens.np[:num_reqs]
-                )
-            else:
-                # Non-async mode: use values directly
-                self.num_accepted_tokens.np[:num_reqs] = (
-                    self.input_batch.num_accepted_tokens_cpu[:num_reqs]
-                )
-            self.num_accepted_tokens.np[num_reqs:].fill(1)
-            self.num_accepted_tokens.copy_to_gpu()
-        else:
-            self.num_accepted_tokens.np.fill(1)
-            self.num_accepted_tokens.gpu.fill_(1)
-
-        # Update num_computed_tokens on GPU. In async spec decode,
-        # CPU values are optimistic (all drafts accepted). The kernel
-        # corrects on GPU using the previous step's
-        # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
-        # In edge-cloud embedding_only mode, the tail segment reuses the
-        # num_computed_tokens already corrected by the head segment, so skip
-        # both the kernel and the CPU fallback copy to avoid re-introducing
-        # the scheduler's optimistic value.
-        if not self._is_edge_cloud_embed_only_tail:
-            if (
-                self.use_async_spec_decode
-                and self.valid_sampled_token_count_gpu is not None
-                and prev_req_id_to_index
-            ):
-                self.prev_positions.copy_to_gpu(num_reqs)
-                self.prev_num_draft_tokens.copy_to_gpu()
-                cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
-                    device=self.device, non_blocking=True
-                )
-                update_num_computed_tokens_for_batch_change(
-                    self.num_computed_tokens,
-                    self.num_accepted_tokens.gpu[:num_reqs],
-                    self.prev_positions.gpu[:num_reqs],
-                    self.valid_sampled_token_count_gpu,
-                    self.prev_num_draft_tokens.gpu,
-                    cpu_values,
-                )
-                # Sync the corrected num_computed_tokens back to CPU so that
-                # positions_np and input_ids gathering below use the actual
-                # (not optimistic) token positions.
-                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].copy_(
-                    self.num_computed_tokens[:num_reqs]
-                )
-                # Make sure the CPU mirror is ready before reading it for positions.
-                torch.npu.current_stream().synchronize()
-            else:
-                self.num_computed_tokens[:num_reqs].copy_(
-                    self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
-                    non_blocking=True,
-                )
-
         # Get positions.
         cu_num_tokens = self._get_cumsum_and_arange(
             num_scheduled_tokens, self.query_pos.np
@@ -1356,6 +1282,11 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
 
+        # Build prev_positions mapping: current pos -> prev pos (-1 if new).
+        # Used for gathering from previous iteration's GPU tensors.
+        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+        self._compute_prev_positions(num_reqs)
+
         # Fill unused with -1. Needed for reshape_and_cache in attention_cp
         self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
 
@@ -1401,9 +1332,66 @@ class NPUModelRunner(GPUModelRunner):
         self.discard_request_indices.np[: self.num_discarded_requests] = discard_request_indices
         self.discard_request_indices.copy_to_gpu(self.num_discarded_requests)
 
-        # num_accepted_tokens and num_computed_tokens were already synced/corrected
-        # earlier in this function (before positions_np was computed), so the GPU
-        # state is already consistent here.
+        # Sync num_accepted_tokens from CPU (set by
+        # _update_states_after_model_execute for hybrid models).
+        if self.num_accepted_tokens_event is not None:
+            self.num_accepted_tokens_event.synchronize()
+            # Async mode: condense() reordered indices, use prev_positions mapping
+            if self.use_async_scheduling and prev_req_id_to_index:
+                prev_idx = self.prev_positions.np[:num_reqs]
+                new_mask = prev_idx < 0
+                self.num_accepted_tokens.np[:num_reqs] = (
+                    self.input_batch.num_accepted_tokens_cpu[
+                        np.where(new_mask, 0, prev_idx)
+                    ]
+                )
+                self.num_accepted_tokens.np[:num_reqs][new_mask] = 1
+                self.input_batch.num_accepted_tokens_cpu[:num_reqs] = (
+                    self.num_accepted_tokens.np[:num_reqs]
+                )
+            else:
+                # Non-async mode: use values directly
+                self.num_accepted_tokens.np[:num_reqs] = (
+                    self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+                )
+            self.num_accepted_tokens.np[num_reqs:].fill(1)
+            self.num_accepted_tokens.copy_to_gpu()
+        else:
+            self.num_accepted_tokens.np.fill(1)
+            self.num_accepted_tokens.gpu.fill_(1)
+
+        # Update num_computed_tokens on GPU. In async spec decode,
+        # CPU values are optimistic (all drafts accepted). The kernel
+        # corrects on GPU using the previous step's
+        # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
+        # In edge-cloud embedding_only mode, the tail segment reuses the
+        # num_computed_tokens already corrected by the head segment, so skip
+        # both the kernel and the CPU fallback copy to avoid re-introducing
+        # the scheduler's optimistic value.
+        if not self._is_edge_cloud_embed_only_tail:
+            if (
+                self.use_async_spec_decode
+                and self.valid_sampled_token_count_gpu is not None
+                and prev_req_id_to_index
+            ):
+                self.prev_positions.copy_to_gpu(num_reqs)
+                self.prev_num_draft_tokens.copy_to_gpu()
+                cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
+                    device=self.device, non_blocking=True
+                )
+                update_num_computed_tokens_for_batch_change(
+                    self.num_computed_tokens,
+                    self.num_accepted_tokens.gpu[:num_reqs],
+                    self.prev_positions.gpu[:num_reqs],
+                    self.valid_sampled_token_count_gpu,
+                    self.prev_num_draft_tokens.gpu,
+                    cpu_values,
+                )
+            else:
+                self.num_computed_tokens[:num_reqs].copy_(
+                    self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+                    non_blocking=True,
+                )
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
         self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
@@ -1446,7 +1434,7 @@ class NPUModelRunner(GPUModelRunner):
             self._needs_seq_lens_cpu_sync
             and self.use_async_spec_decode
             and self.valid_sampled_token_count_gpu is not None
-            and self.input_batch.prev_req_id_to_index
+            and prev_req_id_to_index
         ):
             self.optimistic_seq_lens_cpu[:num_reqs].copy_(
                 self.seq_lens[:num_reqs], non_blocking=True

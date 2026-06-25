@@ -685,6 +685,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     common_attn_metadata.num_computed_tokens_cpu, num_reqs_padded
                 )
 
+            # ----- [ACLGRAPH-DBG] checkpoint B4: graph 块内, 所有 _adjust_tensor 之后.
+            # B3 通过但 B4 失败 -> _adjust_tensor (block_table/seq_lens) 越界. -----
+            print(f"[ACLGRAPH-DBG] B4: _adjust_tensor 之后 num_reqs_padded={num_reqs_padded} slicing_length={slicing_length}", flush=True)
+            torch.npu.synchronize()
+            print("[ACLGRAPH-DBG] B4: sync OK", flush=True)
+            # ----- [ACLGRAPH-DBG] end checkpoint B4 -----
+
             if self.pcp_size > 1:
                 pcp_allgather_restore_idx = (
                     common_attn_metadata.prefill_context_parallel_metadata.pcp_allgather_restore_idx
@@ -875,6 +882,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         token_indices_to_sample_len = token_indices_to_sample.shape[0]
         self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
+
+        # ----- [ACLGRAPH-DBG] checkpoint B5: set_ascend_forward_context 之前 (含 inputs_embeds / slot_mapping / token_indices copy).
+        # B4 通过但 B5 失败 -> inputs_embeds embed 或 slot_mapping 或 token_indices copy 越界. -----
+        print(f"[ACLGRAPH-DBG] B5: forward_context 之前 supports_mm_inputs={self.supports_mm_inputs} inputs_embeds_is_None={inputs_embeds is None}", flush=True)
+        torch.npu.synchronize()
+        print("[ACLGRAPH-DBG] B5: sync OK", flush=True)
+        # ----- [ACLGRAPH-DBG] end checkpoint B5 -----
 
         with set_ascend_forward_context(
             multi_steps_attn_metadata[0] if multi_steps_attn_metadata else None,

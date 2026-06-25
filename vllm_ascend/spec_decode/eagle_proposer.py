@@ -595,6 +595,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_prefill_reqs=num_prefill_reqs,
             num_decode_reqs=num_decode_reqs,
         )
+        # ----- [ACLGRAPH-DBG] checkpoint B1: set_inputs_first_pass 之后.
+        # 若 B 通过但 B1 失败 -> set_inputs_first_pass 里的 device op 出错. -----
+        print("[ACLGRAPH-DBG] B1: set_inputs_first_pass 之后", flush=True)
+        torch.npu.synchronize()
+        print("[ACLGRAPH-DBG] B1: sync OK", flush=True)
+        # ----- [ACLGRAPH-DBG] end checkpoint B1 -----
         if self.pcp_size * self.dcp_size > 1:
             assert long_seq_args is not None
             query_lens_d, ori_token_indices_to_sample = long_seq_args
@@ -632,6 +638,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # is run in eager mode currently, which means `_pad_query_start_loc_for_fia` is not called,
             # while draft model is run in graph model, which means we should pad the `query_start_loc`.
             # Need to be fixed in the future.
+            # ----- [ACLGRAPH-DBG] checkpoint B2: _pad_query_start_loc_for_fia 之前 -----
+            print(f"[ACLGRAPH-DBG] B2: FIA padding 之前 num_tokens={num_tokens} num_input_tokens={num_input_tokens} num_reqs={common_attn_metadata.num_reqs} bd_num_reqs={batch_descriptor.num_reqs}", flush=True)
+            torch.npu.synchronize()
+            print("[ACLGRAPH-DBG] B2: sync OK", flush=True)
+            # ----- [ACLGRAPH-DBG] end checkpoint B2 -----
             num_reqs_padded = self.runner._pad_query_start_loc_for_fia(
                 num_input_tokens,
                 batch_descriptor.num_reqs if batch_descriptor.num_reqs is not None else common_attn_metadata.num_reqs,
@@ -639,6 +650,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 aclgraph_runtime_mode,
                 batch_descriptor.num_reqs,
             )
+            # ----- [ACLGRAPH-DBG] checkpoint B3: _pad_query_start_loc_for_fia 之后.
+            # 若 B2 通过但 B3 失败 -> _pad_query_start_loc_for_fia 写 query_start_loc 越界. -----
+            print(f"[ACLGRAPH-DBG] B3: FIA padding 之后 num_reqs_padded={num_reqs_padded}", flush=True)
+            torch.npu.synchronize()
+            print("[ACLGRAPH-DBG] B3: sync OK", flush=True)
+            # ----- [ACLGRAPH-DBG] end checkpoint B3 -----
             common_attn_metadata.num_reqs = num_reqs_padded
             common_attn_metadata.query_start_loc = self.runner.query_start_loc.gpu[: num_reqs_padded + 1]
             common_attn_metadata.query_start_loc_cpu = self.runner.query_start_loc.cpu[: num_reqs_padded + 1]

@@ -912,22 +912,31 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         )
 
         # Edge-cloud MTP does not wrap the whole _run_merged_draft in ACLGraph;
-        # only individual segments are captured.  The padding tail of the
-        # drafter's buffers is therefore prepared outside the graph and may
-        # contain stale values, including ``-1`` placeholders from rejected
-        # speculative tokens.  Passing ``-1`` to ``embed_input_ids`` triggers an
-        # NPU vector-core MTE out-of-range error (error code 507035).  Sanitize
-        # the padded region before building ``model_kwargs`` so the edge segment
-        # only sees valid inputs.  Non-edge-cloud MTP freezes the padding tail
-        # at capture-time values, so it does not need this.
-        if is_edge_cloud_mtp and num_input_tokens > num_tokens:
+        # only individual segments are captured.  The drafter's input buffer is
+        # therefore prepared outside the graph and may contain ``-1``
+        # placeholders from rejected speculative tokens, both in the actual
+        # token range and in the cudagraph padding tail.  Passing ``-1`` to
+        # ``embed_input_ids`` triggers an NPU vector-core MTE out-of-range error
+        # (error code 507035).  Sanitize the buffer before building
+        # ``model_kwargs`` so the edge segment only sees valid inputs.
+        # Non-edge-cloud MTP freezes the inputs at capture-time values, so it
+        # does not need this.
+        if is_edge_cloud_mtp:
             if inputs_embeds is None:
-                self.input_ids[num_tokens:num_input_tokens].fill_(0)
+                # Replace -1 placeholders anywhere in the padded range.
+                self.input_ids[:num_input_tokens].masked_fill_(
+                    self.input_ids[:num_input_tokens] == -1, 0
+                )
+                # Zero the padding tail in case it holds stale out-of-range
+                # values other than -1.
+                if num_input_tokens > num_tokens:
+                    self.input_ids[num_tokens:num_input_tokens].fill_(0)
             else:
                 # inputs_embeds is a view of self.inputs_embeds; zero the
                 # padded tail so the model does not consume garbage embeddings.
-                self.inputs_embeds[num_tokens:num_input_tokens].fill_(0.0)
-            if self.pass_hidden_states_to_model:
+                if num_input_tokens > num_tokens:
+                    self.inputs_embeds[num_tokens:num_input_tokens].fill_(0.0)
+            if self.pass_hidden_states_to_model and num_input_tokens > num_tokens:
                 self.hidden_states[num_tokens:num_input_tokens].fill_(0.0)
 
         if self.method == "dflash":

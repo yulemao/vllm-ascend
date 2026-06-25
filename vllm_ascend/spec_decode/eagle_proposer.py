@@ -1584,7 +1584,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         valid_mask = (valid_sampled_token_ids_gpu != -1) & (valid_sampled_token_ids_gpu < gpu_input_batch.vocab_size)
 
         # Count the number of valid tokens in each request
-        valid_sampled_tokens_count = valid_mask.sum(dim=1)
+        valid_sampled_tokens_count = valid_mask.sum(dim=1).to(torch.int32)
 
         # Get the rightmost valid index per row
         last_valid_indices = valid_sampled_tokens_count - 1

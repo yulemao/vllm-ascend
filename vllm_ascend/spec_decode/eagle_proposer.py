@@ -575,6 +575,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             target_hidden_states = self.model.combine_hidden_states(target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
 
+        # ----- [ACLGRAPH-DBG] checkpoint B: draft _propose 入口, set_inputs_first_pass 之前.
+        # 若 A 通过但 B 失败 -> 错误在 target 与 draft 之间的采样 op. -----
+        print("[ACLGRAPH-DBG] B: _propose 入口 (set_inputs_first_pass 之前)", flush=True)
+        torch.npu.synchronize()
+        print("[ACLGRAPH-DBG] B: sync OK", flush=True)
+        # ----- [ACLGRAPH-DBG] end checkpoint B -----
+
         num_tokens, token_indices_to_sample, common_attn_metadata, long_seq_args = self.set_inputs_first_pass(
             target_token_ids=target_token_ids,
             next_token_ids=next_token_ids,
@@ -878,6 +885,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 "num_tokens": num_tokens,
                 "is_prefill": attn_metadata_i.num_prefills if attn_metadata_i is not None else 0,
             }
+            # ----- [ACLGRAPH-DBG] checkpoint C: set_inputs_first_pass 之后, run_draft 之前.
+            # 若 B 通过但 C 失败 -> 错误在 set_inputs_first_pass
+            # (写 self.input_ids / self.hidden_states 的 index_put). -----
+            print("[ACLGRAPH-DBG] C: set_inputs_first_pass 之后, run_draft 之前", flush=True)
+            torch.npu.synchronize()
+            print("[ACLGRAPH-DBG] C: sync OK", flush=True)
+            # ----- [ACLGRAPH-DBG] end checkpoint C -----
+
             run_draft = partial(self._runnable, **model_inputs)
 
             if self.enable_enpu:
@@ -902,6 +917,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
         # speculative tokens' proposings. `model_input_ids`, `model_positions` and
         # `model_hidden_states` represent the speculative model inputs.
+        # ----- [ACLGRAPH-DBG] checkpoint D: _run_merged_draft 入口, draft segment "a"
+        # (embed+fc) 之前. 这就是你之前加 print(self.input_ids) 的位置.
+        # 若 C 通过但 D 的 sync 失败 -> 错误在 set_inputs 与 draft 前向之间的 dispatch/pad op.
+        # 若 D 的 sync 通过但仍崩 -> draft 的 embed (segment "a" 对 -1 查表) 就是元凶.
+        # num_negative>0 即坐实 -1 进入了 draft 的 embedding. -----
+        print(f"[ACLGRAPH-DBG] D: _run_merged_draft 入口 num_tokens={num_tokens} num_input_tokens={num_input_tokens}", flush=True)
+        torch.npu.synchronize()
+        print("[ACLGRAPH-DBG] D: sync OK", flush=True)
+        _dbg_neg_d = (self.input_ids[:num_input_tokens] < 0).sum().item()
+        print(f"[ACLGRAPH-DBG] D: drafter input_ids[:{num_input_tokens}] 负值个数={_dbg_neg_d}", flush=True)
+        # ----- [ACLGRAPH-DBG] end checkpoint D -----
         model_input_ids = self.input_ids[:num_input_tokens]
         model_positions = self._get_positions(num_input_tokens)
 

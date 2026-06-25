@@ -2583,6 +2583,17 @@ class NPUModelRunner(GPUModelRunner):
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        # ----- [ACLGRAPH-DBG] checkpoint A: target 模型前向刚结束 (execute_model 返回后).
+        # 若 A 的 sync 失败 -> 异步错误来自 TARGET 模型前向 (如 edge segment_a 对 -1 查表).
+        # 若 A 通过 -> 错误在 draft 侧, 继续看 B/C/D. -----
+        print("[ACLGRAPH-DBG] A: sample_tokens 入口 (target 模型已完成)", flush=True)
+        torch.npu.synchronize()
+        print("[ACLGRAPH-DBG] A: target-sync OK", flush=True)
+        _dbg_total = scheduler_output.total_num_scheduled_tokens
+        _dbg_neg = (self.input_ids.gpu[:_dbg_total] < 0).sum().item()
+        print(f"[ACLGRAPH-DBG] A: target input_ids[:{_dbg_total}] 负值个数={_dbg_neg}", flush=True)
+        # ----- [ACLGRAPH-DBG] end checkpoint A -----
+
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             # here we are different from gpu_model_runner,

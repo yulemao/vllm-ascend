@@ -2555,25 +2555,6 @@ class NPUModelRunner(GPUModelRunner):
                             self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
                         )
 
-                    # In sync mode the cloud has no scheduler to update
-                    # num_computed_tokens after rejection. Advance the
-                    # cached state by the number of accepted tokens so
-                    # the next _prepare_inputs builds positions from
-                    # the correct KV cache offset. This is needed for
-                    # both hybrid (e.g. Qwen3.5) and non-hybrid models.
-                    if not self.use_async_scheduling:
-                        num_accepted_cpu = tensor_dict[
-                            "num_accepted_tokens"
-                        ].cpu().numpy()
-                        for i, req_id in enumerate(
-                            self.input_batch.req_ids[:num_reqs]
-                        ):
-                            accepted = int(num_accepted_cpu[i])
-                            self.requests[req_id].num_computed_tokens += accepted
-                            self.input_batch.num_computed_tokens_cpu[i] = (
-                                self.requests[req_id].num_computed_tokens
-                            )
-
                 return None  # noqa
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output

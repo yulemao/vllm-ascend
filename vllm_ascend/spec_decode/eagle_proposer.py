@@ -905,31 +905,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         model_input_ids = self.input_ids[:num_input_tokens]
         model_positions = self._get_positions(num_input_tokens)
 
-        is_edge_cloud_mtp = (
-            self.method == "mtp"
-            and self.runner is not None
-            and getattr(self.runner, "_edge_cloud_enabled", False)
-        )
-
-        # Edge-cloud MTP does not wrap the whole _run_merged_draft in ACLGraph;
-        # only individual segments are captured.  The padding tail of the
-        # drafter's buffers is therefore prepared outside the graph and may
-        # contain stale values, including ``-1`` placeholders from rejected
-        # speculative tokens.  Passing ``-1`` to ``embed_input_ids`` triggers an
-        # NPU vector-core MTE out-of-range error (error code 507035).  Sanitize
-        # the padded region before building ``model_kwargs`` so the edge segment
-        # only sees valid inputs.  Non-edge-cloud MTP freezes the padding tail
-        # at capture-time values, so it does not need this.
-        if is_edge_cloud_mtp and num_input_tokens > num_tokens:
-            if inputs_embeds is None:
-                self.input_ids[num_tokens:num_input_tokens].fill_(0)
-            else:
-                # inputs_embeds is a view of self.inputs_embeds; zero the
-                # padded tail so the model does not consume garbage embeddings.
-                self.inputs_embeds[num_tokens:num_input_tokens].fill_(0.0)
-            if self.pass_hidden_states_to_model:
-                self.hidden_states[num_tokens:num_input_tokens].fill_(0.0)
-
         if self.method == "dflash":
             model_kwargs = self.build_model_inputs_first_pass(num_input_tokens)
         else:
@@ -946,7 +921,29 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if self.method == "mtp":
                     model_kwargs["positions"] = model_positions
 
-        if is_edge_cloud_mtp:
+        if (
+            self.method == "mtp"
+            and self.runner is not None
+            and getattr(self.runner, "_edge_cloud_enabled", False)
+        ):
+            # Edge-cloud MTP does not wrap the whole _run_merged_draft in
+            # ACLGraph; only individual segments are captured.  The padding
+            # tail of the drafter's buffers is therefore prepared outside the
+            # graph and may contain stale values, including ``-1`` placeholders
+            # from rejected speculative tokens.  Passing ``-1`` to
+            # ``embed_input_ids`` triggers an NPU vector-core MTE out-of-range
+            # error (error code 507035).  Sanitize the padded region before the
+            # edge segment sees it.  Non-edge-cloud MTP freezes the padding
+            # tail at capture-time values, so it does not need this.
+            if num_input_tokens > num_tokens:
+                if inputs_embeds is None:
+                    self.input_ids[num_tokens:num_input_tokens].fill_(0)
+                else:
+                    # inputs_embeds is a view of self.inputs_embeds; zero the
+                    # padded tail so the model does not consume garbage embeddings.
+                    self.inputs_embeds[num_tokens:num_input_tokens].fill_(0.0)
+                if self.pass_hidden_states_to_model:
+                    self.hidden_states[num_tokens:num_input_tokens].fill_(0.0)
             ret_hidden_states = self._run_mtp_edge_cloud(**model_kwargs)
             if self.runner.edge_cloud_cfg.role == "cloud":
                 # When num_speculative_tokens > 1, the edge side iterates

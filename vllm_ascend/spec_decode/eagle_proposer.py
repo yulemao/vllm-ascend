@@ -905,6 +905,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         model_input_ids = self.input_ids[:num_input_tokens]
         model_positions = self._get_positions(num_input_tokens)
 
+        # The drafter's buffers are sized for the maximum batch; when the
+        # cudagraph dispatcher pads a small batch up to a captured graph size,
+        # the tail beyond ``num_tokens`` may contain stale values, including
+        # ``-1`` placeholders left by rejected speculative tokens.  Passing
+        # ``-1`` to ``embed_input_ids`` triggers an NPU vector-core MTE
+        # out-of-range error (error code 507035).  Sanitize the padded region
+        # before the model sees it.
+        if num_input_tokens > num_tokens:
+            if inputs_embeds is None:
+                self.input_ids[num_tokens:num_input_tokens].fill_(0)
+            else:
+                # inputs_embeds is a view of self.inputs_embeds; zero the
+                # padded tail so the model does not consume garbage embeddings.
+                self.inputs_embeds[num_tokens:num_input_tokens].fill_(0.0)
+            if self.pass_hidden_states_to_model:
+                self.hidden_states[num_tokens:num_input_tokens].fill_(0.0)
+
         if self.method == "dflash":
             model_kwargs = self.build_model_inputs_first_pass(num_input_tokens)
         else:
@@ -926,24 +943,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             and self.runner is not None
             and getattr(self.runner, "_edge_cloud_enabled", False)
         ):
-            # Edge-cloud MTP does not wrap the whole _run_merged_draft in
-            # ACLGraph; only individual segments are captured.  The padding
-            # tail of the drafter's buffers is therefore prepared outside the
-            # graph and may contain stale values, including ``-1`` placeholders
-            # from rejected speculative tokens.  Passing ``-1`` to
-            # ``embed_input_ids`` triggers an NPU vector-core MTE out-of-range
-            # error (error code 507035).  Sanitize the padded region before the
-            # edge segment sees it.  Non-edge-cloud MTP freezes the padding
-            # tail at capture-time values, so it does not need this.
-            if num_input_tokens > num_tokens:
-                if inputs_embeds is None:
-                    self.input_ids[num_tokens:num_input_tokens].fill_(0)
-                else:
-                    # inputs_embeds is a view of self.inputs_embeds; zero the
-                    # padded tail so the model does not consume garbage embeddings.
-                    self.inputs_embeds[num_tokens:num_input_tokens].fill_(0.0)
-                if self.pass_hidden_states_to_model:
-                    self.hidden_states[num_tokens:num_input_tokens].fill_(0.0)
             ret_hidden_states = self._run_mtp_edge_cloud(**model_kwargs)
             if self.runner.edge_cloud_cfg.role == "cloud":
                 # When num_speculative_tokens > 1, the edge side iterates

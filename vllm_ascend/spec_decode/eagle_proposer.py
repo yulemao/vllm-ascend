@@ -602,24 +602,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         print("[ACLGRAPH-DBG] B1: sync OK", flush=True)
         # ----- [ACLGRAPH-DBG] end checkpoint B1 -----
 
-        # In padded-batch speculative decoding, rejected draft tokens are kept as
-        # padding in the target model's input_ids and are copied into the drafter's
-        # persistent input_ids buffer. Their value is -1, which is *not* a valid
-        # vocabulary index. When the drafter later calls embed_input_ids on the
-        # whole buffer (e.g. edge-cloud MTP embed_only path), the embedding lookup
-        # on -1 causes an NPU vector-core out-of-range access. Clamp them to 0 so
-        # the embedding is well-defined; these padding positions are masked out by
-        # token_indices_to_sample later anyway.
-        draft_input_ids = self.input_ids[:num_tokens]
-        negative_mask = draft_input_ids < 0
-        if negative_mask.any():
-            draft_input_ids.clamp_(min=0)
-            num_negative = negative_mask.sum().item()
-            print(
-                f"[ACLGRAPH-DBG] B1.5: clamped {num_negative} negative "
-                f"input_ids to 0 before embed_input_ids", flush=True
-            )
-
         if self.pcp_size * self.dcp_size > 1:
             assert long_seq_args is not None
             query_lens_d, ori_token_indices_to_sample = long_seq_args
@@ -744,10 +726,34 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         )
         if self.supports_mm_inputs and not is_cloud_mtp:
             mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
+            # ----- [ACLGRAPH-DBG] checkpoint B4.1: embed_input_ids 之前 -----
+            print(
+                f"[ACLGRAPH-DBG] B4.1: embed_input_ids 之前 "
+                f"num_tokens={num_tokens} input_ids_shape={self.input_ids[:num_tokens].shape} "
+                f"input_ids_min={self.input_ids[:num_tokens].min().item()} "
+                f"input_ids_max={self.input_ids[:num_tokens].max().item()}", flush=True
+            )
+            torch.npu.synchronize()
+            print("[ACLGRAPH-DBG] B4.1: sync OK", flush=True)
+            # ----- [ACLGRAPH-DBG] end checkpoint B4.1 -----
             inputs_embeds = self.model.embed_input_ids(
                 self.input_ids[:num_tokens], multimodal_embeddings=mm_embeds, is_multimodal=is_mm_embed
             )
+            # ----- [ACLGRAPH-DBG] checkpoint B4.2: embed_input_ids 之后 -----
+            print(
+                f"[ACLGRAPH-DBG] B4.2: embed_input_ids 之后 "
+                f"inputs_embeds_shape={inputs_embeds.shape} dtype={inputs_embeds.dtype} "
+                f"device={inputs_embeds.device} contiguous={inputs_embeds.is_contiguous()}", flush=True
+            )
+            torch.npu.synchronize()
+            print("[ACLGRAPH-DBG] B4.2: sync OK", flush=True)
+            # ----- [ACLGRAPH-DBG] end checkpoint B4.2 -----
             self.inputs_embeds[:num_tokens] = inputs_embeds
+            # ----- [ACLGRAPH-DBG] checkpoint B4.3: inputs_embeds 赋值之后 -----
+            print("[ACLGRAPH-DBG] B4.3: inputs_embeds 赋值之后", flush=True)
+            torch.npu.synchronize()
+            print("[ACLGRAPH-DBG] B4.3: sync OK", flush=True)
+            # ----- [ACLGRAPH-DBG] end checkpoint B4.3 -----
             inputs_embeds = self.inputs_embeds[:num_input_tokens]
         else:
             inputs_embeds = None
@@ -761,6 +767,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.slot_mapping_group[0][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping)
         self.slot_mapping_group[0][slot_mapping_lens:].fill_(-1)
         common_attn_metadata.slot_mapping = self.slot_mapping_group[0]
+        # ----- [ACLGRAPH-DBG] checkpoint B4.4: slot_mapping copy 之后 -----
+        print("[ACLGRAPH-DBG] B4.4: slot_mapping copy 之后", flush=True)
+        torch.npu.synchronize()
+        print("[ACLGRAPH-DBG] B4.4: sync OK", flush=True)
+        # ----- [ACLGRAPH-DBG] end checkpoint B4.4 -----
 
         self.seq_lens_group[0][:num_reqs_padded].copy_(common_attn_metadata.seq_lens)
         self.seq_lens_group[0][num_reqs_padded:].fill_(0)
@@ -769,6 +780,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.query_start_loc_group[0][: num_reqs_padded + 1].copy_(common_attn_metadata.query_start_loc)
         self.query_start_loc_group[0][num_reqs_padded + 1 :].fill_(0)
         common_attn_metadata.query_start_loc = self.query_start_loc_group[0][: num_reqs_padded + 1]
+        # ----- [ACLGRAPH-DBG] checkpoint B4.5: seq_lens/query_start_loc copy 之后 -----
+        print("[ACLGRAPH-DBG] B4.5: seq_lens/query_start_loc copy 之后", flush=True)
+        torch.npu.synchronize()
+        print("[ACLGRAPH-DBG] B4.5: sync OK", flush=True)
+        # ----- [ACLGRAPH-DBG] end checkpoint B4.5 -----
 
         common_attn_metadata.num_input_tokens = num_input_tokens
         if self.draft_attn_groups:
@@ -901,13 +917,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         token_indices_to_sample_len = token_indices_to_sample.shape[0]
         self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
+        # ----- [ACLGRAPH-DBG] checkpoint B4.6: token_indices_to_sample copy 之后 -----
+        print("[ACLGRAPH-DBG] B4.6: token_indices_to_sample copy 之后", flush=True)
+        torch.npu.synchronize()
+        print("[ACLGRAPH-DBG] B4.6: sync OK", flush=True)
+        # ----- [ACLGRAPH-DBG] end checkpoint B4.6 -----
 
         # ----- [ACLGRAPH-DBG] checkpoint B5: set_ascend_forward_context 之前 (含 inputs_embeds / slot_mapping / token_indices copy).
         # B4 通过但 B5 失败 -> inputs_embeds embed 或 slot_mapping 或 token_indices copy 越界. -----
-        num_negative_input_ids = (self.input_ids[:num_tokens] < 0).sum().item() if inputs_embeds is None else 0
+        num_negative_input_ids = (self.input_ids[:num_tokens] < 0).sum().item()
         print(
             f"[ACLGRAPH-DBG] B5: forward_context 之前 supports_mm_inputs={self.supports_mm_inputs} "
-            f"inputs_embeds_is_None={inputs_embeds is None} num_negative_input_ids={num_negative_input_ids}",
+            f"inputs_embeds_is_None={inputs_embeds is None} num_tokens={num_tokens} "
+            f"num_input_tokens={num_input_tokens} num_negative_input_ids={num_negative_input_ids}",
             flush=True,
         )
         torch.npu.synchronize()

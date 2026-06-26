@@ -1873,6 +1873,24 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
             # ----- end [PIP-DBG] -----
 
+            # ----- [PIP-DBG] BEFORE kernel: device-wide sync, then dump input
+            # DATA. The device sync drains everything enqueued so far, INCLUDING
+            # the overlapping async input-prep stream. If it crashes here, the
+            # fault was enqueued BEFORE prepare_inputs_padded_kernel (i.e. the
+            # overlapping input-prep), not in this kernel. If it passes, the
+            # printed values are the exact inputs the kernel is about to read. -----
+            print("[PIP-DBG] before kernel, device-syncing...", flush=True)
+            torch.npu.synchronize()
+            print("[PIP-DBG] pre-kernel device-sync OK; dumping input data:",
+                  flush=True)
+            print("[PIP-DBG]   cu_num_draft_tokens =",
+                  spec_decode_metadata.cu_num_draft_tokens, flush=True)
+            print("[PIP-DBG]   query_start_loc =",
+                  common_attn_metadata.query_start_loc, flush=True)
+            print("[PIP-DBG]   valid_sampled_tokens_count =",
+                  valid_sampled_tokens_count, flush=True)
+            # ----- end [PIP-DBG] -----
+
             prepare_inputs_padded_kernel[grid](
                 spec_decode_metadata.cu_num_draft_tokens,
                 valid_sampled_tokens_count,
@@ -1883,11 +1901,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 BLOCK_SIZE=_PREPARE_INPUTS_BLOCK_SIZE,
             )
 
-            # ----- [PIP-DBG] sync right after the kernel so a fault here is
-            # surfaced at this exact line instead of the next downstream sync. -----
-            print("[PIP-DBG] prepare_inputs_padded_kernel launched, syncing...", flush=True)
-            torch.npu.synchronize()
-            print("[PIP-DBG] sync OK", flush=True)
+            # ----- [PIP-DBG] compute-stream sync right after the kernel. NOTE:
+            # this is current_stream() (NOT device-wide) so it does NOT drain the
+            # overlapping async input-prep stream -- if this passes but a later
+            # device sync / synchronize_input_prep crashes, the fault is on the
+            # input-prep stream, not here. -----
+            print("[PIP-DBG] prepare_inputs_padded_kernel launched, syncing (compute stream)...", flush=True)
+            torch.npu.current_stream().synchronize()
+            print("[PIP-DBG] sync OK (compute stream)", flush=True)
             # ----- end [PIP-DBG] -----
         else:
             num_draft_tokens_gpu = torch.cat(

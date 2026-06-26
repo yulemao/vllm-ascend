@@ -3346,6 +3346,14 @@ class NPUModelRunner(GPUModelRunner):
             num_scheduled_tokens_np,
         )
 
+        # [INPREP-DBG] _prepare_inputs runs on the async input-prep stream and
+        # builds logits_indices + spec_decode_metadata. If this sync crashes
+        # (and the compute-stream syncs pass), the fault is in _prepare_inputs
+        # for the mixed prefill+decode batch.
+        print("[INPREP-DBG] after _prepare_inputs, syncing...", flush=True)
+        torch.npu.synchronize()
+        print("[INPREP-DBG] _prepare_inputs sync OK", flush=True)
+
         num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
         if self.pcp_size > 1:
             num_tokens_unpadded = self.pcp_manager.total_num_sampled_tokens_pcp
@@ -3423,6 +3431,13 @@ class NPUModelRunner(GPUModelRunner):
                 cascade_attn_prefix_lens=cascade_attn_prefix_lens,
             )
         )
+
+        # [INPREP-DBG] _build_attention_metadata (async input-prep stream). If
+        # this crashes (compute-stream syncs pass), the fault is in attention
+        # metadata construction for the mixed prefill+decode batch.
+        print("[INPREP-DBG] after _build_attention_metadata, syncing...", flush=True)
+        torch.npu.synchronize()
+        print("[INPREP-DBG] _build_attention_metadata sync OK", flush=True)
 
         return {
             "total_num_scheduled_tokens": total_num_scheduled_tokens,

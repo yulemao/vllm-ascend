@@ -107,7 +107,16 @@ def rejection_greedy_sample_triton(
         is_greedy = tl.load(is_greedy_ptr + offset, mask=mask, other=0)
         is_greedy_mask = mask & (is_greedy != 0)
 
-    start_idx = tl.where(offset == 0, 0, tl.load(cu_num_draft_tokens_ptr + offset - 1, is_greedy_mask))
+    # NOTE: mask off the offset == 0 lane so we never issue a load at
+    # cu_num_draft_tokens_ptr - 1 (out of bounds). `tl.where` evaluates both
+    # branches, so without this the first lane reads one element before the
+    # buffer; for a tiny batch=1 allocation that address is unmapped and trips
+    # an NPU "MTE out of range" / vector core exception.
+    cu_prev_mask = is_greedy_mask & (offset != 0)
+    start_idx = tl.where(
+        offset == 0, 0,
+        tl.load(cu_num_draft_tokens_ptr + offset - 1, cu_prev_mask, other=0),
+    )
     end_idx = tl.load(cu_num_draft_tokens_ptr + offset, is_greedy_mask)
     num_draft_tokens = end_idx - start_idx
 
@@ -161,7 +170,13 @@ def rejection_random_sample_kernel(
     mask = offsets < vec_len
     is_greedy = tl.load(is_greedy_ptr + offsets, mask, other=1)
     not_greedy_mask = is_greedy == 0
-    start_idxs = tl.where(offsets == 0, 0, tl.load(cu_num_draft_tokens_ptr + offsets - 1, not_greedy_mask))
+    # NOTE: same cu_num_draft_tokens_ptr - 1 fix as the greedy kernel; mask
+    # off the offsets == 0 lane to avoid an out-of-bounds load on batch=1.
+    cu_prev_mask = not_greedy_mask & (offsets != 0)
+    start_idxs = tl.where(
+        offsets == 0, 0,
+        tl.load(cu_num_draft_tokens_ptr + offsets - 1, cu_prev_mask, other=0),
+    )
     end_idxs = tl.load(cu_num_draft_tokens_ptr + offsets, not_greedy_mask)
     n_num_draft_tokens = end_idxs - start_idxs
     for req_i in range(BLOCK_SIZE):

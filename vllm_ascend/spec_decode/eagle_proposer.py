@@ -1852,6 +1852,27 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             grid_size = min(num_blocks_needed, num_vector_core)
             grid = (grid_size,)
 
+            # ----- [PIP-DBG] confirm prepare_inputs_padded padding-mismatch OOB.
+            # `num_reqs` comes from common_attn_metadata (possibly graph-padded),
+            # while cu_num_draft_tokens / query_start_loc come from the
+            # scheduler's spec_decode_metadata (real size). If num_reqs is larger
+            # than the real buffer size, the kernel reads past them -> MTE out of
+            # range. -----
+            _real_num_reqs = len(spec_decode_metadata.num_draft_tokens)
+            print(
+                f"[PIP-DBG] num_reqs(kernel arg)={num_reqs}"
+                f" real_num_reqs={_real_num_reqs}"
+                f" padded?={num_reqs != _real_num_reqs}"
+                f" cu_num_draft_tokens.shape="
+                f"{tuple(spec_decode_metadata.cu_num_draft_tokens.shape)}"
+                f" query_start_loc.shape="
+                f"{tuple(common_attn_metadata.query_start_loc.shape)}"
+                f" valid_sampled_tokens_count.shape="
+                f"{tuple(valid_sampled_tokens_count.shape)}",
+                flush=True,
+            )
+            # ----- end [PIP-DBG] -----
+
             prepare_inputs_padded_kernel[grid](
                 spec_decode_metadata.cu_num_draft_tokens,
                 valid_sampled_tokens_count,
@@ -1861,6 +1882,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 num_reqs,
                 BLOCK_SIZE=_PREPARE_INPUTS_BLOCK_SIZE,
             )
+
+            # ----- [PIP-DBG] sync right after the kernel so a fault here is
+            # surfaced at this exact line instead of the next downstream sync. -----
+            print("[PIP-DBG] prepare_inputs_padded_kernel launched, syncing...", flush=True)
+            torch.npu.synchronize()
+            print("[PIP-DBG] sync OK", flush=True)
+            # ----- end [PIP-DBG] -----
         else:
             num_draft_tokens_gpu = torch.cat(
                 [

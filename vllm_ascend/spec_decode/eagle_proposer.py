@@ -601,6 +601,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         torch.npu.synchronize()
         print("[ACLGRAPH-DBG] B1: sync OK", flush=True)
         # ----- [ACLGRAPH-DBG] end checkpoint B1 -----
+
+        # In padded-batch speculative decoding, rejected draft tokens are kept as
+        # padding in the target model's input_ids and are copied into the drafter's
+        # persistent input_ids buffer. Their value is -1, which is *not* a valid
+        # vocabulary index. When the drafter later calls embed_input_ids on the
+        # whole buffer (e.g. edge-cloud MTP embed_only path), the embedding lookup
+        # on -1 causes an NPU vector-core out-of-range access. Clamp them to 0 so
+        # the embedding is well-defined; these padding positions are masked out by
+        # token_indices_to_sample later anyway.
+        draft_input_ids = self.input_ids[:num_tokens]
+        negative_mask = draft_input_ids < 0
+        if negative_mask.any():
+            draft_input_ids.clamp_(min=0)
+            num_negative = negative_mask.sum().item()
+            print(
+                f"[ACLGRAPH-DBG] B1.5: clamped {num_negative} negative "
+                f"input_ids to 0 before embed_input_ids", flush=True
+            )
+
         if self.pcp_size * self.dcp_size > 1:
             assert long_seq_args is not None
             query_lens_d, ori_token_indices_to_sample = long_seq_args
@@ -885,7 +904,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         # ----- [ACLGRAPH-DBG] checkpoint B5: set_ascend_forward_context 之前 (含 inputs_embeds / slot_mapping / token_indices copy).
         # B4 通过但 B5 失败 -> inputs_embeds embed 或 slot_mapping 或 token_indices copy 越界. -----
-        print(f"[ACLGRAPH-DBG] B5: forward_context 之前 supports_mm_inputs={self.supports_mm_inputs} inputs_embeds_is_None={inputs_embeds is None}", flush=True)
+        num_negative_input_ids = (self.input_ids[:num_tokens] < 0).sum().item() if inputs_embeds is None else 0
+        print(
+            f"[ACLGRAPH-DBG] B5: forward_context 之前 supports_mm_inputs={self.supports_mm_inputs} "
+            f"inputs_embeds_is_None={inputs_embeds is None} num_negative_input_ids={num_negative_input_ids}",
+            flush=True,
+        )
         torch.npu.synchronize()
         print("[ACLGRAPH-DBG] B5: sync OK", flush=True)
         # ----- [ACLGRAPH-DBG] end checkpoint B5 -----

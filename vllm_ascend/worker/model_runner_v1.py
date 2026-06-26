@@ -2707,6 +2707,15 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config is not None:
                 self.finalize_kv_connector()
 
+        # [STEP-END-DBG] device sync at the end of this step's compute. With
+        # async scheduling on, a fault enqueued by an earlier kernel would
+        # otherwise leak to the NEXT step's first sync (e.g. prepare_inputs_padded)
+        # and mislead localization. This forces it to surface HERE, in the step
+        # that caused it. Drop this block once the fault is localized.
+        print("[STEP-END-DBG] end of sample_tokens compute, syncing...", flush=True)
+        torch.npu.synchronize()
+        print("[STEP-END-DBG] sync OK", flush=True)
+
         routed_experts_lists = None
         if self.model_config.enable_return_routed_experts:
             if vllm_version_is("0.20.2"):

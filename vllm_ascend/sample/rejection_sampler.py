@@ -135,6 +135,16 @@ def rejection_sample(
         # Rejection sampling for greedy sampling requests.
         target_argmax = target_logits.argmax(dim=-1)
         if HAS_TRITON:
+            # [REJ-DBG] bracket the greedy rejection kernel with device syncs so
+            # a fault surfaces here instead of at a later async sync. If the
+            # "post-sync OK" line is missing, this kernel faulted.
+            print(
+                f"[REJ-DBG] before kernel batch_size={batch_size} "
+                f"num_draft_tokens={num_draft_tokens} is_greedy={is_greedy}",
+                flush=True,
+            )
+            torch.npu.synchronize()
+            print("[REJ-DBG] pre-sync OK", flush=True)
             rejection_greedy_sample_with_triton(
                 output_token_ids,
                 num_draft_tokens,
@@ -147,6 +157,9 @@ def rejection_sample(
                 grid,
                 block_size,
             )
+            print("[REJ-DBG] after kernel, syncing...", flush=True)
+            torch.npu.synchronize()
+            print("[REJ-DBG] post-sync OK", flush=True)
         else:
             if min(num_draft_tokens) == 1 and max(num_draft_tokens) == 1 and sampling_metadata.all_greedy:
                 rejection_greedy_sample_spec_len_1_pytorch(

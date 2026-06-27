@@ -48,7 +48,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
 from vllm_ascend.distributed.parallel_state import edge_cloud_broadcast_recv
-from vllm_ascend.ops.triton.reject_sample import pad_tail_to
+from vllm_ascend.ops.triton.reject_sample import pad_cu_for_kernel, pad_tail_to
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
@@ -1858,8 +1858,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             _pad_n = num_reqs + _PREPARE_INPUTS_BLOCK_SIZE
             token_indices_to_sample_k = torch.empty((_pad_n,), dtype=torch.int32, device=device)
             num_rejected_tokens_gpu_k = torch.empty((_pad_n,), dtype=torch.int32, device=device)
-            cu_num_draft_tokens_k = pad_tail_to(
-                spec_decode_metadata.cu_num_draft_tokens, _pad_n, repeat_last=True
+            cu_num_draft_tokens_k = pad_cu_for_kernel(
+                spec_decode_metadata.cu_num_draft_tokens, _pad_n
             )
             valid_sampled_tokens_count_k = pad_tail_to(valid_sampled_tokens_count, _pad_n)
             query_start_loc_k = pad_tail_to(

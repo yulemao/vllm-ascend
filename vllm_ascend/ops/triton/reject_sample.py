@@ -62,6 +62,32 @@ def pad_tail_to(t, length: int, repeat_last: bool = False, fill: int = 0):
     return torch.cat([t, pad], dim=0)
 
 
+def pad_cu_for_kernel(cu, length: int):
+    """Pad an inclusive-cumsum tensor (``cu_num_draft_tokens``) for kernels that
+    read it at BOTH ``offset`` and ``offset - 1``.
+
+    The real Ascend fault is the ``cu_ptr + offset - 1`` load at block 0: with
+    ``block_size >= 2`` the MTE reads a contiguous tile that includes the
+    ``offset - 1 == -1`` lane, touching the element *before* the buffer base. A
+    freshly allocated ``cu`` is page-aligned, so ``base - 1`` is in the previous
+    (often unmapped) page -> "MTE address out of range" / vector core exception.
+    Tail padding cannot help a *head* underrun.
+
+    Fix: prepend a one-element guard and return a length-``length`` VIEW that
+    starts at index 1 of the larger buffer, so the kernel's ``view_ptr - 1``
+    lands on the guard (mapped) instead of before the allocation. A tail that
+    repeats the last value is also added so padded lanes see
+    ``num_draft_tokens == 0``. The guard value is irrelevant (the kernel's
+    ``tl.where(offset == 0, 0, ...)`` discards the offset-0 result).
+    """
+    n = cu.shape[0]
+    parts = [cu[:1], cu]
+    if length > n:
+        parts.append(cu[-1:].expand(length - n))
+    full = torch.cat(parts)  # len == 1 + max(n, length)
+    return full[1 : 1 + length]
+
+
 @triton.jit(do_not_specialize=["max_spec_len"])
 def bonus_renew_1(
     bonus_token_ids_ptr,
@@ -399,11 +425,12 @@ def expand_triton(batch_size, expanded_x, x, cu_num_tokens, replace_from, replac
     grid, block_size = cal_grid_and_block_size(batch_size)
     pad_len = grid * block_size
 
-    # Launch with no masked lanes (vec_len == grid*block_size). Pad the
-    # offset-indexed inputs to match; cu_num_tokens repeats its last value so a
-    # padded lane sees num_tokens == 0 and its inner store loop is a no-op (the
-    # caller over-allocates `expanded_x` so even that no-op's tile stays mapped).
-    cu_k = pad_tail_to(cu_num_tokens, pad_len, repeat_last=True)
+    # Launch with no masked lanes (vec_len == grid*block_size). cu uses the
+    # front-guard view (avoids the offset-1 == -1 underrun at block 0) and a
+    # repeated-last tail (padded lanes see num_tokens == 0, so the inner store
+    # loop is a no-op; the caller over-allocates `expanded_x` so even that no-op
+    # tile stays mapped). The input is tail-padded (read at offset only).
+    cu_k = pad_cu_for_kernel(cu_num_tokens, pad_len)
     x_k = pad_tail_to(x, pad_len)
 
     expand_kernel[(grid,)](

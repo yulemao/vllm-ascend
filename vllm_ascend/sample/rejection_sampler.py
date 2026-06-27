@@ -13,6 +13,7 @@ from vllm.v1.sample.rejection_sampler import (
 from vllm_ascend.ops.triton.reject_sample import (
     cal_grid_and_block_size,
     expand_triton,
+    pad_cu_for_kernel,
     pad_tail_to,
     rejection_greedy_sample_with_triton,
     rejection_random_sample_block_verify_kernel,
@@ -149,11 +150,14 @@ def rejection_sample(
         is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
 
     if HAS_TRITON and pad_len > batch_size:
-        # cu repeats its last value -> padded lanes see num_draft_tokens == 0;
-        # is_greedy padded with 1 (greedy) -> the random kernels skip them;
-        # bonus repeats its last row -> padded greedy lanes have a valid bonus
-        # source (their write lands in the sliced-off output rows).
-        cu_num_draft_tokens_k = pad_tail_to(cu_num_draft_tokens, pad_len, repeat_last=True)
+        # cu uses a front-guard + tail view (pad_cu_for_kernel): the front guard
+        # makes the offset-1 == -1 tile read at block 0 land in mapped memory
+        # (the actual Ascend fault), and the repeated-last tail makes padded
+        # lanes see num_draft_tokens == 0. is_greedy padded with 1 (greedy) so
+        # the random kernels skip padded lanes; bonus repeats its last row so a
+        # padded greedy lane has a valid bonus source (written into sliced-off
+        # output rows).
+        cu_num_draft_tokens_k = pad_cu_for_kernel(cu_num_draft_tokens, pad_len)
         bonus_token_ids_k = pad_tail_to(bonus_token_ids, pad_len, repeat_last=True)
         is_greedy_k = None if is_greedy is None else pad_tail_to(is_greedy, pad_len, fill=1)
     else:

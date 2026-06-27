@@ -117,7 +117,16 @@ def rejection_greedy_sample_triton(
         offset == 0, 0,
         tl.load(cu_num_draft_tokens_ptr + offset - 1, cu_prev_mask, other=0),
     )
-    end_idx = tl.load(cu_num_draft_tokens_ptr + offset, is_greedy_mask)
+    # NOTE: `other=0` is required for the masked-off lanes. When
+    # batch_size > vectorcore_num, cal_grid_and_block_size() picks BLOCK_SIZE>=2
+    # and the tail lanes (offset >= vec_len) are masked. Without `other=0` the
+    # masked load returns unspecified register garbage, so
+    # num_draft_tokens = garbage - start_idx becomes a large positive value and
+    # the `for i in range(num_tokens1)` loop below reads draft_token_ids /
+    # target_argmax and writes output_token_ids far out of bounds -> NPU
+    # "MTE address out of range" / vector core exception. With `other=0` the
+    # tail lanes get num_draft_tokens=0 and the inner loop is a no-op.
+    end_idx = tl.load(cu_num_draft_tokens_ptr + offset, is_greedy_mask, other=0)
     num_draft_tokens = end_idx - start_idx
 
     for pos in tl.range(0, BLOCK_SIZE):

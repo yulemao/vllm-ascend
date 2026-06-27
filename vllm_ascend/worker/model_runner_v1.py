@@ -3056,14 +3056,59 @@ class NPUModelRunner(GPUModelRunner):
                 sampling_metadata=sampling_metadata,
             )
 
+        # ----- [SAMPLE-DBG] bracket the window between target-forward sync
+        # (checkpoint A) and the rejection sampler. The crash on one rank with
+        # identical metadata points to an index-vs-buffer-size mismatch here
+        # (likely lmhead_tp logits padded to a fixed acl_graph capture size,
+        # while bonus/target_logits_indices are built from the real layout).
+        # Each .item() forces a device sync, so whichever print is the LAST one
+        # before the fault pinpoints the offending step. -----
+        def _dbg_max(t):
+            return int(t.max().item()) if t is not None and t.numel() > 0 else -1
+
+        bonus_idx = spec_decode_metadata.bonus_logits_indices
+        target_idx = spec_decode_metadata.target_logits_indices
+        print(
+            f"[SAMPLE-DBG] pre-slice lmhead_tp={lmhead_tp_enable()} "
+            f"logits_is_None={logits is None} "
+            f"logits.shape={None if logits is None else tuple(logits.shape)} "
+            f"len(logits_indices)={len(spec_decode_metadata.logits_indices)} "
+            f"bonus_idx.shape={tuple(bonus_idx.shape)} bonus_idx.max={_dbg_max(bonus_idx)} "
+            f"target_idx.shape={tuple(target_idx.shape)} target_idx.max={_dbg_max(target_idx)} "
+            f"cu_num_draft_tokens.max={_dbg_max(spec_decode_metadata.cu_num_draft_tokens)} "
+            f"draft_token_ids.shape={tuple(spec_decode_metadata.draft_token_ids.shape)}",
+            flush=True,
+        )
+        torch.npu.synchronize()
+        print("[SAMPLE-DBG] pre-slice sync OK", flush=True)
+
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
+
+        # After the (possible) lmhead_tp slice, verify every index the rejection
+        # sampler will gather is in-bounds for the actual logits buffer.
+        if logits is not None:
+            n_rows = logits.shape[0]
+            b_max = _dbg_max(bonus_idx)
+            t_max = _dbg_max(target_idx)
+            oob = (b_max >= n_rows) or (t_max >= n_rows)
+            print(
+                f"[SAMPLE-DBG] post-slice logits.shape={tuple(logits.shape)} "
+                f"n_rows={n_rows} bonus_idx.max={b_max} target_idx.max={t_max} "
+                f"OUT_OF_BOUNDS={oob}",
+                flush=True,
+            )
+            torch.npu.synchronize()
+            print("[SAMPLE-DBG] post-slice sync OK, entering rejection_sampler", flush=True)
+
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             None,  # draft_probs
             logits,
             sampling_metadata,
         )
+        torch.npu.synchronize()
+        print("[SAMPLE-DBG] rejection_sampler returned, sync OK", flush=True)
         return sampler_output
 
     # TODO: remove this func after eagle_proposer is refactored and

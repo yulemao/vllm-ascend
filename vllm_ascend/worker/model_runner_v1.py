@@ -181,7 +181,6 @@ if TYPE_CHECKING:
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
 
-
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
@@ -191,14 +190,11 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
-
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
-
 
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
-
 
 @contextmanager
 def graph_capture(device: torch.device):
@@ -230,10 +226,8 @@ def graph_capture(device: torch.device):
     with torch.npu.stream(stream), maybe_ca_context:
         yield graph_capture_context
 
-
 def get_tp_context(drafter):
     return getattr(drafter, "tp_group_context", nullcontext())
-
 
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
@@ -251,9 +245,6 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
-
-
-
 
 class EdgeCloudSegment(torch.nn.Module):
     """执行指定层区间 [start_layer, end_layer) 的轻量 nn.Module。
@@ -1241,7 +1232,6 @@ class NPUModelRunner(GPUModelRunner):
             self.gdn_query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
             self.gdn_query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
             self.gdn_query_start_loc.copy_to_gpu()
-
 
         # Compute optimistic seq_lens (assumes all draft tokens from previous
         # iteration accepted). Store in optimistic_seq_lens_cpu for use by
@@ -2583,17 +2573,6 @@ class NPUModelRunner(GPUModelRunner):
         # Clear ephemeral state.
         self.execute_model_state = None
 
-        # ----- [ACLGRAPH-DBG] checkpoint A: target 模型前向刚结束 (execute_model 返回后).
-        # 若 A 的 sync 失败 -> 异步错误来自 TARGET 模型前向 (如 edge segment_a 对 -1 查表).
-        # 若 A 通过 -> 错误在 draft 侧, 继续看 B/C/D. -----
-        print("[ACLGRAPH-DBG] A: sample_tokens 入口 (target 模型已完成)", flush=True)
-        torch.npu.synchronize()
-        print("[ACLGRAPH-DBG] A: target-sync OK", flush=True)
-        _dbg_total = scheduler_output.total_num_scheduled_tokens
-        _dbg_neg = (self.input_ids.gpu[:_dbg_total] < 0).sum().item()
-        print(f"[ACLGRAPH-DBG] A: target input_ids[:{_dbg_total}] 负值个数={_dbg_neg}", flush=True)
-        # ----- [ACLGRAPH-DBG] end checkpoint A -----
-
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             # here we are different from gpu_model_runner,
@@ -2706,15 +2685,6 @@ class NPUModelRunner(GPUModelRunner):
             # draft model runs so KV pool save/put can complete.
             if self.speculative_config is not None:
                 self.finalize_kv_connector()
-
-        # [STEP-END-DBG] compute-stream sync at the end of this step's compute.
-        # Uses current_stream() (NOT device-wide) so it drains only this step's
-        # compute and NOT the overlapping async input-prep stream. If this passes
-        # but the next execute_model's synchronize_input_prep crashes, the fault
-        # is on the input-prep stream. Drop this block once localized.
-        print("[STEP-END-DBG] end of sample_tokens compute, syncing (compute stream)...", flush=True)
-        torch.npu.current_stream().synchronize()
-        print("[STEP-END-DBG] sync OK (compute stream)", flush=True)
 
         routed_experts_lists = None
         if self.model_config.enable_return_routed_experts:
@@ -3346,14 +3316,6 @@ class NPUModelRunner(GPUModelRunner):
             num_scheduled_tokens_np,
         )
 
-        # [INPREP-DBG] _prepare_inputs runs on the async input-prep stream and
-        # builds logits_indices + spec_decode_metadata. If this sync crashes
-        # (and the compute-stream syncs pass), the fault is in _prepare_inputs
-        # for the mixed prefill+decode batch.
-        print("[INPREP-DBG] after _prepare_inputs, syncing...", flush=True)
-        torch.npu.synchronize()
-        print("[INPREP-DBG] _prepare_inputs sync OK", flush=True)
-
         num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
         if self.pcp_size > 1:
             num_tokens_unpadded = self.pcp_manager.total_num_sampled_tokens_pcp
@@ -3431,13 +3393,6 @@ class NPUModelRunner(GPUModelRunner):
                 cascade_attn_prefix_lens=cascade_attn_prefix_lens,
             )
         )
-
-        # [INPREP-DBG] _build_attention_metadata (async input-prep stream). If
-        # this crashes (compute-stream syncs pass), the fault is in attention
-        # metadata construction for the mixed prefill+decode batch.
-        print("[INPREP-DBG] after _build_attention_metadata, syncing...", flush=True)
-        torch.npu.synchronize()
-        print("[INPREP-DBG] _build_attention_metadata sync OK", flush=True)
 
         return {
             "total_num_scheduled_tokens": total_num_scheduled_tokens,
@@ -3918,7 +3873,6 @@ class NPUModelRunner(GPUModelRunner):
             max_seq_len = self.max_model_len
         else:
             max_seq_len = self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max().item()
-
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
@@ -4523,7 +4477,6 @@ class NPUModelRunner(GPUModelRunner):
 
                 self._finalize_dump_data(dump=False)
             return hidden_states, hidden_states
-
 
     @torch.inference_mode()
     def _dummy_sampler_run(
@@ -5564,7 +5517,6 @@ class NPUModelRunner(GPUModelRunner):
         with update_pass_config(self):
             super()._check_and_update_cudagraph_mode(attention_backends, kv_cache_groups)
 
-
         capture_descs = self.cudagraph_dispatcher.get_capture_descs()
         capture_sizes = sorted({
             desc.num_tokens
@@ -5666,7 +5618,6 @@ class NPUModelRunner(GPUModelRunner):
                     if isinstance(tensor, torch.Tensor) and tensor.device.type != "cpu":
                         mm_data[field] = tensor.cpu()
 
-
 def _post_process_cudagraph_mode(tensor: torch.Tensor) -> int:
     """
     Synchronize cudagraph_mode across DP ranks by taking the minimum.
@@ -5674,7 +5625,6 @@ def _post_process_cudagraph_mode(tensor: torch.Tensor) -> int:
     This ensures all ranks send consistent values (all padded or all unpadded).
     """
     return int(tensor[1, :].min().item())
-
 
 def _get_gpu_model_runner_module_name(model_runner) -> str:
     """Return the module name of GPUModelRunner found in the MRO."""
@@ -5688,7 +5638,6 @@ def _get_gpu_model_runner_module_name(model_runner) -> str:
             "The class hierarchy may have changed."
         )
     return gpu_model_runner_cls.__module__
-
 
 @contextmanager
 def _torch_cuda_wrapper():
@@ -5731,7 +5680,6 @@ def _torch_cuda_wrapper():
         torch.cuda.synchronize = torch.npu.synchronize
         torch.cuda.mem_get_info = torch.npu.mem_get_info
 
-
 # TODO: This method will be removed subsequently and implemented in platform.
 @contextmanager
 def _replace_gpu_model_runner_function_wrapper(target_module_name):
@@ -5743,7 +5691,6 @@ def _replace_gpu_model_runner_function_wrapper(target_module_name):
         raise RuntimeError(f"NPUModelRunner failed, error is {e}")
     finally:
         setattr(target_module, "graph_capture", graph_capture)  # noqa: B010
-
 
 # TODO: remove it when flash_comm1 is removed
 @contextmanager

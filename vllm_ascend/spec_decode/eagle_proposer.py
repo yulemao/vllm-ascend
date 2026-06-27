@@ -56,7 +56,6 @@ from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enab
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
 
-
 # TODO: Remove it when the bug of fx-graph is solved
 # patch vllm_config to be in CompilationMode.NONE temporarily
 @contextmanager
@@ -67,7 +66,6 @@ def _maybe_eager_context(vllm_config):
         yield
     finally:
         vllm_config.compilation_config.mode = raw_compilation_config_mode
-
 
 # split hidden states along dimension of sequence
 def split_inputs_tp_to_sp(hidden_states, out):
@@ -88,7 +86,6 @@ def split_inputs_tp_to_sp(hidden_states, out):
     hidden_states_curr_rank = hidden_states[start:end]
     out[: hidden_states_curr_rank.shape[0]] = hidden_states_curr_rank
     return out[:padded_num_tokens_per_rank]
-
 
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
@@ -576,13 +573,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             target_hidden_states = self.model.combine_hidden_states(target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
 
-        # ----- [ACLGRAPH-DBG] checkpoint B: draft _propose 入口, set_inputs_first_pass 之前.
-        # 若 A 通过但 B 失败 -> 错误在 target 与 draft 之间的采样 op. -----
-        print("[ACLGRAPH-DBG] B: _propose 入口 (set_inputs_first_pass 之前)", flush=True)
-        torch.npu.synchronize()
-        print("[ACLGRAPH-DBG] B: sync OK", flush=True)
-        # ----- [ACLGRAPH-DBG] end checkpoint B -----
-
         num_tokens, token_indices_to_sample, common_attn_metadata, long_seq_args = self.set_inputs_first_pass(
             target_token_ids=target_token_ids,
             next_token_ids=next_token_ids,
@@ -596,12 +586,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_prefill_reqs=num_prefill_reqs,
             num_decode_reqs=num_decode_reqs,
         )
-        # ----- [ACLGRAPH-DBG] checkpoint B1: set_inputs_first_pass 之后.
-        # 若 B 通过但 B1 失败 -> set_inputs_first_pass 里的 device op 出错. -----
-        print("[ACLGRAPH-DBG] B1: set_inputs_first_pass 之后", flush=True)
-        torch.npu.synchronize()
-        print("[ACLGRAPH-DBG] B1: sync OK", flush=True)
-        # ----- [ACLGRAPH-DBG] end checkpoint B1 -----
 
         if self.pcp_size * self.dcp_size > 1:
             assert long_seq_args is not None
@@ -640,11 +624,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # is run in eager mode currently, which means `_pad_query_start_loc_for_fia` is not called,
             # while draft model is run in graph model, which means we should pad the `query_start_loc`.
             # Need to be fixed in the future.
-            # ----- [ACLGRAPH-DBG] checkpoint B2: _pad_query_start_loc_for_fia 之前 -----
-            print(f"[ACLGRAPH-DBG] B2: FIA padding 之前 num_tokens={num_tokens} num_input_tokens={num_input_tokens} num_reqs={common_attn_metadata.num_reqs} bd_num_reqs={batch_descriptor.num_reqs}", flush=True)
-            torch.npu.synchronize()
-            print("[ACLGRAPH-DBG] B2: sync OK", flush=True)
-            # ----- [ACLGRAPH-DBG] end checkpoint B2 -----
             num_reqs_padded = self.runner._pad_query_start_loc_for_fia(
                 num_input_tokens,
                 batch_descriptor.num_reqs if batch_descriptor.num_reqs is not None else common_attn_metadata.num_reqs,
@@ -652,12 +631,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 aclgraph_runtime_mode,
                 batch_descriptor.num_reqs,
             )
-            # ----- [ACLGRAPH-DBG] checkpoint B3: _pad_query_start_loc_for_fia 之后.
-            # 若 B2 通过但 B3 失败 -> _pad_query_start_loc_for_fia 写 query_start_loc 越界. -----
-            print(f"[ACLGRAPH-DBG] B3: FIA padding 之后 num_reqs_padded={num_reqs_padded}", flush=True)
-            torch.npu.synchronize()
-            print("[ACLGRAPH-DBG] B3: sync OK", flush=True)
-            # ----- [ACLGRAPH-DBG] end checkpoint B3 -----
             common_attn_metadata.num_reqs = num_reqs_padded
             common_attn_metadata.query_start_loc = self.runner.query_start_loc.gpu[: num_reqs_padded + 1]
             common_attn_metadata.query_start_loc_cpu = self.runner.query_start_loc.cpu[: num_reqs_padded + 1]
@@ -686,13 +659,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 common_attn_metadata.num_computed_tokens_cpu = self._adjust_tensor(
                     common_attn_metadata.num_computed_tokens_cpu, num_reqs_padded
                 )
-
-            # ----- [ACLGRAPH-DBG] checkpoint B4: graph 块内, 所有 _adjust_tensor 之后.
-            # B3 通过但 B4 失败 -> _adjust_tensor (block_table/seq_lens) 越界. -----
-            print(f"[ACLGRAPH-DBG] B4: _adjust_tensor 之后 num_reqs_padded={num_reqs_padded} slicing_length={slicing_length}", flush=True)
-            torch.npu.synchronize()
-            print("[ACLGRAPH-DBG] B4: sync OK", flush=True)
-            # ----- [ACLGRAPH-DBG] end checkpoint B4 -----
 
             if self.pcp_size > 1:
                 pcp_allgather_restore_idx = (
@@ -727,34 +693,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         )
         if self.supports_mm_inputs and not is_cloud_mtp:
             mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
-            # ----- [ACLGRAPH-DBG] checkpoint B4.1: embed_input_ids 之前 -----
-            print(
-                f"[ACLGRAPH-DBG] B4.1: embed_input_ids 之前 "
-                f"num_tokens={num_tokens} input_ids_shape={self.input_ids[:num_tokens].shape} "
-                f"input_ids_min={self.input_ids[:num_tokens].min().item()} "
-                f"input_ids_max={self.input_ids[:num_tokens].max().item()}", flush=True
-            )
-            torch.npu.synchronize()
-            print("[ACLGRAPH-DBG] B4.1: sync OK", flush=True)
-            # ----- [ACLGRAPH-DBG] end checkpoint B4.1 -----
             inputs_embeds = self.model.embed_input_ids(
                 self.input_ids[:num_tokens], multimodal_embeddings=mm_embeds, is_multimodal=is_mm_embed
             )
-            # ----- [ACLGRAPH-DBG] checkpoint B4.2: embed_input_ids 之后 -----
-            print(
-                f"[ACLGRAPH-DBG] B4.2: embed_input_ids 之后 "
-                f"inputs_embeds_shape={inputs_embeds.shape} dtype={inputs_embeds.dtype} "
-                f"device={inputs_embeds.device} contiguous={inputs_embeds.is_contiguous()}", flush=True
-            )
-            torch.npu.synchronize()
-            print("[ACLGRAPH-DBG] B4.2: sync OK", flush=True)
-            # ----- [ACLGRAPH-DBG] end checkpoint B4.2 -----
             self.inputs_embeds[:num_tokens] = inputs_embeds
-            # ----- [ACLGRAPH-DBG] checkpoint B4.3: inputs_embeds 赋值之后 -----
-            print("[ACLGRAPH-DBG] B4.3: inputs_embeds 赋值之后", flush=True)
-            torch.npu.synchronize()
-            print("[ACLGRAPH-DBG] B4.3: sync OK", flush=True)
-            # ----- [ACLGRAPH-DBG] end checkpoint B4.3 -----
             inputs_embeds = self.inputs_embeds[:num_input_tokens]
         else:
             inputs_embeds = None
@@ -768,11 +710,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.slot_mapping_group[0][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping)
         self.slot_mapping_group[0][slot_mapping_lens:].fill_(-1)
         common_attn_metadata.slot_mapping = self.slot_mapping_group[0]
-        # ----- [ACLGRAPH-DBG] checkpoint B4.4: slot_mapping copy 之后 -----
-        print("[ACLGRAPH-DBG] B4.4: slot_mapping copy 之后", flush=True)
-        torch.npu.synchronize()
-        print("[ACLGRAPH-DBG] B4.4: sync OK", flush=True)
-        # ----- [ACLGRAPH-DBG] end checkpoint B4.4 -----
 
         self.seq_lens_group[0][:num_reqs_padded].copy_(common_attn_metadata.seq_lens)
         self.seq_lens_group[0][num_reqs_padded:].fill_(0)
@@ -781,11 +718,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.query_start_loc_group[0][: num_reqs_padded + 1].copy_(common_attn_metadata.query_start_loc)
         self.query_start_loc_group[0][num_reqs_padded + 1 :].fill_(0)
         common_attn_metadata.query_start_loc = self.query_start_loc_group[0][: num_reqs_padded + 1]
-        # ----- [ACLGRAPH-DBG] checkpoint B4.5: seq_lens/query_start_loc copy 之后 -----
-        print("[ACLGRAPH-DBG] B4.5: seq_lens/query_start_loc copy 之后", flush=True)
-        torch.npu.synchronize()
-        print("[ACLGRAPH-DBG] B4.5: sync OK", flush=True)
-        # ----- [ACLGRAPH-DBG] end checkpoint B4.5 -----
 
         common_attn_metadata.num_input_tokens = num_input_tokens
         if self.draft_attn_groups:
@@ -918,24 +850,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         token_indices_to_sample_len = token_indices_to_sample.shape[0]
         self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
-        # ----- [ACLGRAPH-DBG] checkpoint B4.6: token_indices_to_sample copy 之后 -----
-        print("[ACLGRAPH-DBG] B4.6: token_indices_to_sample copy 之后", flush=True)
-        torch.npu.synchronize()
-        print("[ACLGRAPH-DBG] B4.6: sync OK", flush=True)
-        # ----- [ACLGRAPH-DBG] end checkpoint B4.6 -----
-
-        # ----- [ACLGRAPH-DBG] checkpoint B5: set_ascend_forward_context 之前 (含 inputs_embeds / slot_mapping / token_indices copy).
-        # B4 通过但 B5 失败 -> inputs_embeds embed 或 slot_mapping 或 token_indices copy 越界. -----
-        num_negative_input_ids = (self.input_ids[:num_tokens] < 0).sum().item()
-        print(
-            f"[ACLGRAPH-DBG] B5: forward_context 之前 supports_mm_inputs={self.supports_mm_inputs} "
-            f"inputs_embeds_is_None={inputs_embeds is None} num_tokens={num_tokens} "
-            f"num_input_tokens={num_input_tokens} num_negative_input_ids={num_negative_input_ids}",
-            flush=True,
-        )
-        torch.npu.synchronize()
-        print("[ACLGRAPH-DBG] B5: sync OK", flush=True)
-        # ----- [ACLGRAPH-DBG] end checkpoint B5 -----
 
         with set_ascend_forward_context(
             multi_steps_attn_metadata[0] if multi_steps_attn_metadata else None,
@@ -963,13 +877,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 "num_tokens": num_tokens,
                 "is_prefill": attn_metadata_i.num_prefills if attn_metadata_i is not None else 0,
             }
-            # ----- [ACLGRAPH-DBG] checkpoint C: set_inputs_first_pass 之后, run_draft 之前.
-            # 若 B 通过但 C 失败 -> 错误在 set_inputs_first_pass
-            # (写 self.input_ids / self.hidden_states 的 index_put). -----
-            print("[ACLGRAPH-DBG] C: set_inputs_first_pass 之后, run_draft 之前", flush=True)
-            torch.npu.synchronize()
-            print("[ACLGRAPH-DBG] C: sync OK", flush=True)
-            # ----- [ACLGRAPH-DBG] end checkpoint C -----
 
             run_draft = partial(self._runnable, **model_inputs)
 
@@ -995,17 +902,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
         # speculative tokens' proposings. `model_input_ids`, `model_positions` and
         # `model_hidden_states` represent the speculative model inputs.
-        # ----- [ACLGRAPH-DBG] checkpoint D: _run_merged_draft 入口, draft segment "a"
-        # (embed+fc) 之前. 这就是你之前加 print(self.input_ids) 的位置.
-        # 若 C 通过但 D 的 sync 失败 -> 错误在 set_inputs 与 draft 前向之间的 dispatch/pad op.
-        # 若 D 的 sync 通过但仍崩 -> draft 的 embed (segment "a" 对 -1 查表) 就是元凶.
-        # num_negative>0 即坐实 -1 进入了 draft 的 embedding. -----
-        print(f"[ACLGRAPH-DBG] D: _run_merged_draft 入口 num_tokens={num_tokens} num_input_tokens={num_input_tokens}", flush=True)
-        torch.npu.synchronize()
-        print("[ACLGRAPH-DBG] D: sync OK", flush=True)
-        _dbg_neg_d = (self.input_ids[:num_input_tokens] < 0).sum().item()
-        print(f"[ACLGRAPH-DBG] D: drafter input_ids[:{num_input_tokens}] 负值个数={_dbg_neg_d}", flush=True)
-        # ----- [ACLGRAPH-DBG] end checkpoint D -----
         model_input_ids = self.input_ids[:num_input_tokens]
         model_positions = self._get_positions(num_input_tokens)
 
@@ -1870,45 +1766,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             grid_size = min(num_blocks_needed, num_vector_core)
             grid = (grid_size,)
 
-            # ----- [PIP-DBG] confirm prepare_inputs_padded padding-mismatch OOB.
-            # `num_reqs` comes from common_attn_metadata (possibly graph-padded),
-            # while cu_num_draft_tokens / query_start_loc come from the
-            # scheduler's spec_decode_metadata (real size). If num_reqs is larger
-            # than the real buffer size, the kernel reads past them -> MTE out of
-            # range. -----
-            _real_num_reqs = len(spec_decode_metadata.num_draft_tokens)
-            print(
-                f"[PIP-DBG] num_reqs(kernel arg)={num_reqs}"
-                f" real_num_reqs={_real_num_reqs}"
-                f" padded?={num_reqs != _real_num_reqs}"
-                f" cu_num_draft_tokens.shape="
-                f"{tuple(spec_decode_metadata.cu_num_draft_tokens.shape)}"
-                f" query_start_loc.shape="
-                f"{tuple(common_attn_metadata.query_start_loc.shape)}"
-                f" valid_sampled_tokens_count.shape="
-                f"{tuple(valid_sampled_tokens_count.shape)}",
-                flush=True,
-            )
-            # ----- end [PIP-DBG] -----
-
-            # ----- [PIP-DBG] BEFORE kernel: device-wide sync, then dump input
-            # DATA. The device sync drains everything enqueued so far, INCLUDING
-            # the overlapping async input-prep stream. If it crashes here, the
-            # fault was enqueued BEFORE prepare_inputs_padded_kernel (i.e. the
-            # overlapping input-prep), not in this kernel. If it passes, the
-            # printed values are the exact inputs the kernel is about to read. -----
-            print("[PIP-DBG] before kernel, device-syncing...", flush=True)
-            torch.npu.synchronize()
-            print("[PIP-DBG] pre-kernel device-sync OK; dumping input data:",
-                  flush=True)
-            print("[PIP-DBG]   cu_num_draft_tokens =",
-                  spec_decode_metadata.cu_num_draft_tokens, flush=True)
-            print("[PIP-DBG]   query_start_loc =",
-                  common_attn_metadata.query_start_loc, flush=True)
-            print("[PIP-DBG]   valid_sampled_tokens_count =",
-                  valid_sampled_tokens_count, flush=True)
-            # ----- end [PIP-DBG] -----
-
             prepare_inputs_padded_kernel[grid](
                 cu_num_draft_tokens_k,
                 valid_sampled_tokens_count_k,
@@ -1921,16 +1778,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Slice the real rows back out of the padded output buffers.
             token_indices_to_sample = token_indices_to_sample_k[:num_reqs]
             num_rejected_tokens_gpu = num_rejected_tokens_gpu_k[:num_reqs]
-
-            # ----- [PIP-DBG] compute-stream sync right after the kernel. NOTE:
-            # this is current_stream() (NOT device-wide) so it does NOT drain the
-            # overlapping async input-prep stream -- if this passes but a later
-            # device sync / synchronize_input_prep crashes, the fault is on the
-            # input-prep stream, not here. -----
-            print("[PIP-DBG] prepare_inputs_padded_kernel launched, syncing (compute stream)...", flush=True)
-            torch.npu.current_stream().synchronize()
-            print("[PIP-DBG] sync OK (compute stream)", flush=True)
-            # ----- end [PIP-DBG] -----
         else:
             num_draft_tokens_gpu = torch.cat(
                 [
@@ -2251,7 +2098,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if hidden_states is not None:
                     hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states.contiguous(), True)
         return last_hidden_states, positions, hidden_states
-
 
 class AscendEagleProposer(EagleProposer, AscendSpecDecodeBaseProposer):
     def __init__(

@@ -48,6 +48,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
 from vllm_ascend.distributed.parallel_state import edge_cloud_broadcast_recv
+from vllm_ascend.ops.triton.reject_sample import pad_tail_to
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
@@ -1845,8 +1846,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_reqs = common_attn_metadata.num_reqs
             device = valid_sampled_tokens_count.device
 
-            token_indices_to_sample = torch.empty((num_reqs,), dtype=torch.int32, device=device)
-            num_rejected_tokens_gpu = torch.empty((num_reqs,), dtype=torch.int32, device=device)
+            # Pad offset-indexed inputs/outputs so the kernel's BLOCK-wide tile
+            # accesses stay in mapped memory. On Ascend the MTE reads/writes the
+            # full BLOCK tile and applies the lane mask only afterward, so the
+            # masked tail lanes (offsets reach num_reqs+BLOCK-2) still touch DDR;
+            # with tight per-step buffers that overrun faults ("MTE address out
+            # of range" / 507035). num_reqs passed to the kernel stays the real
+            # value so the padded lanes are inert; the real rows are sliced back
+            # out below. (The non-edge-cloud path is immune only because its
+            # batch is already graph-padded; this makes edge-cloud match.)
+            _pad_n = num_reqs + _PREPARE_INPUTS_BLOCK_SIZE
+            token_indices_to_sample_k = torch.empty((_pad_n,), dtype=torch.int32, device=device)
+            num_rejected_tokens_gpu_k = torch.empty((_pad_n,), dtype=torch.int32, device=device)
+            cu_num_draft_tokens_k = pad_tail_to(
+                spec_decode_metadata.cu_num_draft_tokens, _pad_n, repeat_last=True
+            )
+            valid_sampled_tokens_count_k = pad_tail_to(valid_sampled_tokens_count, _pad_n)
+            query_start_loc_k = pad_tail_to(
+                common_attn_metadata.query_start_loc, _pad_n + 1, repeat_last=True
+            )
             num_blocks_needed = triton.cdiv(num_reqs, _PREPARE_INPUTS_BLOCK_SIZE)
             num_vector_core = get_vectorcore_num()
             grid_size = min(num_blocks_needed, num_vector_core)
@@ -1892,14 +1910,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # ----- end [PIP-DBG] -----
 
             prepare_inputs_padded_kernel[grid](
-                spec_decode_metadata.cu_num_draft_tokens,
-                valid_sampled_tokens_count,
-                common_attn_metadata.query_start_loc,
-                token_indices_to_sample,
-                num_rejected_tokens_gpu,
+                cu_num_draft_tokens_k,
+                valid_sampled_tokens_count_k,
+                query_start_loc_k,
+                token_indices_to_sample_k,
+                num_rejected_tokens_gpu_k,
                 num_reqs,
                 BLOCK_SIZE=_PREPARE_INPUTS_BLOCK_SIZE,
             )
+            # Slice the real rows back out of the padded output buffers.
+            token_indices_to_sample = token_indices_to_sample_k[:num_reqs]
+            num_rejected_tokens_gpu = num_rejected_tokens_gpu_k[:num_reqs]
 
             # ----- [PIP-DBG] compute-stream sync right after the kernel. NOTE:
             # this is current_stream() (NOT device-wide) so it does NOT drain the

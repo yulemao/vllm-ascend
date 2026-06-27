@@ -38,42 +38,27 @@ def prepare_inputs_padded_kernel(
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < num_reqs
 
-        # NOTE: Ascend's MTE issues the full contiguous BLOCK_SIZE-wide tile
-        # read from DDR and only applies `mask` afterward in the vector unit, so
-        # masked-off lanes still touch their address. With BLOCK_SIZE=4 and tiny
-        # buffers (cu_num_draft_tokens / valid_sampled_tokens_count are
-        # [num_reqs]; query_start_loc is [num_reqs + 1]) the lanes beyond
-        # num_reqs -- and the offsets-1 == -1 lane below -- point past/before the
-        # allocation. When such a buffer sits near a page boundary the overrun
-        # hits unmapped memory -> "MTE address out of range" / vector core
-        # exception. Clamp every load address into its valid range; `mask` still
-        # guarantees only in-range lanes are stored, so results are unchanged.
-        safe_offsets = tl.minimum(offsets, num_reqs - 1)
-
         # Calculate num_draft_tokens from cu_num_draft_tokens, which is an inclusive
         # cumulative sum (first entry is the first value, not zero).
-        cu_draft_curr = tl.load(cu_num_draft_tokens_ptr + safe_offsets, mask=mask, other=0)
+        cu_draft_curr = tl.load(cu_num_draft_tokens_ptr + offsets, mask=mask)
 
         prev_indices = offsets - 1
         has_prev = offsets > 0
-        safe_prev_indices = tl.minimum(tl.maximum(prev_indices, 0), num_reqs - 1)
         cu_draft_prev = tl.load(
-            cu_num_draft_tokens_ptr + safe_prev_indices,
+            cu_num_draft_tokens_ptr + prev_indices,
             mask=mask & has_prev,
             other=0,
         )
 
         num_draft_tokens = tl.where(has_prev, cu_draft_curr - cu_draft_prev, cu_draft_curr)
 
-        valid_count = tl.load(valid_sampled_tokens_count_ptr + safe_offsets, mask=mask, other=0)
+        valid_count = tl.load(valid_sampled_tokens_count_ptr + offsets, mask=mask)
         num_rejected = num_draft_tokens + 1 - valid_count
         num_rejected = tl.where(num_draft_tokens > 0, num_rejected, 0)
 
         # query_start_loc[req_idx + 1] is the start position of the next request,
-        # which is one past the last token of this request. query_start_loc has
-        # num_reqs + 1 entries, so the max valid index is num_reqs.
-        safe_q_offsets = tl.minimum(offsets + 1, num_reqs)
-        q_last_tok_idx = tl.load(query_start_loc_gpu_ptr + safe_q_offsets, mask=mask, other=0) - 1
+        # which is one past the last token of this request.
+        q_last_tok_idx = tl.load(query_start_loc_gpu_ptr + offsets + 1, mask=mask) - 1
 
         index_to_sample = q_last_tok_idx - num_rejected
         tl.store(token_indices_to_sample_ptr + offsets, index_to_sample, mask=mask)

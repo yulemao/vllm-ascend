@@ -13,6 +13,8 @@ from vllm.v1.sample.rejection_sampler import (
 from vllm_ascend.ops.triton.reject_sample import (
     cal_grid_and_block_size,
     expand_triton,
+    pad_cu_for_kernel,
+    pad_tail_to,
     rejection_greedy_sample_with_triton,
     rejection_random_sample_block_verify_kernel,
     rejection_random_sample_kernel,
@@ -117,9 +119,26 @@ def rejection_sample(
     # to avoid incorrect verification results.
     using_block_verify = max_spec_len >= 3 and draft_probs is not None
 
-    # Create output buffer.
+    # On Ascend the Triton sampling kernels below read/write a full BLOCK_SIZE
+    # tile per block and apply the lane mask only afterward, so a launched lane
+    # past the real batch still TOUCHES DDR -- and a masked cu load even returns
+    # garbage that drives an out-of-bounds inner loop. We therefore launch with
+    # NO masked lanes: pad every offset-indexed buffer up to grid*block_size and
+    # pass vec_len = grid*block_size, so every lane is a valid, in-bounds access.
+    # Padded lanes get num_draft_tokens == 0 (cu repeats its last value) and only
+    # write a bonus token into padded output rows, which are sliced off before
+    # returning. This is what makes edge-cloud match the non-edge-cloud path
+    # (whose batch is already graph-padded, so these buffers already have slack).
+    if HAS_TRITON:
+        grid, block_size = cal_grid_and_block_size(batch_size)
+        pad_len = grid * block_size
+    else:
+        pad_len = batch_size
+
+    # Create output buffer (padded rows for the kernels; sliced to batch_size at
+    # return).
     output_token_ids = torch.empty(
-        (batch_size, max_spec_len + 1),
+        (pad_len, max_spec_len + 1),
         dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.
         device=device,
     )
@@ -129,8 +148,22 @@ def rejection_sample(
         is_greedy = None
     else:
         is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
-    if HAS_TRITON:
-        grid, block_size = cal_grid_and_block_size(batch_size)
+
+    if HAS_TRITON and pad_len > batch_size:
+        # cu uses a front-guard + tail view (pad_cu_for_kernel): the front guard
+        # makes the offset-1 == -1 tile read at block 0 land in mapped memory
+        # (the actual Ascend fault), and the repeated-last tail makes padded
+        # lanes see num_draft_tokens == 0. is_greedy padded with 1 (greedy) so
+        # the random kernels skip padded lanes; bonus repeats its last row so a
+        # padded greedy lane has a valid bonus source (written into sliced-off
+        # output rows).
+        cu_num_draft_tokens_k = pad_cu_for_kernel(cu_num_draft_tokens, pad_len)
+        bonus_token_ids_k = pad_tail_to(bonus_token_ids, pad_len, repeat_last=True)
+        is_greedy_k = None if is_greedy is None else pad_tail_to(is_greedy, pad_len, fill=1)
+    else:
+        cu_num_draft_tokens_k = cu_num_draft_tokens
+        bonus_token_ids_k = bonus_token_ids
+        is_greedy_k = is_greedy
     if not sampling_metadata.all_random:
         # Rejection sampling for greedy sampling requests.
         target_argmax = target_logits.argmax(dim=-1)
@@ -138,11 +171,11 @@ def rejection_sample(
             rejection_greedy_sample_with_triton(
                 output_token_ids,
                 num_draft_tokens,
-                cu_num_draft_tokens,
+                cu_num_draft_tokens_k,
                 draft_token_ids,
                 target_argmax,
-                bonus_token_ids,
-                is_greedy,
+                bonus_token_ids_k,
+                is_greedy_k,
                 max_spec_len,
                 grid,
                 block_size,
@@ -167,7 +200,7 @@ def rejection_sample(
                     is_greedy,
                 )
         if sampling_metadata.all_greedy:
-            return output_token_ids
+            return output_token_ids[:batch_size]
 
     # Compute probability distribution from target logits.
     target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
@@ -200,17 +233,17 @@ def rejection_sample(
         if HAS_TRITON:
             rejection_random_sample_kernel[(grid,)](
                 output_token_ids,
-                cu_num_draft_tokens,
+                cu_num_draft_tokens_k,
                 draft_token_ids,
                 draft_probs,
                 target_probs,
-                bonus_token_ids,
+                bonus_token_ids_k,
                 recovered_token_ids,
                 uniform_probs.to(torch.float32),
-                is_greedy,
+                is_greedy_k,
                 max_spec_len,
                 vocab_size,
-                batch_size,
+                pad_len,
                 NO_DRAFT_PROBS=draft_probs is None,
                 BLOCK_SIZE=block_size,
             )
@@ -235,17 +268,17 @@ def rejection_sample(
         if HAS_TRITON:
             rejection_random_sample_block_verify_kernel[(grid,)](
                 output_token_ids,
-                cu_num_draft_tokens,
+                cu_num_draft_tokens_k,
                 draft_token_ids,
                 draft_probs,
                 target_probs,
-                bonus_token_ids,
+                bonus_token_ids_k,
                 recovered_token_ids,
                 uniform_probs.to(torch.float32),
-                is_greedy,
+                is_greedy_k,
                 max_spec_len,
                 vocab_size,
-                batch_size,
+                pad_len,
                 NO_DRAFT_PROBS=draft_probs is None,
                 BLOCK_SIZE=block_size,
                 SUB_BLOCK=4 * 1024,
@@ -265,8 +298,7 @@ def rejection_sample(
                 vocab_size,
                 IS_NGRAM=draft_probs is None,
             )
-    return output_token_ids
-
+    return output_token_ids[:batch_size]
 
 def expand_batch_to_tokens(
     x: torch.Tensor,  # [batch_size]
@@ -296,10 +328,19 @@ def expand_batch_to_tokens(
     """
     batch_size = x.shape[0]
     assert cu_num_tokens.shape[0] == batch_size
-    expanded_x = x.new_empty(num_tokens)
     if HAS_TRITON:
-        expand_triton(batch_size, expanded_x, x, cu_num_tokens, replace_from, replace_to, max_num_tokens=MAX_SPEC_LEN)
+        # Over-allocate by MAX_SPEC_LEN: expand_kernel's inner store loop runs a
+        # full MAX_NUM_TOKENS-wide masked store for every lane, including the
+        # padded tail lanes whose base index sits at the end of the buffer. On
+        # Ascend even a fully-masked store can touch its tile address, so the
+        # extra tail keeps that in mapped memory. The real rows are sliced back.
+        expanded_x_full = x.new_empty(num_tokens + MAX_SPEC_LEN)
+        expand_triton(
+            batch_size, expanded_x_full, x, cu_num_tokens, replace_from, replace_to, max_num_tokens=MAX_SPEC_LEN
+        )
+        expanded_x = expanded_x_full[:num_tokens]
     else:
+        expanded_x = x.new_empty(num_tokens)
         expand_pytorch(
             expanded_x,
             x,

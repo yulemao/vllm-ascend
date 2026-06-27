@@ -21,6 +21,10 @@ from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5_MoeMixtureOfExperts,
 )
 from vllm.model_executor.models.qwen3_next import QwenNextMixtureOfExperts
+from vllm.model_executor.models.qwen3_5_mtp import (
+    Qwen3_5MTP,
+    Qwen3_5MultiTokenPredictor,
+)
 from vllm.sequence import IntermediateTensors
 
 
@@ -269,3 +273,127 @@ Qwen3_5_MoeMixtureOfExperts.update_physical_experts_metadata = (
     _qwen3_5_update_physical_experts_metadata
 )
 Qwen3_5_MoeMixtureOfExperts.set_moe_parameters = _qwen3_5_set_moe_parameters
+
+
+def _forward_edge_cloud_segment_qwen3_5_mtp(
+    self: Qwen3_5MultiTokenPredictor,
+    start_layer: int,
+    end_layer: int,
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    intermediate_tensors: IntermediateTensors | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+    spec_step_idx: int = 0,
+    is_first_segment: bool | None = None,
+    is_last_segment: bool | None = None,
+    **extra_layer_kwargs: Any,
+) -> torch.Tensor | IntermediateTensors:
+    # All MTP decoder layers run on the cloud side; edge only handles
+    # embed+fc (first segment) and norm (last segment).  start_layer/end_layer
+    # are kept in the signature for backward compatibility but ignored here.
+    num_layers = len(self.layers)
+
+    if is_first_segment is None:
+        is_first_segment = start_layer == 0
+    if is_last_segment is None:
+        is_last_segment = end_layer == num_layers
+
+    if is_first_segment:
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+        hidden_states = self.fc(hidden_states)
+        residual = None
+    else:
+        assert intermediate_tensors is not None, (
+            "intermediate_tensors is None in MTP edge-cloud segment; "
+            "check that all TP ranks receive tensors correctly."
+        )
+        hidden_states = intermediate_tensors["hidden_states"]
+        residual = intermediate_tensors["residual"]
+
+    # Cloud segment: execute exactly one decoder layer selected by spec_step_idx.
+    if not is_first_segment and not is_last_segment:
+        actual_idx = spec_step_idx % self.num_mtp_layers
+        hidden_states, residual = self.layers[actual_idx](
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=residual,
+        )
+
+    if not is_last_segment:
+        return IntermediateTensors(
+            {"hidden_states": hidden_states, "residual": residual}
+        )
+
+    hidden_states, _ = self.norm(hidden_states, residual)
+    return hidden_states
+
+
+def _qwen3_5_mtp_forward_edge_cloud_segment(
+    self: Qwen3_5MTP,
+    start_layer: int,
+    end_layer: int,
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor,
+    intermediate_tensors: IntermediateTensors | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+    **extra_layer_kwargs: Any,
+) -> torch.Tensor | IntermediateTensors:
+    hidden_states = extra_layer_kwargs.pop("hidden_states", None)
+    spec_step_idx = extra_layer_kwargs.pop("spec_step_idx", 0)
+    return self.model.forward_edge_cloud_segment(
+        start_layer,
+        end_layer,
+        input_ids,
+        positions,
+        hidden_states,
+        intermediate_tensors,
+        inputs_embeds,
+        spec_step_idx,
+        **extra_layer_kwargs,
+    )
+
+
+Qwen3_5MultiTokenPredictor.forward_edge_cloud_segment = (
+    _forward_edge_cloud_segment_qwen3_5_mtp
+)
+Qwen3_5MTP.forward_edge_cloud_segment = _qwen3_5_mtp_forward_edge_cloud_segment
+
+# Patch supports_pp for Qwen3_5MTP to enable pipeline parallelism.
+# Qwen3_5MTP.forward already accepts intermediate_tensors, but the class
+# does not declare SupportsPP, so is_pp_supported_model returns False.
+Qwen3_5MTP.supports_pp = True
+
+
+def _qwen3_5_mtp_make_empty_intermediate_tensors(
+    self: Qwen3_5MTP,
+    batch_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+):
+    return self.model.make_empty_intermediate_tensors(batch_size, dtype, device)
+
+
+Qwen3_5MTP.make_empty_intermediate_tensors = _qwen3_5_mtp_make_empty_intermediate_tensors
+
+# Clear stale _ModelInfo caches so that inspect_model_cls re-computes
+# supports_pp with the patched class instead of loading the old cached value.
+from pathlib import Path  # noqa: E402
+
+from vllm.envs import VLLM_CACHE_ROOT  # noqa: E402
+from vllm.model_executor.models.registry import _try_inspect_model_cls  # noqa: E402
+
+# Clear in-memory lru_cache in case it was populated before the patch.
+_try_inspect_model_cls.cache_clear()
+
+# Clear on-disk cache files for qwen3_5_mtp so the next inspect runs
+# _ModelInfo.from_model_cls on the patched class.
+_cache_dir = Path(VLLM_CACHE_ROOT) / "modelinfos"
+if _cache_dir.exists():
+    for _cache_file in _cache_dir.glob("*qwen3_5_mtp*"):
+        _cache_file.unlink()

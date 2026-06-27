@@ -163,6 +163,101 @@ class LayerShardLoader:
                 if prefix not in removed_prefixes
             ]
 
+    @staticmethod
+    def _get_mtp_model(model: nn.Module) -> nn.Module | None:
+        if hasattr(model, "model") and hasattr(model.model, "layers"):
+            inner = model.model
+            if hasattr(inner, "fc") and hasattr(inner, "embed_tokens"):
+                return inner
+        if hasattr(model, "layers") and hasattr(model, "fc"):
+            return model
+        return None
+
+    @classmethod
+    def apply_sharding_to_mtp(
+        cls,
+        mtp_model: nn.Module,
+        layer_plan: EdgeCloudLayerPlan,
+        compilation_config: Any = None,
+    ) -> None:
+        predictor = cls._get_mtp_model(mtp_model)
+        if predictor is None:
+            return
+
+        layers = predictor.layers
+
+        # All MTP decoder layers run on the cloud side; edge only keeps
+        # embed+fc and norm modules.
+        if layer_plan.role == "cloud":
+            local_layers = set(range(len(layers)))
+        else:
+            local_layers = set()
+
+        # Capture MTP module ids before replacing layers, so we only clean
+        # compilation_config entries that originally belong to the MTP model.
+        # Otherwise _clean_compilation_config would also delete the main model's
+        # static_forward_context entries since they are not in mtp_model.
+        if compilation_config is not None:
+            mtp_module_ids = {id(module) for _, module in mtp_model.named_modules()}
+
+        converted = 0
+        for i in range(len(layers)):
+            if i not in local_layers and not isinstance(layers[i], PPMissingLayer):
+                old_layer = layers[i]
+                layers[i] = PPMissingLayer()
+                del old_layer
+                converted += 1
+
+        if layer_plan.role == "cloud":
+            for module_name in (
+                "embed_tokens",
+                "fc",
+                "norm",
+                "pre_fc_norm_hidden",
+                "pre_fc_norm_embedding",
+            ):
+                module = getattr(predictor, module_name, None)
+                if module is not None and not isinstance(module, PPMissingLayer):
+                    setattr(predictor, module_name, PPMissingLayer())
+            if (
+                hasattr(mtp_model, "lm_head")
+                and not isinstance(mtp_model.lm_head, PPMissingLayer)
+            ):
+                mtp_model.lm_head = PPMissingLayer()
+
+        if compilation_config is not None:
+            current_mtp_module_ids = {
+                id(module) for _, module in mtp_model.named_modules()
+            }
+            removed_prefixes: list[str] = []
+            for prefix in list(compilation_config.static_forward_context.keys()):
+                module = compilation_config.static_forward_context[prefix]
+                if id(module) in mtp_module_ids and id(module) not in current_mtp_module_ids:
+                    del compilation_config.static_forward_context[prefix]
+                    removed_prefixes.append(prefix)
+
+            if removed_prefixes:
+                logger.info(
+                    "[LayerShardLoader] MTP removed %d stale static_forward_context "
+                    "entries: %s",
+                    len(removed_prefixes),
+                    removed_prefixes,
+                )
+
+            if hasattr(compilation_config, "static_all_moe_layers"):
+                compilation_config.static_all_moe_layers[:] = [
+                    prefix
+                    for prefix in compilation_config.static_all_moe_layers
+                    if prefix not in removed_prefixes
+                ]
+
+        logger.info(
+            "[LayerShardLoader] MTP sharding role=%s local_layers=%s converted=%d",
+            layer_plan.role,
+            sorted(local_layers),
+            converted,
+        )
+
     @classmethod
     def validate_sharding(cls, model: nn.Module, layer_plan: EdgeCloudLayerPlan) -> None:
         layers = cls._get_transformer_model(model).layers

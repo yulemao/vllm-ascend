@@ -350,6 +350,13 @@ class NPUModelRunner(GPUModelRunner):
         # that code paths reaching _prepare_inputs before the first execute_model
         # call (e.g. profile_run or unit tests) do not hit AttributeError.
         self._is_edge_cloud_embed_only_tail = False
+        # Edge-cloud embedding_only MTP only: per-request count of the previous
+        # step's rejected draft tokens, keyed by req_id. Used to correct the
+        # scheduler's optimistic num_computed_tokens when async scheduling (and
+        # thus the GPU correction kernel) is disabled. None until the first
+        # decode step produces a value. See _prepare_inputs for how it is
+        # consumed and execute_model/sample_tokens for where it is populated.
+        self._ec_prev_rejected: dict[str, int] | None = None
         if self._edge_cloud_enabled:
             if not self.parallel_config.enable_edge_cloud:
                 raise ValueError(
@@ -1354,6 +1361,33 @@ class NPUModelRunner(GPUModelRunner):
                     self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
                     non_blocking=True,
                 )
+
+        # Edge-cloud embedding_only MTP, non-async path only: the scheduler's
+        # num_computed_tokens is optimistic (assumes every drafted token of the
+        # previous step was accepted), and the GPU correction kernel above only
+        # runs under async spec decode. Without async scheduling nothing undoes
+        # the over-count, so seq_lens/positions/KV reads drift by the number of
+        # rejected draft tokens, corrupting the MTP draft context and collapsing
+        # the hit rate. Subtract the previous step's rejected count here, mirroring
+        # what the kernel does for async. This block is inert for every non
+        # edge-cloud configuration and for the async path.
+        if (
+            self._edge_cloud_enabled
+            and self.edge_cloud_cfg.mode == "embedding_only"
+            and self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and not self.use_async_spec_decode
+            and not self._is_edge_cloud_embed_only_tail
+            and self._ec_prev_rejected
+        ):
+            rej_np = np.zeros(num_reqs, dtype=np.int32)
+            for i, rid in enumerate(self.input_batch.req_ids[:num_reqs]):
+                rej_np[i] = self._ec_prev_rejected.get(rid, 0)
+            if rej_np.any():
+                self.num_computed_tokens[:num_reqs] -= torch.from_numpy(rej_np).to(
+                    self.num_computed_tokens.device, non_blocking=True
+                )
+                self.optimistic_seq_lens_cpu[:num_reqs] -= torch.from_numpy(rej_np)
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
         self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
@@ -2498,6 +2532,16 @@ class NPUModelRunner(GPUModelRunner):
                     num_reqs = num_accepted.size(0)
                     self.num_accepted_tokens.gpu[:num_reqs] = num_accepted
 
+                    # Stash this step's rejected draft-token count (cloud side)
+                    # so the next _prepare_inputs can undo the scheduler's
+                    # optimistic num_computed_tokens under non-async scheduling.
+                    # Use the CPU tensor received from the edge to avoid an extra
+                    # device sync; this is a no-op unless we are in the
+                    # embedding_only MTP non-async scenario.
+                    self._ec_stash_prev_rejected(
+                        tensor_dict["num_accepted_tokens"]
+                    )
+
                     # For embed_only MTP, the cloud also needs the rejection-
                     # corrected valid_sampled_token_count and the prev-batch
                     # request mapping so that _prepare_inputs can run the async
@@ -2666,6 +2710,10 @@ class NPUModelRunner(GPUModelRunner):
             ):
                 num_reqs = sampler_output.sampled_token_ids.size(0)
                 num_accepted = (sampler_output.sampled_token_ids != -1).sum(dim=1).cpu()
+                # Stash this step's rejected draft-token count so the next
+                # _prepare_inputs can undo the scheduler's optimistic
+                # num_computed_tokens under non-async scheduling (edge side).
+                self._ec_stash_prev_rejected(num_accepted)
                 tensor_dict_to_send = {"num_accepted_tokens": num_accepted}
                 if (
                     self.edge_cloud_cfg.mode == "embedding_only"
@@ -2762,6 +2810,42 @@ class NPUModelRunner(GPUModelRunner):
             async_output.async_copy_ready_event,
         )
         return async_output
+
+    def _ec_stash_prev_rejected(self, num_accepted: torch.Tensor) -> None:
+        """Record this step's per-request rejected draft-token count for the
+        edge-cloud embedding_only MTP non-async correction applied in the next
+        ``_prepare_inputs``.
+
+        ``num_accepted`` is the per-request number of accepted tokens (bonus
+        token included), i.e. ``(sampled_token_ids != -1).sum(dim=1)``. The
+        over-count introduced by the scheduler's optimistic num_computed_tokens
+        equals ``num_draft + 1 - num_accepted`` for each request that carried
+        draft tokens. Result is keyed by req_id because the batch may be
+        reordered or churned between steps in non-async mode.
+
+        No-op outside the embedding_only MTP non-async scenario, so it never
+        affects other configurations or the async path.
+        """
+        if not (
+            self._edge_cloud_enabled
+            and self.edge_cloud_cfg.mode == "embedding_only"
+            and self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and not self.use_async_spec_decode
+        ):
+            return
+        scheduler_output = self._last_scheduler_output
+        if scheduler_output is None:
+            self._ec_prev_rejected = None
+            return
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        accepted_list = num_accepted.tolist()
+        prev: dict[str, int] = {}
+        for i, rid in enumerate(self.input_batch.req_ids):
+            num_draft = len(spec_tokens.get(rid, ())) if spec_tokens else 0
+            if num_draft > 0 and i < len(accepted_list):
+                prev[rid] = num_draft + 1 - int(accepted_list[i])
+        self._ec_prev_rejected = prev
 
     def _build_mtp_cloud_attn_metadata(
         self,

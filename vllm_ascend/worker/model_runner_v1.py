@@ -864,7 +864,7 @@ class NPUModelRunner(GPUModelRunner):
             role=self.edge_cloud_cfg.role,
             total_layers=num_mtp_layers,
             k=[0, 0],
-            mode="head_tail",
+            mode="embedding_only",
         )
 
         LayerShardLoader.apply_sharding_to_mtp(

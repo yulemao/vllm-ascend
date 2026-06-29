@@ -895,7 +895,30 @@ class RecomputeScheduler(Scheduler):
             # Check for stop and update request status.
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
-            elif request.pooling_params and pooler_output is not None:
+
+            # ----- [EC-DBG][sched-commit] scheduler-side commit probe. Shows what
+            # the engine's update_from_output actually receives and commits for
+            # this request, i.e. the authoritative state the NEXT schedule reads
+            # (worker [reqstate] reflects CachedRequestState, a different object).
+            # If n_out_after stays 0 after the prefill, the bonus token never
+            # reaches the scheduler Request -> verify window loses its +1. Remove
+            # once localized. -----
+            if self._ec_embed_only_edge_spec:
+                try:
+                    print(
+                        f"[EC-DBG][sched-commit] rid={req_id[:8]} "
+                        f"gen={list(generated_token_ids)} "
+                        f"has_sched_spec={bool(scheduled_spec_token_ids)} "
+                        f"num_computed={request.num_computed_tokens} "
+                        f"n_out_after={len(request.output_token_ids)} "
+                        f"placeholders={request.num_output_placeholders} "
+                        f"n_spec={len(request.spec_token_ids)}",
+                        flush=True,
+                    )
+                except Exception as _e:
+                    print(f"[EC-DBG][sched-commit] print failed: {_e}", flush=True)
+            # ----- end [EC-DBG] -----
+            if not new_token_ids and request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True

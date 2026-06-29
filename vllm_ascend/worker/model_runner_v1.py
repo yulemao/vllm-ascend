@@ -346,6 +346,16 @@ class NPUModelRunner(GPUModelRunner):
         # because the drafter setup needs to know whether edge-cloud is enabled.
         self.edge_cloud_cfg = self.ascend_config.edge_cloud_config
         self._edge_cloud_enabled = self.edge_cloud_cfg.enabled
+        # ----- [EC-DBG] debug gate + role label. The probes below must also fire
+        # in non-edge-cloud spec-decode runs so an edge-cloud run and a plain
+        # (non-edge-cloud) MTP run can be diffed side by side. Gate on either
+        # edge-cloud OR speculative decoding being active. role is the real
+        # edge/cloud role when edge-cloud is on, else "noEC" so the two runs are
+        # never confused (edge_cloud_cfg.role defaults to "edge" even when off).
+        # Remove together with the rest of the [EC-DBG] probes. -----
+        self._ec_dbg = self._edge_cloud_enabled or (self.speculative_config is not None)
+        self._ec_dbg_role = self.edge_cloud_cfg.role if self._edge_cloud_enabled else "noEC"
+        # ----- end [EC-DBG] -----
         # This flag is set per-step in execute_model; initialize it here so
         # that code paths reaching _prepare_inputs before the first execute_model
         # call (e.g. profile_run or unit tests) do not hit AttributeError.
@@ -1388,9 +1398,9 @@ class NPUModelRunner(GPUModelRunner):
         # ----- [EC-DBG] TARGET model attn inputs. Same drafts but different
         # target logits between async/sync => target forward reads wrong
         # KV/positions. Diff these. Remove once localized. -----
-        if self._edge_cloud_enabled:
+        if self._ec_dbg:
             try:
-                _role = getattr(self.edge_cloud_cfg, "role", "?")
+                _role = self._ec_dbg_role
                 print(
                     f"[EC-DBG][prep_inputs] role={_role} async={self.use_async_scheduling} "
                     f"tail={self._is_edge_cloud_embed_only_tail} num_reqs={num_reqs} "
@@ -1727,10 +1737,10 @@ class NPUModelRunner(GPUModelRunner):
         # ----- [EC-DBG] verify logits index mapping. If sync's target/bonus
         # logits indices are shifted vs async, that's the mis-aligned verify
         # window. Diff async vs sync. Remove once localized. -----
-        if self._edge_cloud_enabled:
+        if self._ec_dbg:
             try:
                 print(
-                    f"[EC-DBG][spec_meta] role={getattr(self.edge_cloud_cfg, 'role', '?')} "
+                    f"[EC-DBG][spec_meta] role={self._ec_dbg_role} "
                     f"async={self.use_async_scheduling} "
                     f"num_draft={num_draft_tokens.tolist()} "
                     f"cu_draft={cu_num_draft_tokens.tolist()} "
@@ -2059,11 +2069,11 @@ class NPUModelRunner(GPUModelRunner):
 
         # ----- [EC-DBG] scheduler decision. Pins whether sync loses the +1 base
         # token or attaches fewer drafts. Diff async vs sync. Remove once done. -----
-        if self._edge_cloud_enabled:
+        if self._ec_dbg:
             try:
                 _st = scheduler_output.scheduled_spec_decode_tokens
                 print(
-                    f"[EC-DBG][sched] role={getattr(self.edge_cloud_cfg, 'role', '?')} "
+                    f"[EC-DBG][sched] role={self._ec_dbg_role} "
                     f"async={self.use_async_scheduling} "
                     f"num_sched={dict(scheduler_output.num_scheduled_tokens)} "
                     f"spec_lens={({k: len(v) for k, v in _st.items()} if _st else None)}",
@@ -2076,13 +2086,13 @@ class NPUModelRunner(GPUModelRunner):
         # ----- [EC-DBG] worker view of request state (CachedRequestState). If EC
         # sync's output_token_ids does NOT grow by 1 after prefill, num_tokens_with_spec
         # is short the +1 base token -> next verify window = num_draft. Remove later. -----
-        if self._edge_cloud_enabled:
+        if self._ec_dbg:
             try:
                 for _rid in list(scheduler_output.num_scheduled_tokens)[:2]:
                     _rs = self.requests.get(_rid)
                     if _rs is not None:
                         print(
-                            f"[EC-DBG][reqstate] role={getattr(self.edge_cloud_cfg, 'role', '?')} "
+                            f"[EC-DBG][reqstate] role={self._ec_dbg_role} "
                             f"async={self.use_async_scheduling} rid={_rid[:8]} "
                             f"num_computed={_rs.num_computed_tokens} "
                             f"n_prompt={len(_rs.prompt_token_ids)} "
@@ -2786,7 +2796,7 @@ class NPUModelRunner(GPUModelRunner):
         # i.e. the state the NEXT schedule reads. If EC drops/short-counts the
         # sampled token here (esp. at prefill), num_tokens_with_spec loses its +1
         # and the next verify window collapses to num_draft. Remove once done. -----
-        if self._edge_cloud_enabled:
+        if self._ec_dbg:
             try:
                 def _summ(x):
                     if isinstance(x, list):
@@ -2795,7 +2805,7 @@ class NPUModelRunner(GPUModelRunner):
                         return f"tensor shape={tuple(x.shape)}"
                     return repr(x)[:60]
                 print(
-                    f"[EC-DBG][ret] role={getattr(self.edge_cloud_cfg, 'role', '?')} "
+                    f"[EC-DBG][ret] role={self._ec_dbg_role} "
                     f"async={self.use_async_scheduling} "
                     f"req_ids={req_ids_output_copy[:4]} "
                     f"sampled={_summ(valid_sampled_token_ids)}",

@@ -1837,7 +1837,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # the same prompt and diff these lines; the first mismatch localizes the
         # bug. Remove this block once localized. -----
         try:
-            _role = getattr(getattr(self.runner, "edge_cloud_cfg", None), "role", "?")
+            _role = getattr(self.runner, "_ec_dbg_role",
+                            getattr(getattr(self.runner, "edge_cloud_cfg", None), "role", "?"))
             _async = getattr(self.runner, "use_async_scheduling", "?")
             print(
                 f"[EC-DBG][prepare_inputs_padded] role={_role} async={_async} "

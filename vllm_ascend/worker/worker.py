@@ -431,8 +431,12 @@ class NPUWorker(WorkerBase):
         # on one of these returns. Remove once localized. -----
         try:
             ecfg = getattr(self.model_runner, "edge_cloud_cfg", None)
-            if not getattr(ecfg, "enabled", False):
+            # Fire for edge-cloud OR plain spec-decode runs so the two can be
+            # diffed. _ec_dbg / _ec_dbg_role are set on the model runner.
+            if not getattr(self.model_runner, "_ec_dbg", False):
                 return
+            _role = getattr(self.model_runner, "_ec_dbg_role",
+                            getattr(ecfg, "role", "?"))
 
             def _summ(o):
                 if o is None:
@@ -447,7 +451,7 @@ class NPUWorker(WorkerBase):
                 return f"{type(o).__name__} n_reqs={len(sti) if hasattr(sti,'__len__') else '?'} per_req_lens={lens}"
 
             print(
-                f"[EC-DBG][{tag}] role={getattr(ecfg, 'role', '?')} "
+                f"[EC-DBG][{tag}] role={_role} "
                 f"async={getattr(self.model_runner, 'use_async_scheduling', '?')} "
                 f"out={_summ(output)}",
                 flush=True,

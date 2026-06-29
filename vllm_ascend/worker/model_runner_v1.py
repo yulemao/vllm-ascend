@@ -1385,6 +1385,25 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.seq_lens[num_reqs:].fill_(0)
 
+        # ----- [EC-DBG] TARGET model attn inputs. Same drafts but different
+        # target logits between async/sync => target forward reads wrong
+        # KV/positions. Diff these. Remove once localized. -----
+        if self._edge_cloud_enabled:
+            try:
+                _role = getattr(self.edge_cloud_cfg, "role", "?")
+                print(
+                    f"[EC-DBG][prep_inputs] role={_role} async={self.use_async_scheduling} "
+                    f"tail={self._is_edge_cloud_embed_only_tail} num_reqs={num_reqs} "
+                    f"num_sched={num_scheduled_tokens[:8].tolist()} "
+                    f"num_computed={self.num_computed_tokens[:num_reqs].tolist()} "
+                    f"seq_lens={self.seq_lens[:num_reqs].tolist()} "
+                    f"positions={self.positions[:total_num_scheduled_tokens][:8].tolist()}",
+                    flush=True,
+                )
+            except Exception as _e:
+                print(f"[EC-DBG][prep_inputs] print failed: {_e}", flush=True)
+        # ----- end [EC-DBG] -----
+
         # In async spec decode mode, num_computed_tokens was corrected on GPU
         # by update_num_computed_tokens_for_batch_change, so seq_lens (GPU) is
         # correct but optimistic_seq_lens_cpu is stale (it assumed all drafts

@@ -125,6 +125,27 @@ class RecomputeScheduler(Scheduler):
             or "qwen3_5" in self.vllm_config.model_config.hf_text_config.model_type
         )
 
+        # Edge-cloud embedding_only edge, speculative decoding: the base/bonus
+        # token sampled at the previous step (e.g. the prefill's first token)
+        # must lead the next MTP verify window so target logits line up with the
+        # draft tokens. The async edge (AsyncRecomputeScheduler ->
+        # AsyncScheduler._update_after_schedule) reserves this slot via
+        # `num_output_placeholders += 1 + num_spec`; the sync edge has no such
+        # reservation and the bonus token is not reflected in num_tokens before
+        # that first verify step, so the window collapses from num_draft + 1 to
+        # num_draft. Track the condition so the running-queue scheduling can
+        # restore the base-token slot for this case only -- this is edge-cloud
+        # specific bookkeeping and never affects ordinary PD requests.
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        ec_cfg = get_ascend_config().edge_cloud_config
+        self._ec_embed_only_edge_spec = bool(
+            self.vllm_config.speculative_config
+            and getattr(ec_cfg, "enabled", False)
+            and getattr(ec_cfg, "mode", None) == "embedding_only"
+            and getattr(ec_cfg, "role", None) == "edge"
+        )
+
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
         if existing is not None:
@@ -276,6 +297,35 @@ class RecomputeScheduler(Scheduler):
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
             num_new_tokens = min(num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens)
+
+            # Edge-cloud embedding_only edge fix (see __init__): on the sync edge
+            # the bonus token from the previous step is not reflected in the
+            # request length before the first MTP verify step, so the verify
+            # window is sized to num_draft instead of num_draft + 1. Downstream,
+            # _calc_spec_decode_metadata then derives the logits base index as
+            # cu_num_scheduled_tokens - (num_draft + 1), which goes negative
+            # (e.g. 3 - 4 = -1), reads a stale hidden state and shifts every
+            # target logit one slot off its draft token, collapsing acceptance.
+            # The async edge avoids this via num_output_placeholders; mirror that
+            # guarantee here for the edge-cloud case only, leaving ordinary PD
+            # requests untouched.
+            if (
+                self._ec_embed_only_edge_spec
+                and request.spec_token_ids
+                and not request.is_prefill_chunk
+            ):
+                base_token_slots = (
+                    request.num_tokens
+                    + request.num_output_placeholders
+                    - request.num_computed_tokens
+                )
+                if base_token_slots < 1:
+                    num_new_tokens += 1 - base_token_slots
+                    num_new_tokens = min(
+                        num_new_tokens,
+                        token_budget,
+                        self.max_model_len - 1 - request.num_computed_tokens,
+                    )
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -895,30 +945,7 @@ class RecomputeScheduler(Scheduler):
             # Check for stop and update request status.
             if new_token_ids:
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
-
-            # ----- [EC-DBG][sched-commit] scheduler-side commit probe. Shows what
-            # the engine's update_from_output actually receives and commits for
-            # this request, i.e. the authoritative state the NEXT schedule reads
-            # (worker [reqstate] reflects CachedRequestState, a different object).
-            # If n_out_after stays 0 after the prefill, the bonus token never
-            # reaches the scheduler Request -> verify window loses its +1. Remove
-            # once localized. -----
-            if self._ec_embed_only_edge_spec:
-                try:
-                    print(
-                        f"[EC-DBG][sched-commit] rid={req_id[:8]} "
-                        f"gen={list(generated_token_ids)} "
-                        f"has_sched_spec={bool(scheduled_spec_token_ids)} "
-                        f"num_computed={request.num_computed_tokens} "
-                        f"n_out_after={len(request.output_token_ids)} "
-                        f"placeholders={request.num_output_placeholders} "
-                        f"n_spec={len(request.spec_token_ids)}",
-                        flush=True,
-                    )
-                except Exception as _e:
-                    print(f"[EC-DBG][sched-commit] print failed: {_e}", flush=True)
-            # ----- end [EC-DBG] -----
-            if not new_token_ids and request.pooling_params and pooler_output is not None:
+            elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True

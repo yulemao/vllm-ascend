@@ -2760,6 +2760,30 @@ class NPUModelRunner(GPUModelRunner):
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
 
+        # ----- [EC-DBG] what the worker returns to the engine. This drives
+        # update_from_output -> request.num_computed_tokens / output_token_ids,
+        # i.e. the state the NEXT schedule reads. If EC drops/short-counts the
+        # sampled token here (esp. at prefill), num_tokens_with_spec loses its +1
+        # and the next verify window collapses to num_draft. Remove once done. -----
+        if self._edge_cloud_enabled:
+            try:
+                def _summ(x):
+                    if isinstance(x, list):
+                        return f"list len={len(x)} per_req_lens={[len(r) if hasattr(r,'__len__') else 1 for r in x][:8]}"
+                    if isinstance(x, torch.Tensor):
+                        return f"tensor shape={tuple(x.shape)}"
+                    return repr(x)[:60]
+                print(
+                    f"[EC-DBG][ret] role={getattr(self.edge_cloud_cfg, 'role', '?')} "
+                    f"async={self.use_async_scheduling} "
+                    f"req_ids={req_ids_output_copy[:4]} "
+                    f"sampled={_summ(valid_sampled_token_ids)}",
+                    flush=True,
+                )
+            except Exception as _e:
+                print(f"[EC-DBG][ret] print failed: {_e}", flush=True)
+        # ----- end [EC-DBG] -----
+
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,

@@ -269,26 +269,6 @@ class RecomputeScheduler(Scheduler):
             num_new_tokens = (
                 request.num_tokens_with_spec + request.num_output_placeholders - request.num_computed_tokens
             )
-
-            # ----- [EC-DBG] scheduler request state at num_new_tokens. Confirms
-            # whether sync loses the +1 base token via num_tokens_with_spec (sampled
-            # token not materialized) or num_computed_tokens (over-advanced). Compare
-            # async vs sync. Remove once localized. -----
-            if getattr(self, "num_spec_tokens", 0) and request.num_computed_tokens > 0:
-                try:
-                    print(
-                        f"[EC-DBG][sched-core] async={self.scheduler_config.async_scheduling} "
-                        f"rid={request.request_id[:8]} num_new_raw={num_new_tokens} "
-                        f"with_spec={request.num_tokens_with_spec} "
-                        f"num_computed={request.num_computed_tokens} "
-                        f"n_out={len(request.output_token_ids)} "
-                        f"n_spec={len(request.spec_token_ids)} "
-                        f"ph={request.num_output_placeholders}",
-                        flush=True,
-                    )
-                except Exception as _e:
-                    print(f"[EC-DBG][sched-core] print failed: {_e}", flush=True)
-            # ----- end [EC-DBG] -----
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)

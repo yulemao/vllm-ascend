@@ -1724,6 +1724,25 @@ class NPUModelRunner(GPUModelRunner):
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
         if self.pcp_size > 1:
             logits_indices = logits_indices_pcp
+        # ----- [EC-DBG] verify logits index mapping. If sync's target/bonus
+        # logits indices are shifted vs async, that's the mis-aligned verify
+        # window. Diff async vs sync. Remove once localized. -----
+        if self._edge_cloud_enabled:
+            try:
+                print(
+                    f"[EC-DBG][spec_meta] role={getattr(self.edge_cloud_cfg, 'role', '?')} "
+                    f"async={self.use_async_scheduling} "
+                    f"num_draft={num_draft_tokens.tolist()} "
+                    f"cu_draft={cu_num_draft_tokens.tolist()} "
+                    f"cu_sampled={cu_num_sampled_tokens.tolist()} "
+                    f"logits_idx={logits_indices.tolist()} "
+                    f"target_logits_idx={target_logits_indices.tolist()} "
+                    f"bonus_logits_idx={bonus_logits_indices.tolist()}",
+                    flush=True,
+                )
+            except Exception as _e:
+                print(f"[EC-DBG][spec_meta] print failed: {_e}", flush=True)
+        # ----- end [EC-DBG] -----
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),

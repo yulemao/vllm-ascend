@@ -181,6 +181,38 @@ class AscendMultiprocExecutor(MultiprocExecutor):
             return 0
         return super()._get_output_rank()
 
+    # ----- [EC-DBG] executor<->engine handoff probe. This is the last point
+    # inside vllm-ascend before the result reaches the engine's
+    # update_from_output(). If the prefill bonus token is present here but the
+    # scheduler Request never commits it, the loss is in vllm core; if it is
+    # already empty here, the loss is in executor output aggregation. Remove
+    # once localized. -----
+    def _ec_dbg_summ(self, out) -> str:
+        if out is None:
+            return "None"
+        if isinstance(out, FutureWrapper):
+            return "FutureWrapper(non_block)"
+        sti = getattr(out, "sampled_token_ids", None)
+        if sti is None:
+            return f"{type(out).__name__}(no sampled_token_ids)"
+        try:
+            lens = [len(r) if hasattr(r, "__len__") else 1 for r in sti][:8]
+        except Exception:
+            lens = "?"
+        return f"{type(out).__name__} n_reqs={len(sti) if hasattr(sti, '__len__') else '?'} per_req_lens={lens}"
+
+    def execute_model(self, scheduler_output, non_block: bool = False):
+        out = super().execute_model(scheduler_output, non_block=non_block)
+        if self.parallel_config.enable_edge_cloud:
+            print(f"[EC-DBG][executor.exec_ret] out={self._ec_dbg_summ(out)}", flush=True)
+        return out
+
+    def sample_tokens(self, grammar_output, non_block: bool = False):
+        out = super().sample_tokens(grammar_output, non_block=non_block)
+        if self.parallel_config.enable_edge_cloud:
+            print(f"[EC-DBG][executor.sample_ret] out={self._ec_dbg_summ(out)}", flush=True)
+        return out
+
 
 class AscendWorkerProc(WorkerProc):
     @staticmethod

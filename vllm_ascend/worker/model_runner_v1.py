@@ -2073,6 +2073,27 @@ class NPUModelRunner(GPUModelRunner):
                 print(f"[EC-DBG][sched] print failed: {_e}", flush=True)
         # ----- end [EC-DBG] -----
 
+        # ----- [EC-DBG] worker view of request state (CachedRequestState). If EC
+        # sync's output_token_ids does NOT grow by 1 after prefill, num_tokens_with_spec
+        # is short the +1 base token -> next verify window = num_draft. Remove later. -----
+        if self._edge_cloud_enabled:
+            try:
+                for _rid in list(scheduler_output.num_scheduled_tokens)[:2]:
+                    _rs = self.requests.get(_rid)
+                    if _rs is not None:
+                        print(
+                            f"[EC-DBG][reqstate] role={getattr(self.edge_cloud_cfg, 'role', '?')} "
+                            f"async={self.use_async_scheduling} rid={_rid[:8]} "
+                            f"num_computed={_rs.num_computed_tokens} "
+                            f"n_prompt={len(_rs.prompt_token_ids)} "
+                            f"n_out={len(_rs.output_token_ids)} "
+                            f"sched={scheduler_output.num_scheduled_tokens[_rid]}",
+                            flush=True,
+                        )
+            except Exception as _e:
+                print(f"[EC-DBG][reqstate] print failed: {_e}", flush=True)
+        # ----- end [EC-DBG] -----
+
         # In edge-cloud embedding_only mode, execute_model is called twice for the
         # same scheduler_output: head segment (intermediate_tensors is None) and
         # tail segment (intermediate_tensors is not None). The tail segment should

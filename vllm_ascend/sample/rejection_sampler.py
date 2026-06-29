@@ -119,6 +119,27 @@ def rejection_sample(
     # to avoid incorrect verification results.
     using_block_verify = max_spec_len >= 3 and draft_probs is not None
 
+    # ----- [EC-DBG] verify inputs. If async accepts but sync rejects the same
+    # drafts, draft_probs/target_probs feeding this kernel differ. Remove later.
+    try:
+        def _stat(t):
+            if t is None:
+                return "None"
+            tf = t.float()
+            return (f"shape={tuple(t.shape)} sum={tf.sum().item():.3f} "
+                    f"min={tf.min().item():.4f} max={tf.max().item():.4f}")
+        print(
+            f"[EC-DBG][rejection_sample] block_verify={using_block_verify} "
+            f"max_spec_len={max_spec_len} batch={batch_size} num_tokens={num_tokens} "
+            f"num_draft_tokens={num_draft_tokens[:8]} "
+            f"draft_probs={_stat(draft_probs)} target_logits={_stat(target_logits)} "
+            f"draft_token_ids={draft_token_ids[:8].tolist()}",
+            flush=True,
+        )
+    except Exception as _e:
+        print(f"[EC-DBG][rejection_sample] print failed: {_e}", flush=True)
+    # ----- end [EC-DBG] -----
+
     # On Ascend the Triton sampling kernels below read/write a full BLOCK_SIZE
     # tile per block and apply the lane mask only afterward, so a launched lane
     # past the real batch still TOUCHES DDR -- and a masked cu load even returns

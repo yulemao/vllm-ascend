@@ -2038,6 +2038,22 @@ class NPUModelRunner(GPUModelRunner):
         # Save scheduler_output for edge-cloud mamba state sync in sample_tokens().
         self._last_scheduler_output = scheduler_output
 
+        # ----- [EC-DBG] scheduler decision. Pins whether sync loses the +1 base
+        # token or attaches fewer drafts. Diff async vs sync. Remove once done. -----
+        if self._edge_cloud_enabled:
+            try:
+                _st = scheduler_output.scheduled_spec_decode_tokens
+                print(
+                    f"[EC-DBG][sched] role={getattr(self.edge_cloud_cfg, 'role', '?')} "
+                    f"async={self.use_async_scheduling} "
+                    f"num_sched={dict(scheduler_output.num_scheduled_tokens)} "
+                    f"spec_lens={({k: len(v) for k, v in _st.items()} if _st else None)}",
+                    flush=True,
+                )
+            except Exception as _e:
+                print(f"[EC-DBG][sched] print failed: {_e}", flush=True)
+        # ----- end [EC-DBG] -----
+
         # In edge-cloud embedding_only mode, execute_model is called twice for the
         # same scheduler_output: head segment (intermediate_tensors is None) and
         # tail segment (intermediate_tensors is not None). The tail segment should

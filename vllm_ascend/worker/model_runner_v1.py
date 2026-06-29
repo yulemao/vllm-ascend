@@ -2094,34 +2094,6 @@ class NPUModelRunner(GPUModelRunner):
                 print(f"[EC-DBG][reqstate] print failed: {_e}", flush=True)
         # ----- end [EC-DBG] -----
 
-        # Edge-cloud embedding_only: the edge runs the lm_head and samples its
-        # own tokens, then caches them locally in `_bookkeeping_sync`
-        # (token_ids_cpu / output_token_ids), exactly like a PP last rank. But
-        # the edge is a *non-last* PP rank, so in sync (non-async) scheduling the
-        # core scheduler ALSO relays the sampled tokens back through
-        # CachedRequestData.new_token_ids -- see _make_cached_request_data(),
-        # gated on `use_pp and not async_scheduling`. `_update_states` would then
-        # re-apply those relayed tokens on top of the edge's own bookkeeping
-        # (gpu_model_runner._update_states, the `not is_last_rank` branch),
-        # double-counting the prefill bonus token. That offset makes the next
-        # spec-decode step schedule `num_draft` tokens instead of `num_draft + 1`,
-        # so `_calc_spec_decode_metadata` produces a negative/shifted verify
-        # window (e.g. logits_indices=[-1, 0, 1, 2]) and the cloud target forward
-        # runs as ChunkedPrefill instead of SpecDecoding -> drafts get rejected
-        # and acceptance collapses. In async scheduling new_token_ids is already
-        # empty (tokens travel via the GPU-broadcast path), which is exactly why
-        # async is correct. Mirror that here: drop the relayed tokens so the edge
-        # relies solely on its local cache in both scheduling modes.
-        if (
-            self._edge_cloud_enabled
-            and self.edge_cloud_cfg.mode == "embedding_only"
-            and self.edge_cloud_cfg.role == "edge"
-            and not self.use_async_scheduling
-        ):
-            cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
-            if cached_reqs is not None and cached_reqs.new_token_ids:
-                cached_reqs.new_token_ids = []
-
         # In edge-cloud embedding_only mode, execute_model is called twice for the
         # same scheduler_output: head segment (intermediate_tensors is None) and
         # tail segment (intermediate_tensors is not None). The tail segment should

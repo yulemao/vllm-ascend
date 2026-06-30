@@ -1184,3 +1184,84 @@ def edge_cloud_broadcast_recv(
             handle.wait()
 
     return recv_tensor_dict, [], [broadcast_postprocess]
+
+
+def edge_cloud_broadcast_recv_mtp() -> tuple[
+    dict[str, torch.Tensor | Any] | None,
+    list[Handle],
+    list[Callable[[], None]],
+]:
+    """Receive PP tensors and broadcast them within the local edge/cloud TP group.
+
+    This is the legacy metadata-exchanging variant of
+    :func:`edge_cloud_broadcast_recv`.  Unlike the optimized version above
+    (which computes tensor metadata locally from ``num_tokens`` to avoid the
+    inter-node pickle+Gloo exchange), it falls back to the standard
+    ``pp_group.irecv_tensor_dict()`` / ``tp_group.broadcast_object()`` path
+    that round-trips the metadata over the wire.
+
+    The MTP edge-cloud path originates from an older base branch and sends a
+    per-step tensor dict whose shape/keys are not fully described by the
+    pre-computed EdgeCloudTensorMeta, so it cannot use the locally-computed
+    fast path.  Keep this old implementation around — renamed — for the MTP
+    callers while the non-MTP edge-cloud worker path keeps the optimized one.
+    """
+    pp_group = get_pp_group()
+    tp_group = get_tp_group()
+    is_pp_npu0 = pp_group.world_size == 2
+
+    if is_pp_npu0:
+        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict()
+        assert tensor_dict is not None, (
+            "edge_cloud_broadcast_recv_mtp: PP tensor_dict is None, "
+            "sender may have failed."
+        )
+
+        metadata_list, _ = _split_tensor_dict(tensor_dict)
+        tp_group.broadcast_object(metadata_list, src=0)
+
+        def broadcast_postprocess():
+            _, tensor_list = _split_tensor_dict(tensor_dict) if tensor_dict else (None, [])
+            handles = []
+            for tensor in tensor_list:
+                if tensor.numel() == 0:
+                    continue
+                group = tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
+                handles.append(
+                    torch.distributed.broadcast(
+                        tensor, src=tp_group.ranks[0], group=group, async_op=True
+                    )
+                )
+            for handle in handles:
+                handle.wait()
+
+        comm_postprocess.append(broadcast_postprocess)
+        return tensor_dict, comm_handles, comm_postprocess
+
+    metadata_list = tp_group.broadcast_object(None, src=0)
+    if metadata_list is None:
+        metadata_list = []
+    recv_tensor_dict: dict[str, torch.Tensor | Any] = {}
+
+    for key, value in metadata_list:
+        if isinstance(value, TensorMetadata):
+            tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+            recv_tensor_dict[key] = tensor
+        else:
+            recv_tensor_dict[key] = value
+
+    def broadcast_postprocess():
+        handles = []
+        for tensor in recv_tensor_dict.values():
+            if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+                continue
+            group = tp_group.cpu_group if tensor.is_cpu else tp_group.device_group
+            handles.append(
+                torch.distributed.broadcast(
+                    tensor, src=tp_group.ranks[0], group=group, async_op=True
+                )
+            )
+        for handle in handles:
+            handle.wait()
+
+    return recv_tensor_dict, [], [broadcast_postprocess]

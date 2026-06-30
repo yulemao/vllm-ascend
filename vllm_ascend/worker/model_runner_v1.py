@@ -1044,10 +1044,10 @@ class NPUModelRunner(GPUModelRunner):
 
         # Pre-allocate persistent intermediate buffers for MTP edge-cloud
         # segments. ACLGraphWrapper requires stable input tensor addresses
-        # across graph replay, but edge_cloud_broadcast_recv() allocates fresh
-        # tensors every iteration. Copying received tensors into these buffers
-        # before calling graph-wrapped segments avoids stale-address crashes
-        # such as ACL error 507011.
+        # across graph replay, but edge_cloud_broadcast_recv_mtp() allocates
+        # fresh tensors every iteration. Copying received tensors into these
+        # buffers before calling graph-wrapped segments avoids stale-address
+        # crashes such as ACL error 507011.
         if hasattr(self, "_edge_cloud_mtp_intermediate_buffers"):
             delattr(self, "_edge_cloud_mtp_intermediate_buffers")
         if hasattr(predictor, "make_empty_intermediate_tensors"):
@@ -1088,7 +1088,7 @@ class NPUModelRunner(GPUModelRunner):
         """Copy received MTP intermediate tensors into persistent buffers.
 
         ACLGraphWrapper captures and replays graphs against fixed input
-        addresses. edge_cloud_broadcast_recv() returns freshly-allocated
+        addresses. edge_cloud_broadcast_recv_mtp() returns freshly-allocated
         tensors each iteration, so we copy them into pre-allocated buffers
         (sized to max_num_tokens) and return sliced views with stable
         addresses for the current num_tokens.
@@ -3197,7 +3197,9 @@ class NPUModelRunner(GPUModelRunner):
         return per_layer_attn_metadata
 
     def _run_mtp_cloud_segment(self) -> None:
-        from vllm_ascend.distributed.parallel_state import edge_cloud_broadcast_recv
+        from vllm_ascend.distributed.parallel_state import (
+            edge_cloud_broadcast_recv_mtp,
+        )
 
         # The edge side calls the MTP model for each speculative step
         # (including the first pass).  We loop the same number of times so
@@ -3209,7 +3211,9 @@ class NPUModelRunner(GPUModelRunner):
 
         for _ in range(num_steps):
             # Receive intermediate from edge (including positions and spec_step_idx)
-            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+            tensor_dict, comm_handles, comm_postprocess = (
+                edge_cloud_broadcast_recv_mtp()
+            )
             for handle in comm_handles:
                 handle.wait()
             for postprocess in comm_postprocess:

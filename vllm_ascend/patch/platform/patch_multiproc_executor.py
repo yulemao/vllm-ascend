@@ -181,6 +181,29 @@ class AscendMultiprocExecutor(MultiprocExecutor):
             return 0
         return super()._get_output_rank()
 
+    @property
+    def max_concurrent_batches(self) -> int:
+        # Edge-cloud runs as pipeline parallel (edge=PP0, cloud=PP1), so the
+        # base class returns pp_size (>1), which makes EngineCore enable the
+        # pipelined `step_with_batch_queue` path. With speculative decoding and
+        # synchronous scheduling (`--no-async-scheduling`) that path schedules
+        # the next spec-verify batch before the previous batch's sampled token
+        # is applied, and there is no `num_output_placeholders` accounting (only
+        # AsyncScheduler maintains it) to compensate. The verify window then
+        # loses the +1 base token, every draft is checked one position early and
+        # is rejected, collapsing the draft hit rate. Force a single in-flight
+        # batch so EngineCore falls back to the sequential `step()` path, which
+        # always applies the sampled token before scheduling the next batch.
+        # Async edge-cloud is unaffected (placeholders keep it correct) and
+        # keeps the pipeline overlap.
+        if (
+            self.parallel_config.enable_edge_cloud
+            and self.speculative_config is not None
+            and not self.scheduler_config.async_scheduling
+        ):
+            return 1
+        return super().max_concurrent_batches
+
 
 class AscendWorkerProc(WorkerProc):
     @staticmethod

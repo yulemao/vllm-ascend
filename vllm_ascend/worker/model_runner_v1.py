@@ -346,16 +346,6 @@ class NPUModelRunner(GPUModelRunner):
         # because the drafter setup needs to know whether edge-cloud is enabled.
         self.edge_cloud_cfg = self.ascend_config.edge_cloud_config
         self._edge_cloud_enabled = self.edge_cloud_cfg.enabled
-        # ----- [EC-DBG] debug gate + role label. The probes below must also fire
-        # in non-edge-cloud spec-decode runs so an edge-cloud run and a plain
-        # (non-edge-cloud) MTP run can be diffed side by side. Gate on either
-        # edge-cloud OR speculative decoding being active. role is the real
-        # edge/cloud role when edge-cloud is on, else "noEC" so the two runs are
-        # never confused (edge_cloud_cfg.role defaults to "edge" even when off).
-        # Remove together with the rest of the [EC-DBG] probes. -----
-        self._ec_dbg = self._edge_cloud_enabled or (self.speculative_config is not None)
-        self._ec_dbg_role = self.edge_cloud_cfg.role if self._edge_cloud_enabled else "noEC"
-        # ----- end [EC-DBG] -----
         # This flag is set per-step in execute_model; initialize it here so
         # that code paths reaching _prepare_inputs before the first execute_model
         # call (e.g. profile_run or unit tests) do not hit AttributeError.
@@ -1395,25 +1385,6 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.seq_lens[num_reqs:].fill_(0)
 
-        # ----- [EC-DBG] TARGET model attn inputs. Same drafts but different
-        # target logits between async/sync => target forward reads wrong
-        # KV/positions. Diff these. Remove once localized. -----
-        if self._ec_dbg:
-            try:
-                _role = self._ec_dbg_role
-                print(
-                    f"[EC-DBG][prep_inputs] role={_role} async={self.use_async_scheduling} "
-                    f"tail={self._is_edge_cloud_embed_only_tail} num_reqs={num_reqs} "
-                    f"num_sched={num_scheduled_tokens[:8].tolist()} "
-                    f"num_computed={self.num_computed_tokens[:num_reqs].tolist()} "
-                    f"seq_lens={self.seq_lens[:num_reqs].tolist()} "
-                    f"positions={self.positions[:total_num_scheduled_tokens][:8].tolist()}",
-                    flush=True,
-                )
-            except Exception as _e:
-                print(f"[EC-DBG][prep_inputs] print failed: {_e}", flush=True)
-        # ----- end [EC-DBG] -----
-
         # In async spec decode mode, num_computed_tokens was corrected on GPU
         # by update_num_computed_tokens_for_batch_change, so seq_lens (GPU) is
         # correct but optimistic_seq_lens_cpu is stale (it assumed all drafts
@@ -1734,25 +1705,6 @@ class NPUModelRunner(GPUModelRunner):
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
         if self.pcp_size > 1:
             logits_indices = logits_indices_pcp
-        # ----- [EC-DBG] verify logits index mapping. If sync's target/bonus
-        # logits indices are shifted vs async, that's the mis-aligned verify
-        # window. Diff async vs sync. Remove once localized. -----
-        if self._ec_dbg:
-            try:
-                print(
-                    f"[EC-DBG][spec_meta] role={self._ec_dbg_role} "
-                    f"async={self.use_async_scheduling} "
-                    f"num_draft={num_draft_tokens.tolist()} "
-                    f"cu_draft={cu_num_draft_tokens.tolist()} "
-                    f"cu_sampled={cu_num_sampled_tokens.tolist()} "
-                    f"logits_idx={logits_indices.tolist()} "
-                    f"target_logits_idx={target_logits_indices.tolist()} "
-                    f"bonus_logits_idx={bonus_logits_indices.tolist()}",
-                    flush=True,
-                )
-            except Exception as _e:
-                print(f"[EC-DBG][spec_meta] print failed: {_e}", flush=True)
-        # ----- end [EC-DBG] -----
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
@@ -2066,43 +2018,6 @@ class NPUModelRunner(GPUModelRunner):
 
         # Save scheduler_output for edge-cloud mamba state sync in sample_tokens().
         self._last_scheduler_output = scheduler_output
-
-        # ----- [EC-DBG] scheduler decision. Pins whether sync loses the +1 base
-        # token or attaches fewer drafts. Diff async vs sync. Remove once done. -----
-        if self._ec_dbg:
-            try:
-                _st = scheduler_output.scheduled_spec_decode_tokens
-                print(
-                    f"[EC-DBG][sched] role={self._ec_dbg_role} "
-                    f"async={self.use_async_scheduling} "
-                    f"num_sched={dict(scheduler_output.num_scheduled_tokens)} "
-                    f"spec_lens={({k: len(v) for k, v in _st.items()} if _st else None)}",
-                    flush=True,
-                )
-            except Exception as _e:
-                print(f"[EC-DBG][sched] print failed: {_e}", flush=True)
-        # ----- end [EC-DBG] -----
-
-        # ----- [EC-DBG] worker view of request state (CachedRequestState). If EC
-        # sync's output_token_ids does NOT grow by 1 after prefill, num_tokens_with_spec
-        # is short the +1 base token -> next verify window = num_draft. Remove later. -----
-        if self._ec_dbg:
-            try:
-                for _rid in list(scheduler_output.num_scheduled_tokens)[:2]:
-                    _rs = self.requests.get(_rid)
-                    if _rs is not None:
-                        print(
-                            f"[EC-DBG][reqstate] role={self._ec_dbg_role} "
-                            f"async={self.use_async_scheduling} rid={_rid[:8]} "
-                            f"num_computed={_rs.num_computed_tokens} "
-                            f"n_prompt={len(_rs.prompt_token_ids)} "
-                            f"n_out={len(_rs.output_token_ids)} "
-                            f"sched={scheduler_output.num_scheduled_tokens[_rid]}",
-                            flush=True,
-                        )
-            except Exception as _e:
-                print(f"[EC-DBG][reqstate] print failed: {_e}", flush=True)
-        # ----- end [EC-DBG] -----
 
         # In edge-cloud embedding_only mode, execute_model is called twice for the
         # same scheduler_output: head segment (intermediate_tensors is None) and
@@ -2791,30 +2706,6 @@ class NPUModelRunner(GPUModelRunner):
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
 
-        # ----- [EC-DBG] what the worker returns to the engine. This drives
-        # update_from_output -> request.num_computed_tokens / output_token_ids,
-        # i.e. the state the NEXT schedule reads. If EC drops/short-counts the
-        # sampled token here (esp. at prefill), num_tokens_with_spec loses its +1
-        # and the next verify window collapses to num_draft. Remove once done. -----
-        if self._ec_dbg:
-            try:
-                def _summ(x):
-                    if isinstance(x, list):
-                        return f"list len={len(x)} per_req_lens={[len(r) if hasattr(r,'__len__') else 1 for r in x][:8]}"
-                    if isinstance(x, torch.Tensor):
-                        return f"tensor shape={tuple(x.shape)}"
-                    return repr(x)[:60]
-                print(
-                    f"[EC-DBG][ret] role={self._ec_dbg_role} "
-                    f"async={self.use_async_scheduling} "
-                    f"req_ids={req_ids_output_copy[:4]} "
-                    f"sampled={_summ(valid_sampled_token_ids)}",
-                    flush=True,
-                )
-            except Exception as _e:
-                print(f"[EC-DBG][ret] print failed: {_e}", flush=True)
-        # ----- end [EC-DBG] -----
-
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -2893,8 +2784,6 @@ class NPUModelRunner(GPUModelRunner):
             not hasattr(self, "_cloud_spec_decode_common_attn_metadata")
             or self._cloud_spec_decode_common_attn_metadata is None
         ):
-            print("[EC-DBG][cloud_attn_meta] return None: no cached common_attn_metadata "
-                  "(-> draft attn would read zeros)", flush=True)
             return None
 
         if (
@@ -2902,8 +2791,6 @@ class NPUModelRunner(GPUModelRunner):
             or not hasattr(self.drafter, "draft_attn_groups")
             or not self.drafter.draft_attn_groups
         ):
-            print("[EC-DBG][cloud_attn_meta] return None: no drafter/draft_attn_groups "
-                  "(-> draft attn would read zeros)", flush=True)
             return None
 
         common_attn_metadata = self._cloud_spec_decode_common_attn_metadata
@@ -3036,23 +2923,6 @@ class NPUModelRunner(GPUModelRunner):
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_meta
 
-        # ----- [EC-DBG] cloud draft attn metadata. If seq_lens/positions here
-        # drift between async and sync, the cloud draft model reads wrong KV.
-        # Remove once localized. -----
-        try:
-            _sl = getattr(common_attn_metadata, "seq_lens", None)
-            _pos = positions
-            print(
-                f"[EC-DBG][cloud_attn_meta] step={spec_step_idx} num_reqs={num_reqs} "
-                f"attn_state={common_attn_metadata.attn_state} "
-                f"seq_lens={_sl[:8].tolist() if _sl is not None else None} "
-                f"positions={_pos.flatten()[:8].tolist() if _pos is not None else None}",
-                flush=True,
-            )
-        except Exception as _e:
-            print(f"[EC-DBG][cloud_attn_meta] print failed: {_e}", flush=True)
-        # ----- end [EC-DBG] -----
-
         return per_layer_attn_metadata
 
     def _run_mtp_cloud_segment(self) -> None:
@@ -3133,24 +3003,6 @@ class NPUModelRunner(GPUModelRunner):
             ):
                 output = segment(**model_kwargs)
             assert isinstance(output, IntermediateTensors)
-
-            # ----- [EC-DBG] cloud draft segment output. A ~0 norm here means the
-            # attn backend returned zeros (bad/missing metadata) -> low hit rate.
-            # Remove once localized. -----
-            try:
-                _stats = []
-                for _k, _v in output.items():
-                    if isinstance(_v, torch.Tensor) and _v.is_floating_point():
-                        _stats.append(f"{_k}:norm={_v.float().norm().item():.4f}")
-                print(
-                    f"[EC-DBG][cloud_segment] step_loop spec_step_idx={spec_step_idx} "
-                    f"num_tokens={num_tokens} cudagraph={cudagraph_runtime_mode} "
-                    f"out[{', '.join(_stats)}]",
-                    flush=True,
-                )
-            except Exception as _e:
-                print(f"[EC-DBG][cloud_segment] print failed: {_e}", flush=True)
-            # ----- end [EC-DBG] -----
 
             # Send back to edge
             if get_pp_group().world_size == 2:

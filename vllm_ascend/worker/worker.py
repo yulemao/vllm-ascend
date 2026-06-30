@@ -424,41 +424,6 @@ class NPUWorker(WorkerBase):
 
         return int(self.available_kv_cache_memory_bytes)
 
-    def _ec_probe(self, tag: str, output) -> None:
-        # ----- [EC-DBG] worker<->engine handoff probe. Shows, per worker RPC,
-        # exactly what the edge hands back to the executor/engine. If the prefill
-        # bonus token never reaches update_from_output, it is dropped/short-counted
-        # on one of these returns. Remove once localized. -----
-        try:
-            ecfg = getattr(self.model_runner, "edge_cloud_cfg", None)
-            # Fire for edge-cloud OR plain spec-decode runs so the two can be
-            # diffed. _ec_dbg / _ec_dbg_role are set on the model runner.
-            if not getattr(self.model_runner, "_ec_dbg", False):
-                return
-            _role = getattr(self.model_runner, "_ec_dbg_role",
-                            getattr(ecfg, "role", "?"))
-
-            def _summ(o):
-                if o is None:
-                    return "None"
-                sti = getattr(o, "sampled_token_ids", None)
-                if sti is None:
-                    return f"{type(o).__name__}(no sampled_token_ids)"
-                try:
-                    lens = [len(r) if hasattr(r, "__len__") else 1 for r in sti][:8]
-                except Exception:
-                    lens = "?"
-                return f"{type(o).__name__} n_reqs={len(sti) if hasattr(sti,'__len__') else '?'} per_req_lens={lens}"
-
-            print(
-                f"[EC-DBG][{tag}] role={_role} "
-                f"async={getattr(self.model_runner, 'use_async_scheduling', '?')} "
-                f"out={_summ(output)}",
-                flush=True,
-            )
-        except Exception as _e:  # never let the probe crash the run
-            print(f"[EC-DBG][{tag}] probe failed: {_e}", flush=True)
-
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -512,7 +477,6 @@ class NPUWorker(WorkerBase):
 
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
-            self._ec_probe("worker.exec_ret(seg1)", output)
             return output
 
         assert isinstance(output, IntermediateTensors)
@@ -528,7 +492,6 @@ class NPUWorker(WorkerBase):
             )
 
             output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
-            self._ec_probe("worker.exec_ret(edge_tail)", output)
             if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
                 return output
             return output
@@ -564,7 +527,6 @@ class NPUWorker(WorkerBase):
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
         output = self.model_runner.sample_tokens(grammar_output)
-        self._ec_probe("worker.sample_ret", output)
         return output
 
     def load_model(self) -> None:

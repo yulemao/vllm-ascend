@@ -1833,26 +1833,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             max_seq_len=0,
         )
 
-        # ----- [EC-DBG] drafter alignment (edge side). Run async vs sync with
-        # the same prompt and diff these lines; the first mismatch localizes the
-        # bug. Remove this block once localized. -----
-        try:
-            _role = getattr(self.runner, "_ec_dbg_role",
-                            getattr(getattr(self.runner, "edge_cloud_cfg", None), "role", "?"))
-            _async = getattr(self.runner, "use_async_scheduling", "?")
-            print(
-                f"[EC-DBG][prepare_inputs_padded] role={_role} async={_async} "
-                f"num_reqs={common_attn_metadata.num_reqs} "
-                f"valid_count={valid_sampled_tokens_count[:8].tolist()} "
-                f"num_rejected={num_rejected_tokens_gpu[:8].tolist()} "
-                f"tok_idx_to_sample={token_indices_to_sample[:8].tolist()} "
-                f"qsl={common_attn_metadata.query_start_loc[:9].tolist()}",
-                flush=True,
-            )
-        except Exception as _e:  # never let debug crash the run
-            print(f"[EC-DBG][prepare_inputs_padded] print failed: {_e}", flush=True)
-        # ----- end [EC-DBG] -----
-
         return spec_common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu
 
     def _split_pcp_input(self, req_scheduled_tokens, input_ids, target_hidden_states):

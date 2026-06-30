@@ -272,6 +272,7 @@ class AscendConfig:
         self.enable_reduce_sample = additional_config.get("enable_reduce_sample", False)
         edge_cloud_config = additional_config.get("edge_cloud_config", {})
         self.edge_cloud_config = EdgeCloudConfig(edge_cloud_config, vllm_config)
+        self._check_edge_cloud_spec_decode(vllm_config)
 
         self.mix_placement = additional_config.get("mix_placement", False)
         self._check_mix_placement()
@@ -299,6 +300,24 @@ class AscendConfig:
         if self.mix_placement:
             if self.enable_shared_expert_dp or self.multistream_overlap_shared_expert:
                 raise ValueError("Mix placement is not supported with shared expert DP or multistream overlap.")
+
+    def _check_edge_cloud_spec_decode(self, vllm_config: "VllmConfig"):
+        # Edge-cloud collaborative inference with speculative decoding (e.g. mtp
+        # or eagle3) relies on async scheduling to overlap the cross-node hidden
+        # state transfer with computation. Disabling async scheduling
+        # (--no-async-scheduling) in this combination is not supported yet.
+        if (
+            self.edge_cloud_config.enabled
+            and vllm_config.speculative_config is not None
+            and not vllm_config.scheduler_config.async_scheduling
+        ):
+            spec_method = getattr(vllm_config.speculative_config, "method", "unknown")
+            raise ValueError(
+                "Edge-cloud mode (edge_cloud_config.enabled=True) with speculative "
+                f"decoding (method='{spec_method}', e.g. mtp or eagle3) requires async "
+                "scheduling to be enabled. Please remove --no-async-scheduling "
+                "(i.e. keep async scheduling on), or disable speculative decoding."
+            )
 
     def _check_enable_hamming_sparse(self):
         if self.enable_hamming_sparse:

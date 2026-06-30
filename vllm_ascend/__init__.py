@@ -32,6 +32,11 @@ def _ensure_global_patch():
     from vllm_ascend.utils import adapt_patch
 
     adapt_patch(is_global_patch=True)
+
+    # Import edge-cloud model patches so that they are also applied in the
+    # subprocess spawned by _run_in_subprocess (used by inspect_model_cls).
+    import vllm_ascend.patch.models.qwen3_5_edge_cloud  # noqa: F401
+
     _GLOBAL_PATCH_APPLIED = True
 
 

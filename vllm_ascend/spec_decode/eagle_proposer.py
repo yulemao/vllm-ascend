@@ -6,7 +6,6 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
 
-
 class AscendEagleProposer(EagleProposer, AscendSpecDecodeBaseProposer):
     def __init__(
         self,

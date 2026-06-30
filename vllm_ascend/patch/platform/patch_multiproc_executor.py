@@ -181,6 +181,40 @@ class AscendMultiprocExecutor(MultiprocExecutor):
             return 0
         return super()._get_output_rank()
 
+    @property
+    def max_concurrent_batches(self) -> int:
+        # Edge-cloud embedding_only performs the edge->cloud->edge round trip
+        # INSIDE a single worker.execute_model() call, so it does not rely on the
+        # engine-level batch_queue to pipeline across batches. Under
+        # --no-async-scheduling the base (sync) Scheduler keeps
+        # num_output_placeholders == 0, so a batch_queue depth > 1 lets
+        # schedule(step N+1) run before update_from_output(step N) commits the
+        # just-sampled bonus token. For an MTP verify step that inverts the
+        # ordering: the draft tokens get attached (spec_token_ids) while the
+        # bonus token is still uncommitted, so num_new collapses from
+        # num_draft + 1 to num_draft. That produces the corrupt verify window
+        # (logits_indices[-1], out-of-range bonus index) and rejects every draft,
+        # tanking the acceptance rate. Forcing a single in-flight batch restores
+        # the serial step() path (update_from_output always precedes the next
+        # schedule), matching non-edge-cloud / non-PP behaviour.
+        #
+        # Async edge-cloud is intentionally left untouched: its AsyncScheduler
+        # reserves num_output_placeholders for the in-flight bonus + drafts, so
+        # pipelining stays correct and we keep its throughput.
+        if (
+            self.parallel_config.enable_edge_cloud
+            and not self.scheduler_config.async_scheduling
+        ):
+            return 1
+        # Base behaviour: PP needs PP-size concurrent batches to fill the
+        # pipeline; otherwise depth 2 only when async scheduling is on.
+        pp_size = self.parallel_config.pipeline_parallel_size
+        return (
+            2
+            if pp_size <= 1 and self.scheduler_config.async_scheduling
+            else pp_size
+        )
+
 
 class AscendWorkerProc(WorkerProc):
     @staticmethod

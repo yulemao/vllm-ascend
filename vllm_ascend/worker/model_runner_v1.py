@@ -42,12 +42,15 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_dp_group,
+    get_edge_cloud_layer_range,
     get_pcp_group,
     get_pp_group,
     get_tp_group,
+    is_edge_cloud_pp_mode,
+    is_edge_device,
+    set_edge_cloud_layer_range,
 )
 from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
-from vllm.distributed.parallel_state import is_edge_device, is_edge_cloud_pp_mode
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -828,7 +831,6 @@ class NPUModelRunner(GPUModelRunner):
         # 1. 存储 head_k / tail_k 到 parallel_state 全局变量，
         #    使 make_layers() 在模型 __init__ 中能直接读取并创建正确的
         #    PPMissingLayer 占位（非本地层）和真实层（本地层）。
-        from vllm.distributed.parallel_state import set_edge_cloud_layer_range
         set_edge_cloud_layer_range(self.head_k, self.tail_k)
 
         # 2. 复用标准 vLLM 加载流程：init on device + load_weights on device
@@ -904,37 +906,137 @@ class NPUModelRunner(GPUModelRunner):
             logger.info("[EdgeCloud] Loading drafter model...")
             if self.vllm_config.quant_config is not None:
                 patch_load_weights(self.vllm_config)
+
+            is_mtp_drafter = (
+                self.speculative_config is not None
+                and self.speculative_config.method == "mtp"
+            )
+            if is_mtp_drafter:
+                # MTP draft models use the same edge-cloud layer range mechanism
+                # as the main model. For MTP, all decoder layers run on the cloud
+                # side (embedding_only mode), so head_k=tail_k=0.
+                set_edge_cloud_layer_range(0, 0)
+
             with get_tp_context(self.drafter):
                 self.drafter.load_model(self.model)
 
             if (
-                self.speculative_config
-                and self.speculative_config.method == "mtp"
+                is_mtp_drafter
                 and hasattr(self.drafter, "model")
                 and self.drafter.model is not None
             ):
                 self._setup_edge_cloud_mtp(self.drafter.model)
 
+    def _get_mtp_predictor(self, mtp_model: nn.Module) -> nn.Module | None:
+        """Locate the MTP predictor module inside the draft model.
+
+        Supports both upstream ``DeepSeekMTP`` style models (predictor exposes
+        ``fc``/``norm``/``embed_tokens``/``layers``) and the vLLM-Ascend
+        ``DeepSeekV4MTP`` style (predictor inside ``mtp_model.model``).
+        """
+        if hasattr(mtp_model, "model"):
+            inner = mtp_model.model
+            if hasattr(inner, "layers") and hasattr(inner, "embed_tokens"):
+                return inner
+        if hasattr(mtp_model, "layers") and hasattr(mtp_model, "embed_tokens"):
+            return mtp_model
+        return None
+
+    def _clean_mtp_compilation_config(
+        self,
+        mtp_model: nn.Module,
+        mtp_module_ids: set[int],
+    ) -> None:
+        """Remove stale static_forward_context entries pointing to MTP layers
+        that were replaced by ``PPMissingLayer`` during edge-cloud sharding."""
+        compilation_config = self.vllm_config.compilation_config
+        if compilation_config is None:
+            return
+
+        current_mtp_module_ids = {
+            id(module) for _, module in mtp_model.named_modules()
+        }
+        removed_prefixes: list[str] = []
+        for prefix in list(compilation_config.static_forward_context.keys()):
+            module = compilation_config.static_forward_context[prefix]
+            if id(module) in mtp_module_ids and id(module) not in current_mtp_module_ids:
+                del compilation_config.static_forward_context[prefix]
+                removed_prefixes.append(prefix)
+
+        if removed_prefixes:
+            logger.info(
+                "[EdgeCloud] MTP removed %d stale static_forward_context "
+                "entries: %s",
+                len(removed_prefixes),
+                removed_prefixes,
+            )
+
+        if hasattr(compilation_config, "static_all_moe_layers"):
+            compilation_config.static_all_moe_layers[:] = [
+                prefix
+                for prefix in compilation_config.static_all_moe_layers
+                if prefix not in removed_prefixes
+            ]
+
     def _setup_edge_cloud_mtp(self, mtp_model: nn.Module) -> None:
-        predictor = LayerShardLoader._get_mtp_model(mtp_model)
+        predictor = self._get_mtp_predictor(mtp_model)
         if predictor is None:
             logger.warning("[EdgeCloud] Cannot find MTP predictor for sharding")
             return
 
         num_mtp_layers = len(predictor.layers)
 
-        # All MTP decoder layers run on the cloud side; edge only keeps
-        # embed+fc (first segment) and norm (last segment).
-        layer_plan = EdgeCloudLayerPlan(
-            role=self.edge_cloud_cfg.role,
-            total_layers=num_mtp_layers,
-            k=[0, 0],
-            mode="embedding_only",
-        )
+        # Capture MTP module ids before sharding so we can clean stale
+        # static_forward_context entries that point to removed layers.
+        mtp_module_ids = {id(module) for _, module in mtp_model.named_modules()}
 
-        LayerShardLoader.apply_sharding_to_mtp(
-            mtp_model, layer_plan, self.vllm_config.compilation_config
+        # Use the same edge-cloud layer range mechanism as the main model.
+        # For MTP this was set to head_k=tail_k=0 before the drafter was loaded.
+        head_k, tail_k = get_edge_cloud_layer_range()
+
+        local_layers: set[int] = set()
+        if is_edge_device():
+            if head_k > 0:
+                local_layers.update(range(head_k))
+            if tail_k > 0:
+                local_layers.update(range(num_mtp_layers - tail_k, num_mtp_layers))
+        else:
+            local_layers.update(range(head_k, num_mtp_layers - tail_k))
+
+        layer_keys = (
+            list(predictor.layers.keys())
+            if isinstance(predictor.layers, nn.ModuleDict)
+            else list(range(num_mtp_layers))
         )
+        for idx, key in enumerate(layer_keys):
+            if idx not in local_layers and not isinstance(
+                predictor.layers[key], PPMissingLayer
+            ):
+                predictor.layers[key] = PPMissingLayer()
+
+        # Cloud side does not need embedding/fc/norm modules; edge keeps them.
+        if not is_edge_device():
+            for module_name in (
+                "embed_tokens",
+                "fc",
+                "norm",
+                "pre_fc_norm_hidden",
+                "pre_fc_norm_embedding",
+            ):
+                module = getattr(predictor, module_name, None)
+                if module is not None and not isinstance(module, PPMissingLayer):
+                    setattr(predictor, module_name, PPMissingLayer())
+            if (
+                hasattr(mtp_model, "lm_head")
+                and not isinstance(mtp_model.lm_head, PPMissingLayer)
+            ):
+                mtp_model.lm_head = PPMissingLayer()
+
+        # Re-collect MoE parameters now that some layers may be placeholders.
+        if hasattr(mtp_model, "set_moe_parameters"):
+            mtp_model.set_moe_parameters()
+
+        self._clean_mtp_compilation_config(mtp_model, mtp_module_ids)
 
         if hasattr(self, "_edge_cloud_mtp_segments"):
             delattr(self, "_edge_cloud_mtp_segments")

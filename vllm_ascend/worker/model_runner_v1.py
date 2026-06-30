@@ -6066,8 +6066,9 @@ class NPUModelRunner(GPUModelRunner):
                 ):
                     for wrapper in self._edge_cloud_mtp_segments.values():
                         if isinstance(wrapper, ACLGraphWrapper):
-                            wrapper.init_graph_params(self.cudagraph_batch_sizes)
-                            wrapper.init_draft_graph_params(self.cudagraph_batch_sizes)
+                            wrapper.graph_params = make_graph_params(self.cudagraph_batch_sizes)
+                            if self.speculative_config:
+                                wrapper.draft_graph_params = make_graph_params(self.cudagraph_batch_sizes)
 
     def _get_aclgraph_wrappers(self) -> list[ACLGraphWrapper]:
         """返回所有可能残留 profile 阶段图捕获结果的 ACLGraphWrapper。"""

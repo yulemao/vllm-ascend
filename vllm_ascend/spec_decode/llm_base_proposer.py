@@ -2064,19 +2064,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 for handle in send_work:
                     handle.wait()
 
-            # Receive cloud segment result (all decoder layers run on cloud).
-            # num_tokens comes from the local positions so the optimized recv
-            # path can allocate buffers without a metadata sync. During warmup,
-            # fall back to the forward context's num_tokens.
-            positions = model_kwargs.get("positions")
-            num_tokens = positions.shape[-1] if positions is not None else 0
-            if num_tokens == 0:
-                forward_context = get_forward_context()
-                if forward_context is not None:
-                    num_tokens = getattr(forward_context, "num_tokens", 0) or 0
-            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
-                num_tokens=num_tokens,
-            )
+            # Receive cloud segment result (all decoder layers run on cloud)
+            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
             for handle in comm_handles:
                 handle.wait()
             for postprocess in comm_postprocess:
@@ -2085,6 +2074,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             # Copy received tensors into persistent buffers so that the
             # ACLGraphWrapper-wrapped segment_e sees stable input addresses.
+            positions = model_kwargs.get("positions")
+            num_tokens = positions.shape[-1] if positions is not None else 0
             intermediate = (
                 self.runner._sync_edge_cloud_mtp_intermediate_tensors(
                     num_tokens, intermediate
@@ -2101,22 +2092,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Cloud path: this should normally not be reached because cloud
             # sample_tokens returns None before calling _run_merged_draft.
             # Kept here as a fallback if the calling context changes.
-            # During warmup / profile_run, _last_scheduler_output may be None or
-            # carry 0 tokens; fall back to the forward context's num_tokens.
-            num_tokens = 0
-            if (
-                self.runner is not None
-                and self.runner._last_scheduler_output is not None
-                and self.runner._last_scheduler_output.total_num_scheduled_tokens > 0
-            ):
-                num_tokens = self.runner._last_scheduler_output.total_num_scheduled_tokens
-            if num_tokens == 0:
-                forward_context = get_forward_context()
-                if forward_context is not None:
-                    num_tokens = getattr(forward_context, "num_tokens", 0) or 0
-            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
-                num_tokens=num_tokens,
-            )
+            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
             for handle in comm_handles:
                 handle.wait()
             for postprocess in comm_postprocess:

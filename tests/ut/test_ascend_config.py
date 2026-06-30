@@ -20,13 +20,8 @@ from unittest.mock import patch
 from vllm.config import VllmConfig
 
 from tests.ut.base import TestBase
-from vllm_ascend.ascend_config import (
-    AscendConfig,
-    EdgeCloudConfig,
-    clear_ascend_config,
-    get_ascend_config,
-    init_ascend_config,
-)
+from vllm_ascend.ascend_config import clear_ascend_config, get_ascend_config, init_ascend_config
+from vllm_ascend.utils import clear_enable_sp, enable_sp, get_flashcomm2_config_and_validate
 
 
 class TestAscendConfig(TestBase):
@@ -96,6 +91,152 @@ class TestAscendConfig(TestBase):
         self.assertTrue(ascend_compilation_config.enable_static_kernel)
 
     @_clean_up_ascend_config
+    @patch("vllm_ascend.ascend_config.logger.info_once")
+    @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
+    def test_migrated_config_falls_back_to_envs(self, mock_fix_incompatible_config, mock_info_once):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.parallel_config.tensor_parallel_size = 4
+        with patch.dict(
+            os.environ,
+            {
+                "VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL": "1",
+                "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE": "1",
+                "VLLM_ASCEND_ENABLE_FUSED_MC2": "2",
+                "VLLM_ASCEND_ENABLE_MLAPO": "0",
+                "VLLM_ASCEND_ENABLE_FLASHCOMM1": "1",
+                "VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE": "2",
+                "MSMONITOR_USE_DAEMON": "1",
+                "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": "0",
+                "VLLM_ASCEND_ENABLE_NZ": "2",
+            },
+        ):
+            ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertTrue(ascend_config.enable_context_parallel)
+        self.assertTrue(ascend_config.enable_matmul_allreduce)
+        self.assertEqual(ascend_config.enable_fused_mc2, 2)
+        self.assertFalse(ascend_config.enable_mlapo)
+        self.assertTrue(ascend_config.enable_flashcomm1)
+        self.assertEqual(ascend_config.enable_flashcomm2_parallel_size, 2)
+        self.assertTrue(ascend_config.msmonitor_use_daemon)
+        self.assertFalse(ascend_config.enable_transpose_kv_cache_by_block)
+        self.assertEqual(ascend_config.weight_nz_mode, 2)
+        mock_info_once.assert_any_call(
+            "AscendConfig.enable_mlapo falls back to environment variable VLLM_ASCEND_ENABLE_MLAPO with value False. "
+            "Please use additional_config.enable_mlapo instead, because VLLM_ASCEND_ENABLE_MLAPO will be "
+            "removed in the next release."
+        )
+        mock_info_once.assert_any_call(
+            "AscendConfig.weight_nz_mode falls back to environment variable VLLM_ASCEND_ENABLE_NZ with value 2. "
+            "Please use additional_config.weight_nz_mode instead, because VLLM_ASCEND_ENABLE_NZ will be removed "
+            "in the next release."
+        )
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.ascend_config.logger.info_once")
+    @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
+    def test_migrated_config_skips_default_env_fallback_logs(self, mock_fix_incompatible_config, mock_info_once):
+        test_vllm_config = VllmConfig()
+        with patch.dict(os.environ, {}, clear=True):
+            init_ascend_config(test_vllm_config)
+
+        fallback_logs = [
+            call.args[0]
+            for call in mock_info_once.call_args_list
+            if "falls back to environment variable" in call.args[0]
+        ]
+        self.assertEqual(fallback_logs, [])
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.ascend_config.logger.info_once")
+    @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
+    def test_migrated_config_overrides_envs(self, mock_fix_incompatible_config, mock_info_once):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "enable_context_parallel": False,
+            "enable_matmul_allreduce": False,
+            "enable_fused_mc2": 0,
+            "enable_mlapo": True,
+            "enable_flashcomm1": False,
+            "enable_flashcomm2_parallel_size": 0,
+            "msmonitor_use_daemon": False,
+            "enable_transpose_kv_cache_by_block": True,
+            "weight_nz_mode": 1,
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "VLLM_ASCEND_ENABLE_CONTEXT_PARALLEL": "1",
+                "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE": "1",
+                "VLLM_ASCEND_ENABLE_FUSED_MC2": "2",
+                "VLLM_ASCEND_ENABLE_MLAPO": "0",
+                "VLLM_ASCEND_ENABLE_FLASHCOMM1": "1",
+                "VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE": "2",
+                "MSMONITOR_USE_DAEMON": "1",
+                "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": "0",
+                "VLLM_ASCEND_ENABLE_NZ": "2",
+            },
+        ):
+            ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertFalse(ascend_config.enable_context_parallel)
+        self.assertFalse(ascend_config.enable_matmul_allreduce)
+        self.assertEqual(ascend_config.enable_fused_mc2, 0)
+        self.assertTrue(ascend_config.enable_mlapo)
+        self.assertFalse(ascend_config.enable_flashcomm1)
+        self.assertEqual(ascend_config.enable_flashcomm2_parallel_size, 0)
+        self.assertFalse(ascend_config.msmonitor_use_daemon)
+        self.assertTrue(ascend_config.enable_transpose_kv_cache_by_block)
+        self.assertEqual(ascend_config.weight_nz_mode, 1)
+        mock_info_once.assert_any_call("AscendConfig.enable_mlapo is set from additional_config with value True.")
+        mock_info_once.assert_any_call("AscendConfig.weight_nz_mode is set from additional_config with value 1.")
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
+    def test_enable_flashcomm1_config_overrides_disabled_env(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {"enable_flashcomm1": True}
+        with patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_FLASHCOMM1": "0"}):
+            ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertTrue(ascend_config.enable_flashcomm1)
+        self.assertTrue(enable_sp(test_vllm_config))
+
+    @_clean_up_ascend_config
+    def test_enable_sp_falls_back_to_env_without_current_config(self):
+        clear_enable_sp()
+        with (
+            patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_FLASHCOMM1": "1"}),
+            patch("vllm.config.get_current_vllm_config", side_effect=AssertionError),
+        ):
+            self.assertTrue(enable_sp())
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.utils.logger.warning_once")
+    def test_flashcomm2_warning_uses_enable_flashcomm1_config(self, mock_warning_once):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.parallel_config.tensor_parallel_size = 4
+        test_vllm_config.kv_transfer_config = None
+        ascend_config = type(
+            "MockAscendConfig",
+            (),
+            {
+                "enable_flashcomm2_parallel_size": 2,
+                "layer_sharding": None,
+                "enable_flashcomm1": True,
+                "finegrained_tp_config": type("MockFinegrainedTPConfig", (), {"oproj_tensor_parallel_size": 0})(),
+            },
+        )()
+
+        with patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_FLASHCOMM1": "0"}):
+            self.assertEqual(get_flashcomm2_config_and_validate(ascend_config, test_vllm_config), 2)
+
+        flashcomm1_warning = (
+            "It is recommended to enable FLASHCOMM1 simultaneously when starting FLASHCOMM2 for optimal performance."
+        )
+        self.assertNotIn(flashcomm1_warning, [call.args[0] for call in mock_warning_once.call_args_list])
+
+    @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform._fix_incompatible_config")
     def test_get_ascend_config(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
@@ -149,216 +290,3 @@ class TestAscendConfig(TestBase):
         test_vllm_config.additional_config = {"dump_config": "/tmp/config.json"}
         with self.assertRaises(ValueError):
             init_ascend_config(test_vllm_config)
-
-
-class TestEdgeCloudConfig(TestBase):
-    """Tests for EdgeCloudConfig parsing, validation and head_tail_k."""
-
-    # ---- defaults & disabled behavior ----
-
-    def test_defaults_when_not_provided(self):
-        cfg = EdgeCloudConfig({})
-        self.assertFalse(cfg.enabled)
-        self.assertEqual(cfg.role, "edge")
-        self.assertEqual(cfg.mode, "head_tail")
-        self.assertEqual(cfg.edge_head_tail_layers, 1)
-        self.assertFalse(cfg.enable_decode_graph)
-        self.assertEqual(cfg.decode_graph_min_tokens, 1)
-        self.assertEqual(cfg.transfer_config, {})
-        self.assertEqual(cfg.hidden_dtype, "bf16")
-
-    def test_disabled_skips_validation(self):
-        # role/mode are invalid but enabled=False so _validate is never called
-        cfg = EdgeCloudConfig({"enabled": False, "role": "weird", "mode": "nope"})
-        self.assertFalse(cfg.enabled)
-        self.assertEqual(cfg.role, "weird")
-
-    # ---- head_tail_k property ----
-
-    def test_head_tail_k_symmetric_from_int(self):
-        cfg = EdgeCloudConfig({"enabled": True, "edge_head_tail_layers": 3})
-        self.assertEqual(cfg.head_tail_k, (3, 3))
-
-    def test_head_tail_k_asymmetric_from_list(self):
-        cfg = EdgeCloudConfig({"enabled": True, "edge_head_tail_layers": [2, 5]})
-        self.assertEqual(cfg.head_tail_k, (2, 5))
-
-    def test_head_tail_k_asymmetric_from_tuple(self):
-        cfg = EdgeCloudConfig({"enabled": True, "edge_head_tail_layers": (4, 1)})
-        self.assertEqual(cfg.head_tail_k, (4, 1))
-
-    def test_head_tail_k_embedding_only_is_zero_zero(self):
-        cfg = EdgeCloudConfig(
-            {"enabled": True, "mode": "embedding_only", "edge_head_tail_layers": 3}
-        )
-        self.assertEqual(cfg.head_tail_k, (0, 0))
-
-    # ---- happy-path validated configs ----
-
-    def test_enabled_edge_head_tail(self):
-        cfg = EdgeCloudConfig(
-            {"enabled": True, "role": "edge", "mode": "head_tail", "edge_head_tail_layers": 2}
-        )
-        self.assertTrue(cfg.enabled)
-        self.assertEqual(cfg.role, "edge")
-        self.assertEqual(cfg.head_tail_k, (2, 2))
-
-    def test_enabled_cloud_head_tail_asymmetric(self):
-        cfg = EdgeCloudConfig(
-            {"enabled": True, "role": "cloud", "edge_head_tail_layers": [1, 3]}
-        )
-        self.assertEqual(cfg.role, "cloud")
-        self.assertEqual(cfg.head_tail_k, (1, 3))
-
-    def test_enabled_embedding_only_forces_layers_to_zero(self):
-        cfg = EdgeCloudConfig(
-            {"enabled": True, "mode": "embedding_only", "edge_head_tail_layers": 7}
-        )
-        # embedding_only forces edge_head_tail_layers back to 0 with a warning
-        self.assertEqual(cfg.edge_head_tail_layers, 0)
-        self.assertEqual(cfg.head_tail_k, (0, 0))
-
-    def test_custom_optional_fields(self):
-        cfg = EdgeCloudConfig(
-            {
-                "enabled": True,
-                "enable_decode_graph": True,
-                "decode_graph_min_tokens": 64,
-                "transfer_config": {"dtype": "fp16"},
-                "hidden_dtype": "fp16",
-            }
-        )
-        self.assertTrue(cfg.enable_decode_graph)
-        self.assertEqual(cfg.decode_graph_min_tokens, 64)
-        self.assertEqual(cfg.transfer_config, {"dtype": "fp16"})
-        self.assertEqual(cfg.hidden_dtype, "fp16")
-
-    # ---- validation failures ----
-
-    def test_invalid_role_raises(self):
-        with self.assertRaises(ValueError):
-            EdgeCloudConfig({"enabled": True, "role": "fog"})
-
-    def test_invalid_mode_raises(self):
-        with self.assertRaises(ValueError):
-            EdgeCloudConfig({"enabled": True, "mode": "split"})
-
-    def test_head_tail_mode_requires_positive_head_k(self):
-        with self.assertRaises(ValueError):
-            EdgeCloudConfig({"enabled": True, "mode": "head_tail", "edge_head_tail_layers": 0})
-
-    def test_negative_head_k_raises(self):
-        with self.assertRaises(ValueError):
-            EdgeCloudConfig(
-                {"enabled": True, "edge_head_tail_layers": [-1, 2]}
-            )
-
-    def test_negative_tail_k_raises(self):
-        with self.assertRaises(ValueError):
-            EdgeCloudConfig(
-                {"enabled": True, "edge_head_tail_layers": [2, -3]}
-            )
-
-    # ---- repr ----
-
-    def test_repr_contains_key_fields(self):
-        cfg = EdgeCloudConfig(
-            {"enabled": True, "role": "cloud", "edge_head_tail_layers": [1, 2],
-             "enable_decode_graph": True}
-        )
-        text = repr(cfg)
-        self.assertIn("EdgeCloudConfig", text)
-        self.assertIn("enabled=True", text)
-        self.assertIn("role=cloud", text)
-        self.assertIn("mode=head_tail", text)
-        self.assertIn("enable_decode_graph=True", text)
-
-    def test_repr_default_config_disabled(self):
-        cfg = EdgeCloudConfig({})
-        text = repr(cfg)
-        self.assertIn("enabled=False", text)
-        self.assertIn("role=edge", text)
-        self.assertIn("mode=head_tail", text)
-        self.assertIn("enable_decode_graph=False", text)
-
-    # ---- misc behavior ----
-
-    def test_head_tail_k_computable_even_when_disabled(self):
-        # head_tail_k is a pure property; it works regardless of `enabled`.
-        cfg = EdgeCloudConfig({"enabled": False, "edge_head_tail_layers": 4})
-        self.assertEqual(cfg.head_tail_k, (4, 4))
-
-    def test_enabled_does_not_require_edge_head_tail_layers_field(self):
-        # Defaults to 1 when omitted, still valid for head_tail mode.
-        cfg = EdgeCloudConfig({"enabled": True})
-        self.assertTrue(cfg.enabled)
-        self.assertEqual(cfg.head_tail_k, (1, 1))
-
-    def test_embedding_only_with_zero_layers_does_not_warn(self):
-        # When mode==embedding_only and edge_head_tail_layers already 0,
-        # the warning/force-to-zero path is a no-op (still valid config).
-        cfg = EdgeCloudConfig(
-            {"enabled": True, "mode": "embedding_only", "edge_head_tail_layers": 0}
-        )
-        self.assertEqual(cfg.edge_head_tail_layers, 0)
-        self.assertEqual(cfg.head_tail_k, (0, 0))
-
-    def test_role_normalization_edge_and_cloud_both_valid(self):
-        for role in ("edge", "cloud"):
-            cfg = EdgeCloudConfig({"enabled": True, "role": role})
-            self.assertEqual(cfg.role, role)
-
-    def test_mode_normalization_both_valid(self):
-        for mode in ("head_tail", "embedding_only"):
-            cfg = EdgeCloudConfig(
-                {"enabled": True, "mode": mode, "edge_head_tail_layers": 0}
-                if mode == "embedding_only"
-                else {"enabled": True, "mode": mode}
-            )
-            self.assertEqual(cfg.mode, mode)
-
-    def test_hidden_dtype_and_transfer_config_passthrough(self):
-        cfg = EdgeCloudConfig(
-            {"enabled": True, "hidden_dtype": "fp32",
-             "transfer_config": {"bucket_size_mb": 8}}
-        )
-        self.assertEqual(cfg.hidden_dtype, "fp32")
-        self.assertEqual(cfg.transfer_config, {"bucket_size_mb": 8})
-
-
-class TestAscendConfigMixPlacement(TestBase):
-    """Tests for AscendConfig._check_mix_placement edge-cloud guard."""
-
-    @staticmethod
-    def _make_bare_config(**attrs):
-        cfg = AscendConfig.__new__(AscendConfig)
-        cfg.mix_placement = attrs.get("mix_placement", False)
-        cfg.enable_shared_expert_dp = attrs.get("enable_shared_expert_dp", False)
-        cfg.multistream_overlap_shared_expert = attrs.get(
-            "multistream_overlap_shared_expert", False
-        )
-        return cfg
-
-    def test_no_raise_when_mix_placement_disabled(self):
-        cfg = self._make_bare_config(mix_placement=False,
-                                     enable_shared_expert_dp=True,
-                                     multistream_overlap_shared_expert=True)
-        cfg._check_mix_placement()
-
-    def test_no_raise_when_mix_placement_enabled_no_conflicts(self):
-        cfg = self._make_bare_config(mix_placement=True,
-                                     enable_shared_expert_dp=False,
-                                     multistream_overlap_shared_expert=False)
-        cfg._check_mix_placement()
-
-    def test_raises_with_shared_expert_dp(self):
-        cfg = self._make_bare_config(mix_placement=True,
-                                     enable_shared_expert_dp=True)
-        with self.assertRaises(ValueError):
-            cfg._check_mix_placement()
-
-    def test_raises_with_multistream_overlap(self):
-        cfg = self._make_bare_config(mix_placement=True,
-                                     multistream_overlap_shared_expert=True)
-        with self.assertRaises(ValueError):
-            cfg._check_mix_placement()

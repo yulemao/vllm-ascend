@@ -23,6 +23,7 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.distributed import get_ep_group
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -158,10 +159,13 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
             return
 
         if not hasattr(layer, "_mxfp8_original_shapes"):
-            raise RuntimeError(
-                "Cannot restore weights: original shapes not recorded. "
+            err_msg = (
+                "[vllm-ascend/W8A8_MXFP8] Cannot restore weights: original "
+                "shapes not recorded. "
                 "This should not happen if process_weights_after_loading was called first."
             )
+            logger.error(err_msg)
+            raise RuntimeError(err_msg)
 
         orig_shapes = layer._mxfp8_original_shapes
         orig_scale_shape = orig_shapes["weight_scale"]
@@ -252,6 +256,7 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         mc2_mask: torch.Tensor | None = None,
+        tid2eid: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_shared_experts = getattr(layer, "n_shared_experts", 0)
         if num_shared_experts is None:
@@ -276,6 +281,7 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
             num_experts=num_logical_experts,
+            tid2eid=tid2eid,
         )
 
         # this is a naive implementation for experts load balance so as
@@ -312,6 +318,7 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
                 mxfp_use_bf16=(x.dtype in [torch.bfloat16, torch.float8_e4m3fn]),
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
+                swiglu_limit=layer.swiglu_limit,
             )
         )
 
@@ -378,10 +385,13 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
             return
 
         if not hasattr(layer, "_mxfp8_original_shapes"):
-            raise RuntimeError(
-                "Cannot restore weights: original shapes not recorded. "
+            err_msg = (
+                "[vllm-ascend/W8A8_MXFP8] Cannot restore weights: original "
+                "shapes not recorded. "
                 "This should not happen if process_weights_after_loading was called first."
             )
+            logger.error(err_msg)
+            raise RuntimeError(err_msg)
 
         orig_shapes = layer._mxfp8_original_shapes
 

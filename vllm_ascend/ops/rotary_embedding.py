@@ -89,6 +89,11 @@ def set_cos_and_sin(vllm_config, max_num_reqs, decode_token_per_req, dtype, devi
 def get_cos_and_sin_mla(positions, use_cache=False):
     global _cos_cache
     global _sin_cache
+    # Ensure cache is on the same device as positions (NPU)
+    if _cos_cache is not None and _cos_cache.device != positions.device:
+        _cos_cache = _cos_cache.to(positions.device)
+    if _sin_cache is not None and _sin_cache.device != positions.device:
+        _sin_cache = _sin_cache.to(positions.device)
     cos = _cos_cache[positions].unsqueeze(1).unsqueeze(2)
     sin = _sin_cache[positions].unsqueeze(1).unsqueeze(2)
     if not use_cache:
@@ -131,9 +136,14 @@ def update_cos_sin(positions):
     global _sin
     global _cos_slice
     global _sin_slice
+    global _cos_sin_cache
 
     if _cos_sin_cache is None or _cos is None or _sin is None:
         return
+
+    # Ensure _cos_sin_cache is on the same device as positions
+    if _cos_sin_cache.device != positions.device:
+        _cos_sin_cache = _cos_sin_cache.to(positions.device)
 
     num_tokens = positions.size(0)
     _cos[:, :num_tokens] = (

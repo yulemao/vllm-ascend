@@ -10,7 +10,12 @@ from vllm.distributed.kv_events import (
     KVConnectorKVEvents,
     KVEventAggregator,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1, KVConnectorMetadata, KVConnectorRole
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1,
+    KVConnectorMetadata,
+    KVConnectorRole,
+    SupportsHMA,
+)
 from vllm.forward_context import ForwardContext
 from vllm.logger import logger
 from vllm.utils.network_utils import make_zmq_socket
@@ -63,14 +68,12 @@ class AscendStoreKVEvents(KVConnectorKVEvents):
         return f"<AscendStoreKVEvents events={self.get_all_events()}>"
 
 
-class AscendStoreConnector(KVConnectorBase_V1):
+class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
         """
         AscendStore requires PIECEWISE CUDA graph mode when layerwise
-        operations are enabled. The layerwise load/save hooks perform
-        async synchronization that cannot be safely captured in CUDA
-        graphs.
+        operations are enabled.
         """
         return extra_config.get("use_layerwise", False)
 
@@ -94,13 +97,15 @@ class AscendStoreConnector(KVConnectorBase_V1):
         self._kv_cache_events: AscendStoreKVEvents | None = None
 
         self.sended_but_unfinished_reqs: set[str] = set()
+        self._current_step_has_real_forward = False
 
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = KVPoolScheduler(vllm_config, self.use_layerwise)
+            self.connector_scheduler = KVPoolScheduler(vllm_config, self.use_layerwise, kv_cache_config)
         else:
             self.connector_worker = KVPoolWorker(
                 vllm_config,
                 self.use_layerwise,
+                kv_cache_config,
             )
 
             assert self.connector_worker is not None
@@ -133,6 +138,14 @@ class AscendStoreConnector(KVConnectorBase_V1):
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_finished_all_groups(request, block_ids)
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
@@ -176,7 +189,22 @@ class AscendStoreConnector(KVConnectorBase_V1):
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
-        self.connector_worker.start_load_kv(self._get_connector_metadata())
+        metadata = self._get_connector_metadata()
+        self._current_step_has_real_forward = forward_context is not None
+        logger.debug(
+            "KV pool connector start_load_kv metadata_requests=%d specs=%s",
+            len(metadata.requests),
+            [
+                (
+                    request.req_id,
+                    None if request.load_spec is None else request.load_spec.can_load,
+                    None if request.load_spec is None else request.load_spec.vllm_cached_tokens,
+                    None if request.load_spec is None else request.load_spec.kvpool_cached_tokens,
+                )
+                for request in metadata.requests
+            ],
+        )
+        self.connector_worker.start_load_kv(metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self.use_layerwise:
@@ -207,9 +235,13 @@ class AscendStoreConnector(KVConnectorBase_V1):
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
-        done_sending, done_recving = self.connector_worker.get_finished(
-            finished_req_ids, self._get_connector_metadata()
-        )
+        metadata = self._get_connector_metadata()
+        if self._current_step_has_real_forward:
+            try:
+                self.connector_worker.ensure_store_initialized()
+            finally:
+                self._current_step_has_real_forward = False
+        done_sending, done_recving = self.connector_worker.get_finished(finished_req_ids, metadata)
         return done_sending, done_recving
 
     def get_kv_connector_kv_cache_events(self) -> AscendStoreKVEvents | None:
@@ -251,9 +283,21 @@ class LookupKeyServer:
             while self.running:
                 all_frames = self.socket.recv_multipart(copy=False)
                 token_len = int.from_bytes(all_frames[0], byteorder="big")
-                hash_frames = all_frames[1:]
+                kv_group_ids = self.decoder.decode([all_frames[1]])
+                hash_frames = all_frames[2:]
                 hashes_str = self.decoder.decode(hash_frames)
-                result = self.pool_worker.lookup_scheduler(token_len, hashes_str, self.use_layerwise)
+                result = self.pool_worker.lookup_scheduler(
+                    token_len,
+                    hashes_str,
+                    kv_group_ids,
+                    self.use_layerwise,
+                )
+                logger.debug(
+                    "KV pool lookup response token_len=%d groups=%s hit_tokens=%d",
+                    token_len,
+                    kv_group_ids,
+                    result,
+                )
                 response = result.to_bytes(4, "big")
                 self.socket.send(response)
 

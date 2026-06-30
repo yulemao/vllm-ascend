@@ -19,7 +19,6 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -53,6 +52,7 @@ from vllm_ascend.utils import (
     enable_dsa_cp,
     enable_dsa_cp_with_layer_shard,
     enable_dsa_cp_with_o_proj_tp,
+    enable_sp,
     get_weight_prefetch_method,
     maybe_trans_nz,
 )
@@ -339,7 +339,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             seq_lens_cpu=seq_lens_cpu,
             slot_mapping=slot_mapping,
             head_dim=self.model_config.get_head_size(),
-            attn_mask=self.attn_mask_builder.get_attention_mask(self.model_config),
+            attn_mask=self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal, self.model_config),
             attn_state=common_attn_metadata.attn_state,
             block_table=block_table,
             sin=sin[:num_input_tokens],
@@ -425,7 +425,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # The MLAPO operator fuses the pre-processing steps on Q/K/V in MLA into a single operator
         # NOTE: it imposes a limit on the number of input tokens and conflicts with FlashComm
-        self.enable_mlapo = envs.VLLM_ASCEND_ENABLE_MLAPO
+        self.enable_mlapo = get_ascend_config().enable_mlapo
 
         assert self.indexer is not None, "Indexer is required for DSA."
 
@@ -462,6 +462,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # Effective in SFA when FlashComm is enabled.
         self.enable_dsa_cp = enable_dsa_cp()
+        self.enable_sp = enable_sp()
 
         # Enable layer sharding via DSA-CP on the P node in the PD-disaggregated setup.
         self.enable_dsa_cp_with_layer_shard = enable_dsa_cp_with_layer_shard()
@@ -1125,6 +1126,9 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         # run mlapo ops when dsa-cp is disabled, and ensure that num_tokens satisfies the count limitation
         if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS:
+            hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+                hidden_states.contiguous(), need_gather_q_kv
+            )
             hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
                 hidden_states=hidden_states,
                 kv_cache=kv_cache,
@@ -1142,6 +1146,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
                 inputs=self.fused_qkv_a_proj.weight, dependency=hidden_states
             )
+            if self.enable_sp and not self.enable_dsa_cp:
+                hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
+                    hidden_states.contiguous(), need_gather_q_kv
+                )
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
             q_c, kv_no_split = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],

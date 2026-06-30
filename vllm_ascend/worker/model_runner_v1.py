@@ -3208,8 +3208,17 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         for _ in range(num_steps):
-            # Receive intermediate from edge (including positions and spec_step_idx)
-            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+            # Receive intermediate from edge (including positions and spec_step_idx).
+            # num_tokens must match the edge side's total_num_scheduled_tokens so
+            # the optimized recv path can allocate buffers without a metadata sync.
+            num_tokens = (
+                self._last_scheduler_output.total_num_scheduled_tokens
+                if self._last_scheduler_output is not None
+                else 0
+            )
+            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
+                num_tokens=num_tokens,
+            )
             for handle in comm_handles:
                 handle.wait()
             for postprocess in comm_postprocess:

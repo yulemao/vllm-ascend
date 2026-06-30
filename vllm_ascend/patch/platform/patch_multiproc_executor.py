@@ -181,40 +181,6 @@ class AscendMultiprocExecutor(MultiprocExecutor):
             return 0
         return super()._get_output_rank()
 
-    @property
-    def max_concurrent_batches(self) -> int:
-        # Edge-cloud performs the whole edge->cloud->edge round trip *inside a
-        # single* execute_model call, so the edge/cloud PP ranks already run
-        # concurrently within one scheduler step; the scheduler does NOT need
-        # to pipeline successive logical steps to "fill the pipeline".
-        #
-        # With sync (non-async) scheduling this pipelining is actively harmful:
-        # max_concurrent_batches > 1 makes the engine use step_with_batch_queue,
-        # which schedules step N+1 *before* step N's update_from_output (which
-        # appends the sampled bonus token) and post_step (which attaches the MTP
-        # draft tokens) have run. The spec-decode verify step is then scheduled
-        # from stale request state and gets num_draft tokens instead of
-        # num_draft + 1, producing a negative/shifted logits window
-        # (logits_indices=[-1, 0, 1, 2]) and collapsing draft acceptance.
-        # Async scheduling does not hit this because AsyncScheduler reserves the
-        # bonus + draft slots up-front via num_output_placeholders.
-        #
-        # Force non-pipelined stepping (batch_queue disabled -> EngineCore uses
-        # step()) for sync edge-cloud so every step's token/num_computed
-        # accounting is committed before the next schedule. Async keeps the
-        # default pipelined behaviour.
-        if (
-            self.parallel_config.enable_edge_cloud
-            and not self.scheduler_config.async_scheduling
-        ):
-            return 1
-        pp_size = self.parallel_config.pipeline_parallel_size
-        return (
-            2
-            if pp_size <= 1 and self.scheduler_config.async_scheduling
-            else pp_size
-        )
-
 
 class AscendWorkerProc(WorkerProc):
     @staticmethod

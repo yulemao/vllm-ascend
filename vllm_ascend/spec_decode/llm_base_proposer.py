@@ -465,7 +465,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 pin_memory=self.runner.pin_memory,
             )
 
-        if aclgraph_runtime_mode == CUDAGraphMode.FULL and len(self.runner.attn_groups) > 0:
+        is_edge_cloud = getattr(self.runner, "_edge_cloud_enabled", False)
+        if (
+            aclgraph_runtime_mode == CUDAGraphMode.FULL
+            and len(self.runner.attn_groups) > 0
+            and (not is_edge_cloud or len(self.draft_attn_groups) > 0)
+        ):
             num_computed_tokens_cpu = self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
 
             # num_reqs is already the padded version

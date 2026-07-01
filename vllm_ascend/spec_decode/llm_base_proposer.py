@@ -48,7 +48,10 @@ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
-from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group, edge_cloud_broadcast_recv
+from vllm_ascend.distributed.parallel_state import (
+    edge_cloud_broadcast_recv_mtp,
+    get_lmhead_tp_group,
+)
 from vllm_ascend.ops.triton.reject_sample import pad_cu_for_kernel, pad_tail_to
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
@@ -462,7 +465,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 pin_memory=self.runner.pin_memory,
             )
 
-        if aclgraph_runtime_mode == CUDAGraphMode.FULL and len(self.runner.attn_groups) > 0:
+        is_edge_cloud = getattr(self.runner, "_edge_cloud_enabled", False)
+        if (
+            aclgraph_runtime_mode == CUDAGraphMode.FULL
+            and len(self.runner.attn_groups) > 0
+            and (not is_edge_cloud or len(self.draft_attn_groups) > 0)
+        ):
             num_computed_tokens_cpu = self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
 
             # num_reqs is already the padded version
@@ -2065,7 +2073,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     handle.wait()
 
             # Receive cloud segment result (all decoder layers run on cloud)
-            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+            tensor_dict, comm_handles, comm_postprocess = (
+                edge_cloud_broadcast_recv_mtp()
+            )
             for handle in comm_handles:
                 handle.wait()
             for postprocess in comm_postprocess:
@@ -2092,7 +2102,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Cloud path: this should normally not be reached because cloud
             # sample_tokens returns None before calling _run_merged_draft.
             # Kept here as a fallback if the calling context changes.
-            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+            tensor_dict, comm_handles, comm_postprocess = (
+                edge_cloud_broadcast_recv_mtp()
+            )
             for handle in comm_handles:
                 handle.wait()
             for postprocess in comm_postprocess:

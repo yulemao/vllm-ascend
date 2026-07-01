@@ -490,6 +490,10 @@ class NPUModelRunner(GPUModelRunner):
         # because the drafter setup needs to know whether edge-cloud is enabled.
         self.edge_cloud_cfg = self.ascend_config.edge_cloud_config
         self._edge_cloud_enabled = self.edge_cloud_cfg.enabled
+        # This flag is set per-step in execute_model; initialize it here so
+        # that code paths reaching _prepare_inputs before the first execute_model
+        # call (e.g. profile_run or unit tests) do not hit AttributeError.
+        self._is_edge_cloud_embed_only_tail = False
         if self._edge_cloud_enabled:
             if not self.parallel_config.enable_edge_cloud:
                 raise ValueError(
@@ -1196,10 +1200,10 @@ class NPUModelRunner(GPUModelRunner):
 
         # Pre-allocate persistent intermediate buffers for MTP edge-cloud
         # segments. ACLGraphWrapper requires stable input tensor addresses
-        # across graph replay, but edge_cloud_broadcast_recv() allocates fresh
-        # tensors every iteration. Copying received tensors into these buffers
-        # before calling graph-wrapped segments avoids stale-address crashes
-        # such as ACL error 507011.
+        # across graph replay, but edge_cloud_broadcast_recv_mtp() allocates
+        # fresh tensors every iteration. Copying received tensors into these
+        # buffers before calling graph-wrapped segments avoids stale-address
+        # crashes such as ACL error 507011.
         if hasattr(self, "_edge_cloud_mtp_intermediate_buffers"):
             delattr(self, "_edge_cloud_mtp_intermediate_buffers")
         if hasattr(predictor, "make_empty_intermediate_tensors"):
@@ -1240,7 +1244,7 @@ class NPUModelRunner(GPUModelRunner):
         """Copy received MTP intermediate tensors into persistent buffers.
 
         ACLGraphWrapper captures and replays graphs against fixed input
-        addresses. edge_cloud_broadcast_recv() returns freshly-allocated
+        addresses. edge_cloud_broadcast_recv_mtp() returns freshly-allocated
         tensors each iteration, so we copy them into pre-allocated buffers
         (sized to max_num_tokens) and return sliced views with stable
         addresses for the current num_tokens.
@@ -2958,9 +2962,10 @@ class NPUModelRunner(GPUModelRunner):
                     # regardless of is_last_rank, so the worker can send them to
                     # the cloud side and receive results back for the tail segment.
                     # For embedding_only edge, the output tensors have actual
-                    # batch size (no cudagraph padding on edge), but cloud's
-                    # pre-allocated buffer is sized to max_num_tokens. Pad here
-                    # so that cloud's sync_and_slice copy_ succeeds.
+                    # batch size (no cudagraph padding on edge). The cloud-side
+                    # sync_and_slice_intermediate_tensors copies the received
+                    # prefix and zero-fills the padding locally, so no extra pad
+                    # is required here.
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     self._finalize_dump_data()
@@ -3573,7 +3578,9 @@ class NPUModelRunner(GPUModelRunner):
         return per_layer_attn_metadata
 
     def _run_mtp_cloud_segment(self) -> None:
-        from vllm_ascend.distributed.parallel_state import edge_cloud_broadcast_recv
+        from vllm_ascend.distributed.parallel_state import (
+            edge_cloud_broadcast_recv_mtp,
+        )
 
         # The edge side calls the MTP model for each speculative step
         # (including the first pass).  We loop the same number of times so
@@ -3585,7 +3592,9 @@ class NPUModelRunner(GPUModelRunner):
 
         for _ in range(num_steps):
             # Receive intermediate from edge (including positions and spec_step_idx)
-            tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv()
+            tensor_dict, comm_handles, comm_postprocess = (
+                edge_cloud_broadcast_recv_mtp()
+            )
             for handle in comm_handles:
                 handle.wait()
             for postprocess in comm_postprocess:
@@ -4778,21 +4787,19 @@ class NPUModelRunner(GPUModelRunner):
                 # hidden_states/residual and handles TP/SP internally (e.g. VL
                 # first-layer special branch). Return all keys from the local
                 # buffer so residual is always present.
+                #
+                # The edge side strips cudagraph/SP padding before transmission,
+                # so the received tensors may be shorter than num_tokens. Copy
+                # the received prefix and zero-fill the padding locally to avoid
+                # a shape-mismatch copy_ error on NPUs (e.g. 60 vs 64).
                 for k, v in intermediate_tensors.items():
+                    if not isinstance(v, torch.Tensor):
+                        continue
                     copy_len = num_tokens
                     dst = self.intermediate_tensors[k][:copy_len]
-                    # Senders transmit only real tokens (edge may send fewer
-                    # than the cloud's padded num_tokens, e.g. a small chunk
-                    # under chunk_prefill_prior padded up to a cudagraph size).
-                    # Copy only the rows actually received and zero-fill the
-                    # graph padding tail -- mirrors the non-embedding_only
-                    # branch below.  Without this min(), v[:copy_len] indexes
-                    # past v's real rows (aclnnInplaceCopy error 161002).
                     recv_len = min(v.shape[0], copy_len)
                     if recv_len:
-                        dst[:recv_len].copy_(
-                            v[:recv_len], non_blocking=True
-                        )
+                        dst[:recv_len].copy_(v[:recv_len], non_blocking=True)
                     if recv_len < copy_len:
                         dst[recv_len:].zero_()
                 return IntermediateTensors(
@@ -6820,8 +6827,9 @@ class NPUModelRunner(GPUModelRunner):
                 ):
                     for wrapper in self._edge_cloud_mtp_segments.values():
                         if isinstance(wrapper, ACLGraphWrapper):
-                            wrapper.init_graph_params(self.cudagraph_batch_sizes)
-                            wrapper.init_draft_graph_params(self.cudagraph_batch_sizes)
+                            wrapper.graph_params = make_graph_params(self.cudagraph_batch_sizes)
+                            if self.speculative_config:
+                                wrapper.draft_graph_params = make_graph_params(self.cudagraph_batch_sizes)
 
     def _get_aclgraph_wrappers(self) -> list[ACLGraphWrapper]:
         """返回所有可能残留 profile 阶段图捕获结果的 ACLGraphWrapper。"""

@@ -2640,9 +2640,10 @@ class NPUModelRunner(GPUModelRunner):
                     # regardless of is_last_rank, so the worker can send them to
                     # the cloud side and receive results back for the tail segment.
                     # For embedding_only edge, the output tensors have actual
-                    # batch size (no cudagraph padding on edge), but cloud's
-                    # pre-allocated buffer is sized to max_num_tokens. Pad here
-                    # so that cloud's sync_and_slice copy_ succeeds.
+                    # batch size (no cudagraph padding on edge). The cloud-side
+                    # sync_and_slice_intermediate_tensors copies the received
+                    # prefix and zero-fills the padding locally, so no extra pad
+                    # is required here.
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
                     self._finalize_dump_data()
@@ -4040,11 +4041,21 @@ class NPUModelRunner(GPUModelRunner):
                 # hidden_states/residual and handles TP/SP internally (e.g. VL
                 # first-layer special branch). Return all keys from the local
                 # buffer so residual is always present.
+                #
+                # The edge side strips cudagraph/SP padding before transmission,
+                # so the received tensors may be shorter than num_tokens. Copy
+                # the received prefix and zero-fill the padding locally to avoid
+                # a shape-mismatch copy_ error on NPUs (e.g. 60 vs 64).
                 for k, v in intermediate_tensors.items():
+                    if not isinstance(v, torch.Tensor):
+                        continue
                     copy_len = num_tokens
-                    self.intermediate_tensors[k][:copy_len].copy_(
-                        v[:copy_len], non_blocking=True
-                    )
+                    dst = self.intermediate_tensors[k][:copy_len]
+                    recv_len = min(v.shape[0], copy_len)
+                    if recv_len:
+                        dst[:recv_len].copy_(v[:recv_len], non_blocking=True)
+                    if recv_len < copy_len:
+                        dst[recv_len:].zero_()
                 return IntermediateTensors(
                     {
                         k: v[:num_tokens]

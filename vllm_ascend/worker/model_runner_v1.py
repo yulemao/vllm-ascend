@@ -3213,6 +3213,66 @@ class NPUModelRunner(GPUModelRunner):
 
         return per_layer_attn_metadata
 
+    def _refresh_mtp_cloud_graph_params(
+        self,
+        forward_context: ForwardContext,
+        num_tokens: int,
+        positions: torch.Tensor | None,
+        draft_attn_metadata: dict[str, Any] | None,
+        segment: Any,
+    ) -> None:
+        """Refresh the cloud MTP draft segment's captured FULL-graph attention
+        params before replay.
+
+        Under FULL cudagraph (this includes FULL_DECODE_ONLY, whose decode_mode
+        is FULL) the captured seg_c graph replays the attention params
+        (slot_mapping / seq_lens / block_table) from the buffers captured at
+        warmup.  ``_build_mtp_cloud_attn_metadata`` rebuilds those fresh every
+        step, so without pushing the new values into the segment's captured
+        GraphParams the draft attention replays STALE KV offsets, corrupting the
+        draft hidden states and lowering the MTP acceptance rate.  The main-model
+        edge-cloud segments already do this via
+        ``_update_full_graph_params_if_needed`` (see ``_edge_cloud_forward``);
+        the MTP draft segment was missing the equivalent call.
+
+        No-op unless we are actually replaying a FULL graph (skips capture,
+        warmup and eager runs).
+        """
+        cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
+        if hasattr(cudagraph_runtime_mode, "decode_mode"):
+            cudagraph_runtime_mode = cudagraph_runtime_mode.decode_mode()
+        if (
+            cudagraph_runtime_mode != CUDAGraphMode.FULL
+            or forward_context.capturing
+            or _monitor.cudagraph_capturing_enabled
+            or draft_attn_metadata is None
+            or positions is None
+        ):
+            return
+        drafter = self.drafter
+        if (
+            drafter is None
+            or not getattr(drafter, "draft_attn_groups", None)
+            or getattr(drafter, "update_stream", None) is None
+            or not hasattr(drafter, "_update_full_graph_params")
+        ):
+            return
+        try:
+            drafter._update_full_graph_params(
+                forward_context,
+                num_tokens,
+                draft_attn_metadatas=[draft_attn_metadata],
+                graph_params=getattr(segment, "graph_params", None),
+                draft_graph_params=getattr(segment, "draft_graph_params", None),
+            )
+        except (KeyError, AssertionError) as e:
+            # A size/shape mismatch means this step had no matching captured
+            # graph; fall back to the previous behaviour rather than crash.
+            logger.warning_once(
+                "Skipped MTP cloud draft graph-param refresh (%s); draft "
+                "attention may replay stale params this step.", e,
+            )
+
     def _run_mtp_cloud_segment(self) -> None:
         from vllm_ascend.distributed.parallel_state import (
             edge_cloud_broadcast_recv_mtp,
@@ -3293,6 +3353,16 @@ class NPUModelRunner(GPUModelRunner):
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
                 is_draft_model=True,
             ):
+                # Push this step's freshly-built draft attention params into the
+                # captured graph before replay, otherwise seg_c replays stale
+                # slot_mapping/seq_lens and the MTP hit rate drops.
+                self._refresh_mtp_cloud_graph_params(
+                    get_forward_context(),
+                    batch_descriptor.num_tokens,
+                    positions,
+                    draft_attn_metadata,
+                    segment,
+                )
                 output = segment(**model_kwargs)
             assert isinstance(output, IntermediateTensors)
 

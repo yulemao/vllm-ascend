@@ -2033,7 +2033,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         return num_tokens, input_ids, target_hidden_states, max_query_len, seq_lens, cu_num_tokens
 
     # update full-graph params for one spec token
-    def _update_full_graph_params(self, forward_context, num_tokens, draft_attn_metadatas=None):
+    def _update_full_graph_params(self, forward_context, num_tokens, draft_attn_metadatas=None,
+                                  graph_params=None, draft_graph_params=None):
         if not self.draft_attn_groups:
             return
         assert len(self.draft_attn_groups) > 0
@@ -2046,6 +2047,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.vllm_config,
             self.vllm_config.speculative_config,
             draft_attn_metadatas=draft_attn_metadatas,
+            # Edge-cloud MTP wraps the draft segment in its own
+            # EdgeCloudACLGraphWrapper with a per-segment GraphParams set, so the
+            # captured params must be refreshed into THAT set, not the global one.
+            graph_params=graph_params,
+            draft_graph_params=draft_graph_params,
         )
 
     def _run_mtp_edge_cloud(self, **model_kwargs) -> torch.Tensor:
@@ -2174,6 +2180,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
                 is_draft_model=True,
             ):
+                # Refresh captured graph params before replay (see
+                # NPUModelRunner._refresh_mtp_cloud_graph_params); without this
+                # seg_c replays stale attention params and the hit rate drops.
+                if self.runner is not None and hasattr(
+                    self.runner, "_refresh_mtp_cloud_graph_params"
+                ):
+                    self.runner._refresh_mtp_cloud_graph_params(
+                        get_forward_context(),
+                        batch_descriptor.num_tokens,
+                        positions,
+                        draft_attn_metadata,
+                        segments["c"],
+                    )
                 output = segments["c"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)
 

@@ -2481,7 +2481,19 @@ class NPUModelRunner(GPUModelRunner):
                         )
 
                     # Run core input preparation.
-                    cache = self._run_input_preparation(scheduler_output)
+                    # NOTE: _prepare_inputs was already called inline above; it
+                    # is NOT idempotent (rewrites num_accepted_tokens_cpu in
+                    # place under async spec decode), so reuse its results here
+                    # instead of letting _run_input_preparation call it again.
+                    cache = self._run_input_preparation(
+                        scheduler_output,
+                        precomputed=(
+                            logits_indices,
+                            spec_decode_metadata,
+                            total_num_scheduled_tokens,
+                            num_scheduled_tokens_compressed_list,
+                        ),
+                    )
                     total_num_scheduled_tokens = cache["total_num_scheduled_tokens"]
                     num_tokens_padded = cache["num_tokens_padded"]
                     num_tokens_across_dp = cache["num_tokens_across_dp"]
@@ -3583,12 +3595,23 @@ class NPUModelRunner(GPUModelRunner):
     def _run_input_preparation(
         self,
         scheduler_output: "SchedulerOutput",
+        precomputed: tuple | None = None,
     ) -> dict[str, Any]:
         """Run input preparation pipeline after _update_states.
 
         Executes _prepare_inputs, _determine_batch_execution_and_padding,
         and _build_attention_metadata. Returns all results as a dict that
         can be passed to the forward pass or cached for fast-path reuse.
+
+        ``_prepare_inputs`` is NOT idempotent: under async spec decode it
+        rewrites ``num_accepted_tokens_cpu`` in place by applying the
+        previous-step index permutation, so calling it twice corrupts the
+        per-request accepted-token counts (leading to wrong positions and a
+        drop in MTP acceptance rate). When the caller (execute_model slow
+        path) has already run ``_prepare_inputs`` inline, it passes the
+        results via ``precomputed`` so we reuse them instead of re-running.
+        ``cloud_prepare_early`` has no prior inline call and passes
+        ``precomputed=None`` so we run it here exactly once.
         """
         num_reqs = self.input_batch.num_reqs
         # Guard against empty batch after _update_states
@@ -3612,15 +3635,23 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
         max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
 
-        (
-            logits_indices,
-            spec_decode_metadata,
-            total_num_scheduled_tokens,
-            num_scheduled_tokens_compressed_list,
-        ) = self._prepare_inputs(
-            scheduler_output,
-            num_scheduled_tokens_np,
-        )
+        if precomputed is not None:
+            (
+                logits_indices,
+                spec_decode_metadata,
+                total_num_scheduled_tokens,
+                num_scheduled_tokens_compressed_list,
+            ) = precomputed
+        else:
+            (
+                logits_indices,
+                spec_decode_metadata,
+                total_num_scheduled_tokens,
+                num_scheduled_tokens_compressed_list,
+            ) = self._prepare_inputs(
+                scheduler_output,
+                num_scheduled_tokens_np,
+            )
 
         num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
         if self.pcp_size > 1:

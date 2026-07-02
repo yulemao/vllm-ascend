@@ -3051,6 +3051,55 @@ class NPUModelRunner(GPUModelRunner):
         )
         return async_output
 
+    def _stage_cloud_mtp_slot_mapping(
+        self, slot_mapping: torch.Tensor
+    ) -> torch.Tensor:
+        """Copy the current step's draft ``slot_mapping`` into a stable buffer
+        whose address is bound into the captured seg_c ACL graph.
+
+        The cloud MTP draft segment is replayed once per speculative step, but
+        all steps of a decode batch share a single captured graph (entries are
+        keyed by ``batch_descriptor`` in ``ACLGraphWrapper``).  The draft
+        KV-cache write (``reshape_and_cache``) lives inside that graph and is
+        indexed by ``slot_mapping``; ``update_graph_params`` only patches the
+        attention-read ``seq_lens`` and never touches it.  If we hand the graph
+        a freshly-allocated tensor each step, replay keeps reading the warmup
+        slots and the draft KV is written to the wrong offsets, corrupting the
+        later spec steps and lowering the MTP acceptance rate under ACL graph
+        capture.  Mirroring the single-node path
+        (``AscendSpecDecodeBaseProposer`` slot_mapping_group handling), we copy
+        the fresh values into a persistent buffer in place and return a view
+        with a stable base address so the graph observes them at replay.
+
+        Falls back to the input tensor when no drafter buffer template is
+        available (e.g. eager / no cudagraph), which is harmless because eager
+        execution reads the tensor directly.
+        """
+        buf = getattr(self, "_cloud_mtp_slot_mapping_buf", None)
+        if slot_mapping is None:
+            return slot_mapping
+        if buf is None or buf.device != slot_mapping.device:
+            drafter = self.drafter
+            group = (
+                getattr(drafter, "slot_mapping_group", None)
+                if drafter is not None
+                else None
+            )
+            length = int(group[0].shape[0]) if group else int(self.max_num_tokens)
+            buf = torch.empty(
+                length, dtype=torch.int32, device=slot_mapping.device
+            )
+            # Allocated once (first call happens during warmup capture) and kept
+            # stable afterwards so the graph-bound address never moves.
+            self._cloud_mtp_slot_mapping_buf = buf
+        n = slot_mapping.shape[0]
+        if n > buf.shape[0]:
+            # Buffer too small for this step; skip staging rather than truncate.
+            return slot_mapping
+        buf[:n].copy_(slot_mapping)
+        buf[n:].fill_(PADDING_SLOT_ID)
+        return buf[:n]
+
     def _build_mtp_cloud_attn_metadata(
         self,
         positions: torch.Tensor,
@@ -3184,7 +3233,13 @@ class NPUModelRunner(GPUModelRunner):
                     block_ids * block_size + clamped % block_size
                 ).to(torch.int32)
                 new_slot_mapping.masked_fill_(exceeds, PADDING_SLOT_ID)
-                common_attn_metadata.slot_mapping = new_slot_mapping
+                # reshape_and_cache (the draft KV-cache write) runs INSIDE the
+                # captured seg_c ACL graph and is keyed by slot_mapping.  A
+                # freshly-allocated tensor here is never seen by the replayed
+                # graph, so stage it into a stable persistent buffer instead.
+                common_attn_metadata.slot_mapping = (
+                    self._stage_cloud_mtp_slot_mapping(new_slot_mapping)
+                )
         else:
             # For the first speculative step, preserve the original attn_state
             # from the target model's forward pass (e.g. PrefillNoCache during
@@ -3194,6 +3249,13 @@ class NPUModelRunner(GPUModelRunner):
             # hidden states and leads to 100% draft-hit dead loops.
             if common_attn_metadata.attn_state is None:
                 common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
+            # Same graph-capture concern as the spec_step_idx > 0 branch: the
+            # captured seg_c graph binds whatever slot_mapping tensor existed at
+            # warmup.  Route the first step through the same persistent buffer so
+            # that graph replay reads the current step's KV-write offsets.
+            common_attn_metadata.slot_mapping = (
+                self._stage_cloud_mtp_slot_mapping(common_attn_metadata.slot_mapping)
+            )
 
         # Build per-layer attention metadata using draft_attn_groups.
         per_layer_attn_metadata: dict[str, Any] = {}

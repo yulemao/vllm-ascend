@@ -3077,6 +3077,7 @@ class NPUModelRunner(GPUModelRunner):
         """
         buf = getattr(self, "_cloud_mtp_slot_mapping_buf", None)
         if slot_mapping is None:
+            logger.info("[MTP stage slot] skip: slot_mapping is None")
             return slot_mapping
         if buf is None or buf.device != slot_mapping.device:
             drafter = self.drafter
@@ -3092,12 +3093,30 @@ class NPUModelRunner(GPUModelRunner):
             # Allocated once (first call happens during warmup capture) and kept
             # stable afterwards so the graph-bound address never moves.
             self._cloud_mtp_slot_mapping_buf = buf
+            logger.info(
+                "[MTP stage slot] alloc buf len=%d ptr=%s", length, buf.data_ptr()
+            )
         n = slot_mapping.shape[0]
         if n > buf.shape[0]:
             # Buffer too small for this step; skip staging rather than truncate.
+            logger.info(
+                "[MTP stage slot] skip: n=%d > buf=%d", n, buf.shape[0]
+            )
             return slot_mapping
+        old_fingerprint = buf[:n].clone(memory_format=torch.contiguous_format)
         buf[:n].copy_(slot_mapping)
         buf[n:].fill_(PADDING_SLOT_ID)
+        changed = not torch.equal(old_fingerprint, buf[:n])
+        logger.info(
+            "[MTP stage slot] n=%d in_ptr=%s buf_ptr=%s changed=%s "
+            "in_first5=%s buf_first5=%s",
+            n,
+            slot_mapping.data_ptr(),
+            buf.data_ptr(),
+            changed,
+            slot_mapping[:min(5, n)].tolist(),
+            buf[:min(5, n)].tolist(),
+        )
         return buf[:n]
 
     def _stage_cloud_mtp_positions(
@@ -3122,6 +3141,11 @@ class NPUModelRunner(GPUModelRunner):
         input tensor (harmless in eager, where the tensor is read directly).
         """
         if positions is None or positions.dim() != 1:
+            logger.info(
+                "[MTP stage pos] skip: positions=%s dim=%s",
+                positions is None,
+                positions.dim() if positions is not None else None,
+            )
             return positions
         buf = getattr(self, "_cloud_mtp_positions_buf", None)
         if (
@@ -3137,11 +3161,29 @@ class NPUModelRunner(GPUModelRunner):
             # Allocated once (first call is during warmup capture) and kept
             # stable so the graph-bound address never moves.
             self._cloud_mtp_positions_buf = buf
+            logger.info(
+                "[MTP stage pos] alloc buf len=%d ptr=%s", int(self.max_num_tokens), buf.data_ptr()
+            )
         n = positions.shape[0]
         if n > buf.shape[0]:
+            logger.info(
+                "[MTP stage pos] skip: n=%d > buf=%d", n, buf.shape[0]
+            )
             return positions
+        old_fingerprint = buf[:n].clone(memory_format=torch.contiguous_format)
         buf[:n].copy_(positions)
         buf[n:].zero_()
+        changed = not torch.equal(old_fingerprint, buf[:n])
+        logger.info(
+            "[MTP stage pos] n=%d in_ptr=%s buf_ptr=%s changed=%s "
+            "in_first5=%s buf_first5=%s",
+            n,
+            positions.data_ptr(),
+            buf.data_ptr(),
+            changed,
+            positions[:min(5, n)].tolist(),
+            buf[:min(5, n)].tolist(),
+        )
         return buf[:n]
 
     def _build_mtp_cloud_attn_metadata(
@@ -3345,8 +3387,20 @@ class NPUModelRunner(GPUModelRunner):
         warmup and eager runs).
         """
         cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
+        raw_mode = cudagraph_runtime_mode
         if hasattr(cudagraph_runtime_mode, "decode_mode"):
             cudagraph_runtime_mode = cudagraph_runtime_mode.decode_mode()
+        logger.info(
+            "[MTP refresh] raw_mode=%s decoded_mode=%s capturing=%s "
+            "cg_enabled=%s num_tokens=%d draft_meta=%s positions=%s",
+            raw_mode,
+            cudagraph_runtime_mode,
+            forward_context.capturing,
+            _monitor.cudagraph_capturing_enabled,
+            num_tokens,
+            draft_attn_metadata is not None,
+            positions is not None,
+        )
         if (
             cudagraph_runtime_mode != CUDAGraphMode.FULL
             or forward_context.capturing
@@ -3354,6 +3408,7 @@ class NPUModelRunner(GPUModelRunner):
             or draft_attn_metadata is None
             or positions is None
         ):
+            logger.info("[MTP refresh] skip: guard condition")
             return
         drafter = self.drafter
         if (
@@ -3362,19 +3417,36 @@ class NPUModelRunner(GPUModelRunner):
             or getattr(drafter, "update_stream", None) is None
             or not hasattr(drafter, "_update_full_graph_params")
         ):
+            logger.info(
+                "[MTP refresh] skip: drafter not ready (drafter=%s groups=%s "
+                "stream=%s has_update=%s)",
+                drafter is not None,
+                getattr(drafter, "draft_attn_groups", None) is not None,
+                getattr(drafter, "update_stream", None) is not None,
+                hasattr(drafter, "_update_full_graph_params"),
+            )
             return
+        graph_params = getattr(segment, "graph_params", None)
+        draft_graph_params = getattr(segment, "draft_graph_params", None)
+        logger.info(
+            "[MTP refresh] update: segment=%s graph_params=%s draft_graph_params=%s",
+            type(segment).__name__,
+            graph_params is not None,
+            draft_graph_params is not None,
+        )
         try:
             drafter._update_full_graph_params(
                 forward_context,
                 num_tokens,
                 draft_attn_metadatas=[draft_attn_metadata],
-                graph_params=getattr(segment, "graph_params", None),
-                draft_graph_params=getattr(segment, "draft_graph_params", None),
+                graph_params=graph_params,
+                draft_graph_params=draft_graph_params,
             )
+            logger.info("[MTP refresh] update succeeded")
         except (KeyError, AssertionError) as e:
             # A size/shape mismatch means this step had no matching captured
             # graph; fall back to the previous behaviour rather than crash.
-            logger.warning_once(
+            logger.warning(
                 "Skipped MTP cloud draft graph-param refresh (%s); draft "
                 "attention may replay stale params this step.", e,
             )
@@ -3453,6 +3525,15 @@ class NPUModelRunner(GPUModelRunner):
                         has_lora=False,
                     )
                 )
+            logger.info(
+                "[MTP cloud step] step=%d num_tokens=%d dispatch_mode=%s "
+                "batch_desc=%s segment_type=%s",
+                spec_step_idx,
+                num_tokens,
+                cudagraph_runtime_mode,
+                batch_descriptor,
+                type(segment).__name__,
+            )
 
             with set_ascend_forward_context(
                 attn_metadata=draft_attn_metadata,

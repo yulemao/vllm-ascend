@@ -2108,6 +2108,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Cloud path: this should normally not be reached because cloud
             # sample_tokens returns None before calling _run_merged_draft.
             # Kept here as a fallback if the calling context changes.
+            logger.info(
+                "[MTP cloud fallback] _run_mtp_edge_cloud cloud path triggered "
+                "step=%d num_tokens=%d",
+                spec_step_idx,
+                num_tokens if positions is None else positions.shape[-1],
+            )
             tensor_dict, comm_handles, comm_postprocess = (
                 edge_cloud_broadcast_recv_mtp()
             )

@@ -114,13 +114,24 @@ class ACLGraphWrapper:
         batch_descriptor = forward_context.batch_descriptor
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
 
+        logger.info(
+            "[ACLGraphWrapper] runtime_mode=%s self.runtime_mode=%s batch_desc=%s",
+            aclgraph_runtime_mode,
+            self.runtime_mode,
+            batch_descriptor,
+        )
         if aclgraph_runtime_mode == CUDAGraphMode.NONE or aclgraph_runtime_mode != self.runtime_mode:
             # CUDAGraphMode.NONE could mean the profile run, a warmup run, or
             # running without aclgraphs.
             # We do not trigger capture/replay if the runtime mode is not
             # matches. This enables properly dispatching to the correct
-            # CUDAGraphWrapper when nesting multiple instances with different
+            # CUDAGWrapper when nesting multiple instances with different
             # runtime modes.
+            logger.info(
+                "[ACLGraphWrapper] fallback to eager: runtime_mode=%s self.runtime_mode=%s",
+                aclgraph_runtime_mode,
+                self.runtime_mode,
+            )
             return self.runnable(*args, **kwargs)
 
         if batch_descriptor not in self.concrete_aclgraph_entries:
@@ -130,12 +141,11 @@ class ACLGraphWrapper:
         entry = self.concrete_aclgraph_entries[batch_descriptor]
 
         if entry.aclgraph is None:
-            if self.aclgraph_options.debug_log_enable:
-                # Since we capture aclgraph for many different shapes and
-                # capturing is fast, we don't need to log it for every
-                # shape. E.g. we only log it for the first subgraph in
-                # piecewise mode.
-                logger.debug("Capturing a aclgraph on (%s,%s)", self.runtime_mode.name, entry.batch_descriptor)
+            logger.info(
+                "[ACLGraphWrapper] capturing aclgraph mode=%s batch_desc=%s",
+                self.runtime_mode.name,
+                entry.batch_descriptor,
+            )
             # validate that aclgraph capturing is legal at this point.
             validate_cudagraph_capturing_enabled()
 
@@ -198,7 +208,11 @@ class ACLGraphWrapper:
                 f"got {new_input_addresses}"
             )
 
-        logger.info_once("Replaying aclgraph")
+        logger.info(
+            "[ACLGraphWrapper] replaying aclgraph mode=%s batch_desc=%s",
+            self.runtime_mode.name,
+            entry.batch_descriptor,
+        )
         # In async scheduling or multi-threaded (MT) scenarios, it is possible that
         # the CPU's record event (from update_attn_params) for the iteration i completes
         # before the grph replay of iteration i-1.

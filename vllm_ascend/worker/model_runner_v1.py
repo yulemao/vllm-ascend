@@ -3100,6 +3100,50 @@ class NPUModelRunner(GPUModelRunner):
         buf[n:].fill_(PADDING_SLOT_ID)
         return buf[:n]
 
+    def _stage_cloud_mtp_positions(
+        self, positions: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        """Copy the received draft ``positions`` into a stable buffer whose
+        address is bound into the captured seg_c ACL graph.
+
+        ``positions`` is consumed by RoPE *inside* seg_c
+        (``self.layers[i](positions=...)``).  Like ``hidden_states`` /
+        ``residual`` it must keep a stable address across graph replay, but
+        unlike them it is not part of ``make_empty_intermediate_tensors`` and
+        was passed straight through as the freshly-received tensor.  Under
+        replay the graph then reads the *warmup* positions baked at capture
+        instead of the current ones.  The RoPE error is negligible early in a
+        sequence (positions near the warmup range) but grows with context
+        length, so the MTP acceptance rate degrades visibly toward the end of a
+        run when only long sequences remain -- matching the observed drop as the
+        batch drains.
+
+        Only 1-D decode positions are staged; anything else falls back to the
+        input tensor (harmless in eager, where the tensor is read directly).
+        """
+        if positions is None or positions.dim() != 1:
+            return positions
+        buf = getattr(self, "_cloud_mtp_positions_buf", None)
+        if (
+            buf is None
+            or buf.device != positions.device
+            or buf.dtype != positions.dtype
+        ):
+            buf = torch.zeros(
+                int(self.max_num_tokens),
+                dtype=positions.dtype,
+                device=positions.device,
+            )
+            # Allocated once (first call is during warmup capture) and kept
+            # stable so the graph-bound address never moves.
+            self._cloud_mtp_positions_buf = buf
+        n = positions.shape[0]
+        if n > buf.shape[0]:
+            return positions
+        buf[:n].copy_(positions)
+        buf[n:].zero_()
+        return buf[:n]
+
     def _build_mtp_cloud_attn_metadata(
         self,
         positions: torch.Tensor,
@@ -3368,6 +3412,10 @@ class NPUModelRunner(GPUModelRunner):
             intermediate = self._sync_edge_cloud_mtp_intermediate_tensors(
                 num_tokens, intermediate
             )
+            # positions is consumed by RoPE inside the captured seg_c graph but
+            # is not part of the intermediate buffers, so stage it into its own
+            # stable buffer; otherwise replay uses the warmup positions.
+            positions = self._stage_cloud_mtp_positions(positions)
 
             model_kwargs = {
                 "intermediate_tensors": intermediate,

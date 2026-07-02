@@ -2137,6 +2137,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if positions is not None:
                 model_kwargs["positions"] = positions
             positions = model_kwargs.get("positions", None)
+            # positions is consumed by RoPE inside the captured seg_c graph but
+            # is not part of the persistent intermediate buffers.  Stage it into
+            # its own stable buffer so capture and replay bind the same address
+            # (otherwise replay reads the warmup positions -- see
+            # NPUModelRunner._stage_cloud_mtp_positions).
+            if self.runner is not None and hasattr(
+                self.runner, "_stage_cloud_mtp_positions"
+            ):
+                positions = self.runner._stage_cloud_mtp_positions(positions)
+                if positions is not None:
+                    model_kwargs["positions"] = positions
             num_tokens = positions.shape[-1] if positions is not None else 0
 
             # Build attention metadata for the MTP decoder layers on

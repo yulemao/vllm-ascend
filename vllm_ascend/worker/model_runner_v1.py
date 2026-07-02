@@ -3052,7 +3052,7 @@ class NPUModelRunner(GPUModelRunner):
         return async_output
 
     def _stage_cloud_mtp_slot_mapping(
-        self, slot_mapping: torch.Tensor
+        self, slot_mapping: torch.Tensor, pad_to: int | None = None
     ) -> torch.Tensor:
         """Copy the current step's draft ``slot_mapping`` into a stable buffer
         whose address is bound into the captured seg_c ACL graph.
@@ -3070,6 +3070,11 @@ class NPUModelRunner(GPUModelRunner):
         (``AscendSpecDecodeBaseProposer`` slot_mapping_group handling), we copy
         the fresh values into a persistent buffer in place and return a view
         with a stable base address so the graph observes them at replay.
+
+        ``pad_to`` extends the returned view to the fixed graph bucket size so
+        that the captured graph always writes the same number of rows.  The
+        padding rows (``[n:pad_to]``) carry ``PADDING_SLOT_ID`` so the draft
+        KV-cache write for dummy tokens is a no-op.
 
         Falls back to the input tensor when no drafter buffer template is
         available (e.g. eager / no cudagraph), which is harmless because eager
@@ -3093,15 +3098,16 @@ class NPUModelRunner(GPUModelRunner):
             # stable afterwards so the graph-bound address never moves.
             self._cloud_mtp_slot_mapping_buf = buf
         n = slot_mapping.shape[0]
-        if n > buf.shape[0]:
+        out_len = max(n, pad_to) if pad_to is not None else n
+        if out_len > buf.shape[0]:
             # Buffer too small for this step; skip staging rather than truncate.
             return slot_mapping
         buf[:n].copy_(slot_mapping)
         buf[n:].fill_(PADDING_SLOT_ID)
-        return buf[:n]
+        return buf[:out_len]
 
     def _stage_cloud_mtp_positions(
-        self, positions: torch.Tensor | None
+        self, positions: torch.Tensor | None, pad_to: int | None = None
     ) -> torch.Tensor | None:
         """Copy the received draft ``positions`` into a stable buffer whose
         address is bound into the captured seg_c ACL graph.
@@ -3117,6 +3123,11 @@ class NPUModelRunner(GPUModelRunner):
         length, so the MTP acceptance rate degrades visibly toward the end of a
         run when only long sequences remain -- matching the observed drop as the
         batch drains.
+
+        ``pad_to`` extends the returned view to the fixed graph bucket size so
+        that the captured graph always processes the same number of tokens.
+        The padding tokens (``[n:pad_to]``) carry position 0, which gathers a
+        valid (row-0) cos/sin entry, and their outputs are discarded.
 
         Only 1-D decode positions are staged; anything else falls back to the
         input tensor (harmless in eager, where the tensor is read directly).
@@ -3138,16 +3149,18 @@ class NPUModelRunner(GPUModelRunner):
             # stable so the graph-bound address never moves.
             self._cloud_mtp_positions_buf = buf
         n = positions.shape[0]
-        if n > buf.shape[0]:
+        out_len = max(n, pad_to) if pad_to is not None else n
+        if out_len > buf.shape[0]:
             return positions
         buf[:n].copy_(positions)
         buf[n:].zero_()
-        return buf[:n]
+        return buf[:out_len]
 
     def _build_mtp_cloud_attn_metadata(
         self,
         positions: torch.Tensor,
         spec_step_idx: int,
+        num_reqs_padded: int | None = None,
     ) -> dict[str, Any] | None:
         """Build per-layer attention metadata for the MTP cloud decoder.
 
@@ -3282,7 +3295,9 @@ class NPUModelRunner(GPUModelRunner):
                 # freshly-allocated tensor here is never seen by the replayed
                 # graph, so stage it into a stable persistent buffer instead.
                 common_attn_metadata.slot_mapping = (
-                    self._stage_cloud_mtp_slot_mapping(new_slot_mapping)
+                    self._stage_cloud_mtp_slot_mapping(
+                        new_slot_mapping, pad_to=num_reqs_padded
+                    )
                 )
         else:
             # For the first speculative step, preserve the original attn_state
@@ -3298,8 +3313,25 @@ class NPUModelRunner(GPUModelRunner):
             # warmup.  Route the first step through the same persistent buffer so
             # that graph replay reads the current step's KV-write offsets.
             common_attn_metadata.slot_mapping = (
-                self._stage_cloud_mtp_slot_mapping(common_attn_metadata.slot_mapping)
+                self._stage_cloud_mtp_slot_mapping(
+                    common_attn_metadata.slot_mapping, pad_to=num_reqs_padded
+                )
             )
+
+        # Pad the per-request attention metadata up to the fixed graph bucket
+        # size (num_reqs_padded).  The captured seg_c graph bakes a fixed
+        # token/req shape and the FIA graph-params are keyed by
+        # ``actual_seq_lengths_q[-1]`` (== number of draft tokens); if the batch
+        # is left at the raw request count, that key is generally not a captured
+        # size and, worse, changes every step as the running batch drains, so
+        # the graph-param refresh (see _refresh_mtp_cloud_graph_params)
+        # shape-mismatches and gets skipped -- replaying stale attention params
+        # and dropping the MTP acceptance rate toward the end of a run.  Padding
+        # here keeps capture and replay on one shape (slot_mapping/positions are
+        # already padded via their staging buffers above).
+        self._pad_mtp_cloud_common_metadata(
+            common_attn_metadata, batch_size, num_reqs_padded
+        )
 
         # Build per-layer attention metadata using draft_attn_groups.
         per_layer_attn_metadata: dict[str, Any] = {}
@@ -3318,6 +3350,73 @@ class NPUModelRunner(GPUModelRunner):
                 per_layer_attn_metadata[layer_name] = attn_meta
 
         return per_layer_attn_metadata
+
+    def _pad_mtp_cloud_common_metadata(
+        self,
+        cam: Any,
+        num_reqs_actual: int,
+        num_reqs_padded: int | None,
+    ) -> None:
+        """Extend the draft ``common_attn_metadata`` from the real request count
+        up to the fixed graph bucket size ``num_reqs_padded`` in place.
+
+        Only the per-request fields the Ascend attention builder consumes are
+        padded; ``slot_mapping`` and ``positions`` are already padded through
+        their dedicated stable-address staging buffers and must NOT be
+        reallocated here.  The FIA attention reads (``seq_lens`` /
+        ``block_table`` / ``query_start_loc``) are re-bound into the captured
+        graph every step by ``update_graph_params``, so reallocating them is
+        safe as long as the shape matches the captured bucket.
+
+        Padding convention mirrors the main-model decode path
+        (``_build_attention_metadata``): dummy requests get ``seq_len = 1``
+        (a valid single-slot read), an all-zero block-table row, and one query
+        token each, so ``actual_seq_lengths_q`` becomes ``[1, 2, ..., padded]``
+        whose last element is a captured graph size.  No-op when padding is
+        disabled (eager / no cudagraph) or the batch already fills the bucket.
+        """
+        if num_reqs_padded is None or num_reqs_padded <= num_reqs_actual:
+            return
+        n, p = num_reqs_actual, num_reqs_padded
+
+        def _pad_1d(t: torch.Tensor | None, fill: int) -> torch.Tensor | None:
+            if t is None:
+                return None
+            out = t.new_full((p,) + tuple(t.shape[1:]), fill)
+            out[:n] = t[:n]
+            return out
+
+        # query_start_loc: one query token per (real and dummy) request.
+        qsl_cpu = torch.arange(p + 1, dtype=torch.int32)
+        device = None
+        if cam.query_start_loc is not None:
+            device = cam.query_start_loc.device
+        elif cam.seq_lens is not None:
+            device = cam.seq_lens.device
+        cam.query_start_loc_cpu = qsl_cpu
+        cam.query_start_loc = (
+            qsl_cpu.to(device, non_blocking=True) if device is not None else qsl_cpu
+        )
+        cam.actual_seq_lengths_q = list(range(1, p + 1))
+
+        cam.num_reqs = p
+        cam.num_actual_tokens = p
+        cam.num_input_tokens = p
+        cam.max_query_len = 1
+        cam.decode_token_per_req = 1
+
+        # Dummy requests read a single valid KV slot (seq_len = 1).
+        cam.seq_lens = _pad_1d(cam.seq_lens, 1)
+        cam.seq_lens_cpu = _pad_1d(cam.seq_lens_cpu, 1)
+        cam._seq_lens_cpu = _pad_1d(cam._seq_lens_cpu, 1)
+        cam.num_computed_tokens_cpu = _pad_1d(cam.num_computed_tokens_cpu, 0)
+        if getattr(cam, "seq_lens_cpu_upper_bound", None) is not None:
+            cam.seq_lens_cpu_upper_bound = _pad_1d(cam.seq_lens_cpu_upper_bound, 1)
+
+        # Dummy block-table rows are all-zero; the paired PADDING_SLOT_ID slots
+        # make the draft KV write for these tokens a no-op.
+        if cam.block_table_tensor is not None:
+            cam.block_table_tensor = _pad_1d(cam.block_table_tensor, 0)
 
     def _refresh_mtp_cloud_graph_params(
         self,
@@ -3405,60 +3504,88 @@ class NPUModelRunner(GPUModelRunner):
 
             # Build kwargs for cloud segment
             positions = intermediate.tensors.get("positions", None)
-            num_tokens = positions.shape[-1] if positions is not None else 0
+            num_actual_tokens = positions.shape[-1] if positions is not None else 0
 
-            # Copy received tensors into persistent buffers so that the
-            # ACLGraphWrapper-wrapped segment_c sees stable input addresses.
+            spec_step_idx = 0
+            if "spec_step_idx" in tensor_dict:
+                spec_step_idx = tensor_dict["spec_step_idx"].item()
+
+            # Determine cudagraph runtime mode + the fixed graph bucket size
+            # FIRST.  The captured seg_c graph bakes a fixed token/req shape, so
+            # every input below (intermediate, positions, attention metadata)
+            # must be padded to that same shape (batch_descriptor.num_tokens)
+            # for BOTH capture and replay.  Otherwise, as the running batch
+            # drains and the raw token count changes step to step, replay reuses
+            # a graph captured at a different shape and the graph-param refresh
+            # silently shape-mismatches (see _refresh_mtp_cloud_graph_params),
+            # replaying stale attention params and dropping the MTP acceptance
+            # rate near the end of a run.
+            segment = self._edge_cloud_mtp_segments["c"]
+            cudagraph_runtime_mode = CUDAGraphMode.NONE
+            batch_descriptor = BatchDescriptor(num_actual_tokens)
+            if (
+                self.edge_cloud_cfg.enable_decode_graph
+                and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+                and num_actual_tokens > 0
+            ):
+                cudagraph_runtime_mode, batch_descriptor = (
+                    self.cudagraph_dispatcher.dispatch(
+                        num_tokens=num_actual_tokens,
+                        uniform_decode=True,
+                        has_lora=False,
+                    )
+                )
+            # Graph input length: the fixed bucket size when a FULL graph is
+            # captured/replayed, otherwise the raw token count (eager path,
+            # where no padding is needed).  Padding requires 1-D decode
+            # positions (the only case _stage_cloud_mtp_positions can pad); for
+            # anything else (e.g. m-rope) we keep the raw count so that
+            # intermediate / positions / metadata stay mutually consistent.
+            can_pad = positions is not None and positions.dim() == 1
+            if cudagraph_runtime_mode == CUDAGraphMode.FULL and can_pad:
+                num_graph_tokens = batch_descriptor.num_tokens
+            else:
+                num_graph_tokens = num_actual_tokens
+
+            # Copy received tensors into persistent buffers padded to the graph
+            # size so that the ACLGraphWrapper-wrapped segment_c sees stable
+            # input addresses AND a stable shape across replays.
             intermediate = self._sync_edge_cloud_mtp_intermediate_tensors(
-                num_tokens, intermediate
+                num_graph_tokens, intermediate
             )
             # positions is consumed by RoPE inside the captured seg_c graph but
             # is not part of the intermediate buffers, so stage it into its own
-            # stable buffer; otherwise replay uses the warmup positions.
-            positions = self._stage_cloud_mtp_positions(positions)
+            # stable buffer, padded to the graph size.
+            positions = self._stage_cloud_mtp_positions(
+                positions, pad_to=num_graph_tokens
+            )
 
             model_kwargs = {
                 "intermediate_tensors": intermediate,
                 "positions": positions,
             }
-            spec_step_idx = 0
             if "spec_step_idx" in tensor_dict:
-                spec_step_idx = tensor_dict["spec_step_idx"].item()
                 model_kwargs["spec_step_idx"] = spec_step_idx
 
-            # Build attention metadata for the MTP decoder layers.
-            # Without this, the Ascend attention backend silently
-            # returns zeros, corrupting hidden states.
+            # Build attention metadata for the MTP decoder layers, padded to the
+            # same graph size (num_graph_tokens == padded request count for the
+            # uniform 1-token/req draft decode).  Without this, the Ascend
+            # attention backend silently returns zeros, corrupting hidden states.
             draft_attn_metadata = self._build_mtp_cloud_attn_metadata(
-                positions, spec_step_idx
+                positions,
+                spec_step_idx,
+                num_reqs_padded=(
+                    num_graph_tokens
+                    if (cudagraph_runtime_mode == CUDAGraphMode.FULL and can_pad)
+                    else None
+                ),
             )
-
-            # Run cloud segment (all MTP decoder layers are on cloud)
-            segment = self._edge_cloud_mtp_segments["c"]
-            num_tokens = positions.shape[-1] if positions is not None else 0
-
-            # Determine cudagraph runtime mode for the MTP cloud segment so
-            # that ACLGraphWrapper can replay a captured graph during decode.
-            cudagraph_runtime_mode = CUDAGraphMode.NONE
-            batch_descriptor = BatchDescriptor(num_tokens)
-            if (
-                self.edge_cloud_cfg.enable_decode_graph
-                and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
-                and num_tokens > 0
-            ):
-                cudagraph_runtime_mode, batch_descriptor = (
-                    self.cudagraph_dispatcher.dispatch(
-                        num_tokens=num_tokens,
-                        uniform_decode=True,
-                        has_lora=False,
-                    )
-                )
 
             with set_ascend_forward_context(
                 attn_metadata=draft_attn_metadata,
                 vllm_config=self.vllm_config,
-                num_tokens=num_tokens,
-                num_actual_tokens=num_tokens,
+                num_tokens=num_graph_tokens,
+                num_actual_tokens=num_actual_tokens,
                 batch_descriptor=batch_descriptor,
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
                 is_draft_model=True,

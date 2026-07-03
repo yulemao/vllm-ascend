@@ -3684,23 +3684,25 @@ class NPUModelRunner(GPUModelRunner):
 
             # Determine cudagraph runtime mode for the MTP cloud segment so
             # that ACLGraphWrapper can replay a captured graph during decode.
-            # Do NOT force a decode ACL graph onto a prefill step: under
-            # FULL_DECODE_ONLY the main model already runs prefill batches as
-            # CUDAGraphMode.NONE, and replaying a decode-captured graph with
+            # Do NOT force a decode ACL graph onto a prefill step: the cloud
+            # segment's captured graph is for decode shapes; replaying it with
             # prefill attention metadata leaves the attention params un-updated
             # (the captured graph's attn_params bucket is empty for the prefill
             # key), so the graph replays stale warmup tensors and corrupts the
             # MTP hidden states.
+            is_decode_step = False
+            if draft_attn_metadata:
+                _first_meta = next(iter(draft_attn_metadata.values()))
+                _state = getattr(_first_meta, "attn_state", None)
+                is_decode_step = _state in (
+                    AscendAttentionState.DecodeOnly,
+                    AscendAttentionState.SpecDecoding,
+                )
+
             cudagraph_runtime_mode = CUDAGraphMode.NONE
             batch_descriptor = BatchDescriptor(num_tokens)
-            outer_forward_context = get_forward_context()
-            outer_mode = CUDAGraphMode.NONE
-            if outer_forward_context is not None:
-                outer_mode = outer_forward_context.cudagraph_runtime_mode
-                if hasattr(outer_mode, "decode_mode"):
-                    outer_mode = outer_mode.decode_mode()
             if (
-                outer_mode == CUDAGraphMode.FULL
+                is_decode_step
                 and self.edge_cloud_cfg.enable_decode_graph
                 and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
                 and num_tokens > 0
@@ -3713,11 +3715,11 @@ class NPUModelRunner(GPUModelRunner):
                     )
                 )
             logger.info(
-                "[MTP cloud step] step=%d num_tokens=%d outer_mode=%s "
+                "[MTP cloud step] step=%d num_tokens=%d is_decode_step=%s "
                 "dispatch_mode=%s batch_desc=%s segment_type=%s",
                 spec_step_idx,
                 num_tokens,
-                outer_mode,
+                is_decode_step,
                 cudagraph_runtime_mode,
                 batch_descriptor,
                 type(segment).__name__,

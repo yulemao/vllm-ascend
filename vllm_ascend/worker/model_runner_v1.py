@@ -3131,30 +3131,27 @@ class NPUModelRunner(GPUModelRunner):
         unlike them it is not part of ``make_empty_intermediate_tensors`` and
         was passed straight through as the freshly-received tensor.  Under
         replay the graph then reads the *warmup* positions baked at capture
-        instead of the current ones.  The RoPE error is negligible early in a
-        sequence (positions near the warmup range) but grows with context
-        length, so the MTP acceptance rate degrades visibly toward the end of a
-        run when only long sequences remain -- matching the observed drop as the
-        batch drains.
+        instead of the current ones, corrupting RoPE and lowering the MTP
+        acceptance rate.
 
-        Only 1-D decode positions are staged; anything else falls back to the
-        input tensor (harmless in eager, where the tensor is read directly).
+        Supports 1-D positions as well as N-D positions whose last dimension
+        is the token dimension (e.g. MRoPE/xdrope or flash-comm padded shapes).
         """
-        if positions is None or positions.dim() != 1:
-            logger.info(
-                "[MTP stage pos] skip: positions=%s dim=%s",
-                positions is None,
-                positions.dim() if positions is not None else None,
-            )
+        if positions is None:
+            logger.info("[MTP stage pos] skip: positions is None")
             return positions
+
+        trailing_shape = positions.shape[:-1]
+        n = positions.shape[-1]
         buf = getattr(self, "_cloud_mtp_positions_buf", None)
         if (
             buf is None
             or buf.device != positions.device
             or buf.dtype != positions.dtype
+            or buf.shape[:-1] != trailing_shape
         ):
             buf = torch.zeros(
-                int(self.max_num_tokens),
+                *trailing_shape, int(self.max_num_tokens),
                 dtype=positions.dtype,
                 device=positions.device,
             )
@@ -3162,29 +3159,30 @@ class NPUModelRunner(GPUModelRunner):
             # stable so the graph-bound address never moves.
             self._cloud_mtp_positions_buf = buf
             logger.info(
-                "[MTP stage pos] alloc buf len=%d ptr=%s", int(self.max_num_tokens), buf.data_ptr()
+                "[MTP stage pos] alloc buf shape=%s ptr=%s",
+                list(buf.shape), buf.data_ptr(),
             )
-        n = positions.shape[0]
-        if n > buf.shape[0]:
+        if n > buf.shape[-1]:
             logger.info(
-                "[MTP stage pos] skip: n=%d > buf=%d", n, buf.shape[0]
+                "[MTP stage pos] skip: n=%d > buf=%d", n, buf.shape[-1]
             )
             return positions
-        old_fingerprint = buf[:n].clone(memory_format=torch.contiguous_format)
-        buf[:n].copy_(positions)
-        buf[n:].zero_()
-        changed = not torch.equal(old_fingerprint, buf[:n])
+        view = buf[..., :n]
+        old_fingerprint = view.clone(memory_format=torch.contiguous_format)
+        view.copy_(positions)
+        buf[..., n:].zero_()
+        changed = not torch.equal(old_fingerprint, view)
         logger.info(
-            "[MTP stage pos] n=%d in_ptr=%s buf_ptr=%s changed=%s "
+            "[MTP stage pos] shape=%s in_ptr=%s buf_ptr=%s changed=%s "
             "in_first5=%s buf_first5=%s",
-            n,
+            list(positions.shape),
             positions.data_ptr(),
             buf.data_ptr(),
             changed,
-            positions[:min(5, n)].tolist(),
-            buf[:min(5, n)].tolist(),
+            positions.flatten()[:min(5, positions.numel())].tolist(),
+            view.flatten()[:min(5, view.numel())].tolist(),
         )
-        return buf[:n]
+        return view
 
     def _build_mtp_cloud_attn_metadata(
         self,

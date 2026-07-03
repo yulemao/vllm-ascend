@@ -2064,6 +2064,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 output["spec_step_idx"] = torch.tensor(
                     model_kwargs["spec_step_idx"], dtype=torch.int64, device="cpu"
                 )
+            else:
+                output["spec_step_idx"] = torch.tensor(
+                    0, dtype=torch.int64, device="cpu"
+                )
             if get_pp_group().world_size == 2:
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v

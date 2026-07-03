@@ -3647,18 +3647,18 @@ class NPUModelRunner(GPUModelRunner):
             # that ACLGraphWrapper can replay a captured graph during decode.
             cudagraph_runtime_mode = CUDAGraphMode.NONE
             batch_descriptor = BatchDescriptor(num_tokens)
-            if (
-                self.edge_cloud_cfg.enable_decode_graph
-                and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
-                and num_tokens > 0
-            ):
-                cudagraph_runtime_mode, batch_descriptor = (
-                    self.cudagraph_dispatcher.dispatch(
-                        num_tokens=num_tokens,
-                        uniform_decode=True,
-                        has_lora=False,
-                    )
-                )
+            # if (
+            #     self.edge_cloud_cfg.enable_decode_graph
+            #     and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            #     and num_tokens > 0
+            # ):
+            #     cudagraph_runtime_mode, batch_descriptor = (
+            #         self.cudagraph_dispatcher.dispatch(
+            #             num_tokens=num_tokens,
+            #             uniform_decode=True,
+            #             has_lora=False,
+            #         )
+            #     )
 
             with set_ascend_forward_context(
                 attn_metadata=draft_attn_metadata,

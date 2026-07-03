@@ -23,6 +23,7 @@ import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionBackend,
@@ -1054,6 +1055,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # we inherit ForwardContext in model runner v2, when enable model
         # runner v2, there is not capturing attribute in forward_context,
         # just use getattr to avoid attribute error.
+        if _EXTRA_CTX.is_draft_model:
+            logger.info(
+                "[draft fia fwd] capturing=%s sinks=%s num_tokens=%s attn_state=%s",
+                _EXTRA_CTX.capturing,
+                self.sinks is not None,
+                attn_metadata.actual_seq_lengths_q[-1] if attn_metadata is not None else None,
+                getattr(attn_metadata, "attn_state", None) if attn_metadata is not None else None,
+            )
         if _EXTRA_CTX.capturing:
             if self.sinks is not None:
                 attn_output, num_tokens = self.full_graph_fia_v2(query, key, value, attn_metadata, output)
@@ -1169,6 +1178,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if _EXTRA_CTX.is_draft_model:
+            logger.info(
+                "[draft pa fwd] capturing=%s num_tokens=%d attn_state=%s",
+                _EXTRA_CTX.capturing,
+                query.shape[0],
+                getattr(attn_metadata, "attn_state", None) if attn_metadata is not None else None,
+            )
         if _EXTRA_CTX.capturing:
             return self.full_graph_pa(query, attn_metadata, output)
         torch_npu._npu_paged_attention(

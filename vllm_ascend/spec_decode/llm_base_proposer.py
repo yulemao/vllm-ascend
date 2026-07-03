@@ -2211,6 +2211,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         segments["c"],
                     )
                 output = segments["c"](**model_kwargs)
+            # Diagnostic: log segment_c captured graph-param buckets after the
+            # forward (capture happens on the first call per batch_descriptor).
+            # Compare these keys against [MTP refresh pre-update] refresh_key to
+            # detect capture/refresh num_tokens bucket mismatch -> silent no-op.
+            try:
+                _seg_c = segments["c"]
+                _seg_c_dgp = getattr(_seg_c, "draft_graph_params", None)
+                _seg_c_gp = getattr(_seg_c, "graph_params", None)
+                logger.info(
+                    "[MTP cloud capture] step=%d seg_c draft_graph_params "
+                    "buckets=%s graph_params buckets=%s",
+                    spec_step_idx,
+                    sorted(_seg_c_dgp.attn_params.keys()) if _seg_c_dgp is not None else None,
+                    sorted(_seg_c_gp.attn_params.keys()) if _seg_c_gp is not None else None,
+                )
+            except Exception as _diag_e:
+                logger.info("[MTP cloud capture] diag failed: %s", _diag_e)
             assert isinstance(output, IntermediateTensors)
 
             if get_pp_group().world_size == 2:

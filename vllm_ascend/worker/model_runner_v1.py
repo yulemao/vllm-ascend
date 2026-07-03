@@ -3357,6 +3357,32 @@ class NPUModelRunner(GPUModelRunner):
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_meta
 
+        # Diagnostic: log the FIA capture key source (actual_seq_lengths_q[-1])
+        # and batch geometry. This fires during BOTH warmup capture and runtime,
+        # so capture-time and refresh-time num_tokens bucket keys can be compared.
+        # If they diverge, the refresh in _refresh_mtp_cloud_graph_params looks up
+        # an empty attn_params bucket and silently no-ops -> stale replay.
+        try:
+            _first_meta = next(iter(per_layer_attn_metadata.values())) if per_layer_attn_metadata else None
+            _asq = getattr(_first_meta, "actual_seq_lengths_q", None) if _first_meta is not None else None
+            _asq_last = list(_asq)[-1] if _asq is not None else None
+            _seq_lens_list = getattr(_first_meta, "seq_lens_list", None) if _first_meta is not None else None
+            _slot = getattr(_first_meta, "slot_mapping", None) if _first_meta is not None else None
+            logger.info(
+                "[MTP build meta] step=%d num_input_tokens=%d batch_size=%d "
+                "num_layers=%d fia_key(actual_seq_lengths_q[-1])=%s "
+                "seq_lens_list=%s slot_ptr=%s",
+                spec_step_idx,
+                num_input_tokens,
+                batch_size,
+                len(per_layer_attn_metadata),
+                _asq_last,
+                list(_seq_lens_list) if _seq_lens_list is not None else None,
+                _slot.data_ptr() if isinstance(_slot, torch.Tensor) else None,
+            )
+        except Exception as _diag_e:
+            logger.info("[MTP build meta] diag failed: %s", _diag_e)
+
         return per_layer_attn_metadata
 
     def _refresh_mtp_cloud_graph_params(
@@ -3432,6 +3458,27 @@ class NPUModelRunner(GPUModelRunner):
             graph_params is not None,
             draft_graph_params is not None,
         )
+        # Diagnostic: detect silent no-op. FIA capture keys attn_params by
+        # actual_seq_lengths_q[-1]; this refresh keys by batch_descriptor.num_tokens.
+        # If they diverge, make_graph_params' pre-created empty list makes the
+        # update zip iterate 0 times with NO error and NO warning -> stale replay.
+        try:
+            _dgp = draft_graph_params
+            _buckets = sorted(_dgp.attn_params.keys()) if _dgp is not None else None
+            _attn_len = len(_dgp.attn_params.get(num_tokens, [])) if _dgp is not None else -1
+            _handle_len = len(_dgp.handles.get(num_tokens, [])) if _dgp is not None else -1
+            _first_meta = next(iter(draft_attn_metadata.values())) if draft_attn_metadata else None
+            _asq = getattr(_first_meta, "actual_seq_lengths_q", None) if _first_meta is not None else None
+            _asq_last = list(_asq)[-1] if _asq is not None else None
+            logger.info(
+                "[MTP refresh pre-update] refresh_key(num_tokens)=%d "
+                "captured_buckets=%s attn_params[key]=%d handles[key]=%d "
+                "num_metadata_keys=%d fia_key_from_meta(actual_seq_lengths_q[-1])=%s",
+                num_tokens, _buckets, _attn_len, _handle_len,
+                len(draft_attn_metadata) if draft_attn_metadata else 0, _asq_last,
+            )
+        except Exception as _diag_e:
+            logger.info("[MTP refresh pre-update] diag failed: %s", _diag_e)
         try:
             drafter._update_full_graph_params(
                 forward_context,
@@ -3445,8 +3492,15 @@ class NPUModelRunner(GPUModelRunner):
             # A size/shape mismatch means this step had no matching captured
             # graph; fall back to the previous behaviour rather than crash.
             logger.warning(
-                "Skipped MTP cloud draft graph-param refresh (%s); draft "
-                "attention may replay stale params this step.", e,
+                "Skipped MTP cloud draft graph-param refresh: %s. num_tokens=%s, "
+                "draft_graph_params.attn_params keys=%s, attn_params[num_tokens] "
+                "len=%s. Draft attention may replay stale params this step.",
+                e,
+                num_tokens,
+                sorted(draft_graph_params.attn_params.keys())
+                if draft_graph_params is not None else None,
+                len(draft_graph_params.attn_params.get(num_tokens, []))
+                if draft_graph_params is not None else None,
             )
 
     def _run_mtp_cloud_segment(self) -> None:

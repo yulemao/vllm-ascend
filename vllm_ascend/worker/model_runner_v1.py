@@ -5207,7 +5207,7 @@ class NPUModelRunner(GPUModelRunner):
             if self.use_compress:
                 self.positions.fill_(127)
                 self._dsa_positions_cpu_buf.fill_(127)
-            attn_metadata, _ = self._build_attention_metadata(
+            attn_metadata, spec_decode_common_attn_metadata = self._build_attention_metadata(
                 num_tokens=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded,
                 num_reqs=num_reqs,
@@ -5217,6 +5217,24 @@ class NPUModelRunner(GPUModelRunner):
                 for_cudagraph_capture=is_graph_capturing,
                 num_scheduled_tokens_np=num_scheduled_tokens,
             )
+
+            # In edge-cloud embed_only MTP, the cloud side captures the MTP
+            # decoder segment during drafter.dummy_run.  That path builds draft
+            # attention metadata from _cloud_spec_decode_common_attn_metadata,
+            # which is normally only set during a real execute_model().  Without
+            # it the capture runs with attn_metadata=None, so no attention
+            # params are recorded in the segment's draft_graph_params; at
+            # runtime _refresh_mtp_cloud_graph_params then has nothing to
+            # update and the ACL graph replays stale KV offsets.
+            if (
+                spec_decode_common_attn_metadata is not None
+                and self._edge_cloud_enabled
+                and self.edge_cloud_cfg.role == "cloud"
+                and self.speculative_config is not None
+                and self.speculative_config.method == "mtp"
+            ):
+                self._cloud_spec_decode_common_attn_metadata = spec_decode_common_attn_metadata
+                self._cloud_spec_decode_num_reqs = num_reqs
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,

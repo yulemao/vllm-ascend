@@ -121,6 +121,7 @@ from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
 
+import vllm_ascend.compilation.acl_graph as _acl_graph_module
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm_ascend.compilation.acl_graph import (
@@ -3458,54 +3459,168 @@ class NPUModelRunner(GPUModelRunner):
             graph_params is not None,
             draft_graph_params is not None,
         )
-        # Diagnostic: detect silent no-op. FIA capture keys attn_params by
-        # actual_seq_lengths_q[-1]; this refresh keys by batch_descriptor.num_tokens.
-        # If they diverge, make_graph_params' pre-created empty list makes the
-        # update zip iterate 0 times with NO error and NO warning -> stale replay.
+
+        # The ACL graph is keyed by batch_descriptor.num_tokens (the padded
+        # size), but the attention backends key graph_params differently:
+        #   * FIA (attention_v1) keys by attn_metadata.actual_seq_lengths_q[-1]
+        #   * MLA (mla_v1) keys by q_nope.size(0), which is usually the padded
+        #     token count, but can also differ.
+        # Refreshing with the wrong key silently no-ops because
+        # make_graph_params pre-creates empty lists for the padded buckets only.
+        padded_key = num_tokens
+        fia_key = None
+        if draft_attn_metadata:
+            _first_meta = next(iter(draft_attn_metadata.values()))
+            _decode_meta = getattr(_first_meta, "decode", None)
+            _asq = (
+                getattr(_decode_meta, "actual_seq_lengths_q", None)
+                if _decode_meta is not None else None
+            )
+            if _asq is None:
+                _asq = getattr(_first_meta, "actual_seq_lengths_q", None)
+            if _asq is not None:
+                try:
+                    fia_key = int(list(_asq)[-1])
+                except Exception:
+                    fia_key = None
+
+        # The captured graph may have been bound to the segment's own
+        # draft_graph_params, or -- if captured before the segment wrapper got
+        # its per-segment GraphParams -- to the global _draft_graph_params.
+        # Pick whichever object actually holds captured entries for the key
+        # we are about to refresh.
+        global_draft_graph_params = getattr(
+            _acl_graph_module, "_draft_graph_params", None
+        )
+
+        def _attn_len(params, key):
+            if params is None or key is None:
+                return 0
+            return len(getattr(params, "attn_params", {}).get(key, []))
+
+        update_key = None
+        target_draft_graph_params = None
+        target_name = None
+        for name, candidate_gp in (
+            ("segment", draft_graph_params),
+            ("global", global_draft_graph_params),
+        ):
+            if candidate_gp is None:
+                continue
+            # Prefer the FIA/actual key; fall back to the padded ACL-graph key.
+            for key in (fia_key, padded_key):
+                if key is not None and _attn_len(candidate_gp, key) > 0:
+                    update_key = key
+                    target_draft_graph_params = candidate_gp
+                    target_name = name
+                    break
+            if update_key is not None:
+                break
+
+        if update_key is None:
+            # Nothing has been captured for either key. Use the FIA key (or the
+            # padded key) on the segment's own params so that the subsequent
+            # update attempt fails loudly instead of silently no-oping.
+            update_key = fia_key if fia_key is not None else padded_key
+            target_draft_graph_params = draft_graph_params
+            target_name = "segment_fallback"
+
+        # If the only captured params live in the global draft GraphParams, the
+        # seg_c ACL graph was captured before the segment wrapper had its own
+        # per-segment GraphParams.  Clear the segment's cached ACL entries so the
+        # next forward re-captures against the segment's own params; otherwise we
+        # keep replaying the global-bound graph and the refresh stays a no-op.
+        if target_name == "global":
+            try:
+                segment.concrete_aclgraph_entries.clear()
+                logger.warning(
+                    "[MTP refresh] segment draft params are empty but global "
+                    "draft params have entries for key=%s; clearing segment "
+                    "ACL entries so the next forward re-captures with segment "
+                    "params.",
+                    update_key,
+                )
+            except Exception as _clear_e:
+                logger.info("[MTP refresh] clear segment ACL entries failed: %s", _clear_e)
+
+        def _ensure_graph_params_key(gp, key):
+            if gp is None or key is None:
+                return
+            if key not in gp.attn_params:
+                for attr in (
+                    "events", "handles", "attn_params",
+                    "conv1d_params", "conv1d_handles", "conv1d_events",
+                ):
+                    getattr(gp, attr).setdefault(key, [])
+                gp.workspaces.setdefault(key, None)
+
+        # Make sure the chosen bucket exists so _update_full_graph_params does
+        # not crash with a KeyError when the capture key was not one of the
+        # pre-created padded sizes.  Also ensure the segment's own params have
+        # the bucket in case we just cleared its ACL entries and it will re-capture.
+        _ensure_graph_params_key(target_draft_graph_params, update_key)
+        if draft_graph_params is not target_draft_graph_params:
+            _ensure_graph_params_key(draft_graph_params, update_key)
+
+        # Diagnostic: detect silent no-op and bucket/object mismatches.
         try:
             _dgp = draft_graph_params
             _mgp = graph_params
+            _gdgp = global_draft_graph_params
             _buckets = sorted(_dgp.attn_params.keys()) if _dgp is not None else None
-            _attn_len = len(_dgp.attn_params.get(num_tokens, [])) if _dgp is not None else -1
-            _handle_len = len(_dgp.handles.get(num_tokens, [])) if _dgp is not None else -1
+            _attn_len_padded = len(_dgp.attn_params.get(padded_key, [])) if _dgp is not None else -1
+            _attn_len_fia = len(_dgp.attn_params.get(fia_key, [])) if _dgp is not None and fia_key is not None else -1
             _m_buckets = sorted(_mgp.attn_params.keys()) if _mgp is not None else None
-            _m_attn_len = len(_mgp.attn_params.get(num_tokens, [])) if _mgp is not None else -1
-            _m_handle_len = len(_mgp.handles.get(num_tokens, [])) if _mgp is not None else -1
-            _first_meta = next(iter(draft_attn_metadata.values())) if draft_attn_metadata else None
-            _asq = getattr(_first_meta, "actual_seq_lengths_q", None) if _first_meta is not None else None
-            _asq_last = list(_asq)[-1] if _asq is not None else None
+            _g_buckets = sorted(_gdgp.attn_params.keys()) if _gdgp is not None else None
+            _g_attn_len_padded = len(_gdgp.attn_params.get(padded_key, [])) if _gdgp is not None else -1
+            _g_attn_len_fia = len(_gdgp.attn_params.get(fia_key, [])) if _gdgp is not None and fia_key is not None else -1
             logger.info(
-                "[MTP refresh pre-update] refresh_key(num_tokens)=%d "
-                "DRAFT buckets=%s attn[key]=%d handles[key]=%d | "
-                "MAIN buckets=%s attn[key]=%d handles[key]=%d | "
-                "num_metadata_keys=%d fia_key_from_meta(actual_seq_lengths_q[-1])=%s",
-                num_tokens, _buckets, _attn_len, _handle_len,
-                _m_buckets, _m_attn_len, _m_handle_len,
-                len(draft_attn_metadata) if draft_attn_metadata else 0, _asq_last,
+                "[MTP refresh pre-update] padded_key=%s fia_key=%s "
+                "chosen_target=%s chosen_key=%s | "
+                "segment_draft buckets=%s attn[padded]=%s attn[fia]=%s | "
+                "segment_main buckets=%s | "
+                "global_draft buckets=%s attn[padded]=%s attn[fia]=%s",
+                padded_key, fia_key, target_name, update_key,
+                _buckets, _attn_len_padded, _attn_len_fia,
+                _m_buckets,
+                _g_buckets, _g_attn_len_padded, _g_attn_len_fia,
             )
         except Exception as _diag_e:
             logger.info("[MTP refresh pre-update] diag failed: %s", _diag_e)
+
         try:
             drafter._update_full_graph_params(
                 forward_context,
-                num_tokens,
+                update_key,
                 draft_attn_metadatas=[draft_attn_metadata],
                 graph_params=graph_params,
-                draft_graph_params=draft_graph_params,
+                draft_graph_params=target_draft_graph_params,
             )
-            logger.info("[MTP refresh] update succeeded")
+            post_len = _attn_len(target_draft_graph_params, update_key)
+            logger.info(
+                "[MTP refresh] update succeeded target=%s key=%s post_len=%d",
+                target_name, update_key, post_len,
+            )
+            if post_len == 0:
+                logger.warning(
+                    "[MTP refresh] update completed but attn_params[%s] is still empty; "
+                    "the captured graph is likely bound to a different GraphParams set.",
+                    update_key,
+                )
         except (KeyError, AssertionError) as e:
             # A size/shape mismatch means this step had no matching captured
             # graph; fall back to the previous behaviour rather than crash.
             logger.warning(
-                "Skipped MTP cloud draft graph-param refresh: %s. num_tokens=%s, "
-                "draft_graph_params.attn_params keys=%s, attn_params[num_tokens] "
-                "len=%s. Draft attention may replay stale params this step.",
+                "Skipped MTP cloud draft graph-param refresh: %s. chosen_key=%s, "
+                "target=%s, draft_graph_params.attn_params keys=%s, "
+                "attn_params[chosen_key] len=%s. Draft attention may replay "
+                "stale params this step.",
                 e,
-                num_tokens,
+                update_key,
+                target_name,
                 sorted(draft_graph_params.attn_params.keys())
                 if draft_graph_params is not None else None,
-                len(draft_graph_params.attn_params.get(num_tokens, []))
+                len(draft_graph_params.attn_params.get(update_key, []))
                 if draft_graph_params is not None else None,
             )
 

@@ -3464,17 +3464,23 @@ class NPUModelRunner(GPUModelRunner):
         # update zip iterate 0 times with NO error and NO warning -> stale replay.
         try:
             _dgp = draft_graph_params
+            _mgp = graph_params
             _buckets = sorted(_dgp.attn_params.keys()) if _dgp is not None else None
             _attn_len = len(_dgp.attn_params.get(num_tokens, [])) if _dgp is not None else -1
             _handle_len = len(_dgp.handles.get(num_tokens, [])) if _dgp is not None else -1
+            _m_buckets = sorted(_mgp.attn_params.keys()) if _mgp is not None else None
+            _m_attn_len = len(_mgp.attn_params.get(num_tokens, [])) if _mgp is not None else -1
+            _m_handle_len = len(_mgp.handles.get(num_tokens, [])) if _mgp is not None else -1
             _first_meta = next(iter(draft_attn_metadata.values())) if draft_attn_metadata else None
             _asq = getattr(_first_meta, "actual_seq_lengths_q", None) if _first_meta is not None else None
             _asq_last = list(_asq)[-1] if _asq is not None else None
             logger.info(
                 "[MTP refresh pre-update] refresh_key(num_tokens)=%d "
-                "captured_buckets=%s attn_params[key]=%d handles[key]=%d "
+                "DRAFT buckets=%s attn[key]=%d handles[key]=%d | "
+                "MAIN buckets=%s attn[key]=%d handles[key]=%d | "
                 "num_metadata_keys=%d fia_key_from_meta(actual_seq_lengths_q[-1])=%s",
                 num_tokens, _buckets, _attn_len, _handle_len,
+                _m_buckets, _m_attn_len, _m_handle_len,
                 len(draft_attn_metadata) if draft_attn_metadata else 0, _asq_last,
             )
         except Exception as _diag_e:

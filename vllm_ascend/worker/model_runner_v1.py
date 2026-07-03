@@ -3363,6 +3363,7 @@ class NPUModelRunner(GPUModelRunner):
         # so capture-time and refresh-time num_tokens bucket keys can be compared.
         # If they diverge, the refresh in _refresh_mtp_cloud_graph_params looks up
         # an empty attn_params bucket and silently no-ops -> stale replay.
+        _asq_last = None
         try:
             _first_meta = next(iter(per_layer_attn_metadata.values())) if per_layer_attn_metadata else None
             _asq = getattr(_first_meta, "actual_seq_lengths_q", None) if _first_meta is not None else None
@@ -3383,6 +3384,33 @@ class NPUModelRunner(GPUModelRunner):
             )
         except Exception as _diag_e:
             logger.info("[MTP build meta] diag failed: %s", _diag_e)
+
+        # Safety net: ensure the captured FIA key bucket exists in the draft
+        # GraphParams before the segment forward.  ``full_graph_fia`` indexes
+        # ``graph_params.attn_params[num_tokens]`` (and events/handles) directly
+        # with ``actual_seq_lengths_q[-1]`` during capture, so a key that is not
+        # one of the pre-created ``cudagraph_batch_sizes`` would raise KeyError
+        # mid-capture.  Pre-create the bucket (idempotent) on both the
+        # segment's own draft GraphParams and the global one so capture never
+        # crashes and the runtime refresh can populate / update it.
+        if _asq_last is not None:
+            _seg_c = self._edge_cloud_mtp_segments.get("c")
+            for _gp in (
+                getattr(_seg_c, "draft_graph_params", None),
+                getattr(_acl_graph_module, "_draft_graph_params", None),
+            ):
+                if _gp is None or _asq_last in _gp.attn_params:
+                    continue
+                for _attr in (
+                    "events",
+                    "handles",
+                    "attn_params",
+                    "conv1d_params",
+                    "conv1d_handles",
+                    "conv1d_events",
+                ):
+                    getattr(_gp, _attr).setdefault(_asq_last, [])
+                _gp.workspaces.setdefault(_asq_last, None)
 
         return per_layer_attn_metadata
 
@@ -3518,7 +3546,34 @@ class NPUModelRunner(GPUModelRunner):
                 break
 
         if update_key is None:
-            # Nothing has been captured for either key. Use the FIA key (or the
+            # Neither the FIA actual key nor the padded ACL-graph key matched a
+            # captured bucket.  The draft FULL graph records its FIA handles
+            # under the capture-time ``actual_seq_lengths_q[-1]`` key (see
+            # ``full_graph_fia``), which can differ from the runtime
+            # ``fia_key`` / ``padded_key`` -- e.g. when the decode ``num_reqs``
+            # differs between warmup and runtime, or when the warmup
+            # merged-draft capture uses a different query layout than the
+            # per-step runtime decode.  Fall back to whichever bucket was
+            # actually populated (there is one per captured batch_descriptor),
+            # so the replayed attention still gets refreshed instead of
+            # silently replaying stale / empty params.
+            for name, candidate_gp in (
+                ("segment_populated", draft_graph_params),
+                ("global", global_draft_graph_params),
+            ):
+                if candidate_gp is None:
+                    continue
+                for key in sorted(candidate_gp.attn_params.keys()):
+                    if _attn_len(candidate_gp, key) > 0:
+                        update_key = key
+                        target_draft_graph_params = candidate_gp
+                        target_name = name
+                        break
+                if update_key is not None:
+                    break
+
+        if update_key is None:
+            # Still nothing captured for any key. Use the FIA key (or the
             # padded key) on the segment's own params so that the subsequent
             # update attempt fails loudly instead of silently no-oping.
             update_key = fia_key if fia_key is not None else padded_key

@@ -2227,6 +2227,21 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 batch_descriptor = BatchDescriptor(num_tokens)
                 num_actual_tokens = num_tokens
 
+            # Warmup-only freeze guard.  Step 0 captures the draft FULL graph
+            # (cudagraph_runtime_mode=FULL above).  For later spec steps the
+            # captured graph would be *replayed*, but the per-step attention
+            # refresh (_refresh_mtp_cloud_graph_params) is skipped during the
+            # cudagraph-capturing warmup phase, and replaying the captured FIA
+            # task group without that refresh deadlocks the NPU -- every TP
+            # rank freezes inside aclgraph.replay() (this is the warmup "卡死").
+            # This whole cloud branch is warmup-only (runtime serves via
+            # _run_mtp_cloud_segment, which refreshes before replay), so run the
+            # later spec steps eagerly: it still exercises the edge<->cloud
+            # broadcast handshake every step, while avoiding the un-refreshed
+            # replay.  The step-0 captured graph is what runtime replays later.
+            if spec_step_idx > 0:
+                cudagraph_runtime_mode = CUDAGraphMode.NONE
+
             with set_ascend_forward_context(
                 attn_metadata=draft_attn_metadata,
                 vllm_config=self.vllm_config,

@@ -3122,8 +3122,8 @@ class NPUModelRunner(GPUModelRunner):
     def _stage_cloud_mtp_positions(
         self, positions: torch.Tensor | None
     ) -> torch.Tensor | None:
-        """Copy the received draft ``positions`` into a stable buffer whose
-        address is bound into the captured seg_c ACL graph.
+        """Copy the received draft ``positions`` into a stable, contiguous
+        buffer whose address is bound into the captured seg_c ACL graph.
 
         ``positions`` is consumed by RoPE *inside* seg_c
         (``self.layers[i](positions=...)``).  Like ``hidden_states`` /
@@ -3134,8 +3134,11 @@ class NPUModelRunner(GPUModelRunner):
         instead of the current ones, corrupting RoPE and lowering the MTP
         acceptance rate.
 
-        Supports 1-D positions as well as N-D positions whose last dimension
-        is the token dimension (e.g. MRoPE/xdrope or flash-comm padded shapes).
+        A separate buffer is kept per concrete (trailing_shape, n, dtype,
+        device) so the returned tensor is always contiguous with the exact
+        shape the graph captured.  This avoids stride mismatches that can
+        cause RoPE kernels to read the wrong row when the last dimension is
+        padded to ``max_num_tokens``.
         """
         if positions is None:
             logger.info("[MTP stage pos] skip: positions is None")
@@ -3143,46 +3146,43 @@ class NPUModelRunner(GPUModelRunner):
 
         trailing_shape = positions.shape[:-1]
         n = positions.shape[-1]
-        buf = getattr(self, "_cloud_mtp_positions_buf", None)
-        if (
-            buf is None
-            or buf.device != positions.device
-            or buf.dtype != positions.dtype
-            or buf.shape[:-1] != trailing_shape
-        ):
-            buf = torch.zeros(
-                *trailing_shape, int(self.max_num_tokens),
+        if n == 0:
+            return positions
+
+        contig_bufs = getattr(self, "_cloud_mtp_positions_contig_bufs", None)
+        if contig_bufs is None:
+            contig_bufs = {}
+            self._cloud_mtp_positions_contig_bufs = contig_bufs
+
+        key = (trailing_shape, n, positions.dtype, positions.device)
+        buf = contig_bufs.get(key)
+        if buf is None:
+            buf = torch.empty(
+                *trailing_shape, n,
                 dtype=positions.dtype,
                 device=positions.device,
             )
-            # Allocated once (first call is during warmup capture) and kept
-            # stable so the graph-bound address never moves.
-            self._cloud_mtp_positions_buf = buf
+            contig_bufs[key] = buf
             logger.info(
-                "[MTP stage pos] alloc buf shape=%s ptr=%s",
+                "[MTP stage pos] alloc contig buf shape=%s ptr=%s",
                 list(buf.shape), buf.data_ptr(),
             )
-        if n > buf.shape[-1]:
-            logger.info(
-                "[MTP stage pos] skip: n=%d > buf=%d", n, buf.shape[-1]
-            )
-            return positions
-        view = buf[..., :n]
-        old_fingerprint = view.clone(memory_format=torch.contiguous_format)
-        view.copy_(positions)
-        buf[..., n:].zero_()
-        changed = not torch.equal(old_fingerprint, view)
+
+        old_fingerprint = buf.clone(memory_format=torch.contiguous_format)
+        buf.copy_(positions)
+        changed = not torch.equal(old_fingerprint, buf)
         logger.info(
             "[MTP stage pos] shape=%s in_ptr=%s buf_ptr=%s changed=%s "
-            "in_first5=%s buf_first5=%s",
+            "in_first5=%s buf_first5=%s is_contiguous=%s",
             list(positions.shape),
             positions.data_ptr(),
             buf.data_ptr(),
             changed,
             positions.flatten()[:min(5, positions.numel())].tolist(),
-            view.flatten()[:min(5, view.numel())].tolist(),
+            buf.flatten()[:min(5, buf.numel())].tolist(),
+            buf.is_contiguous(),
         )
-        return view
+        return buf
 
     def _build_mtp_cloud_attn_metadata(
         self,

@@ -1,0 +1,152 @@
+#
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+# This file is a part of the vllm-ascend project.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+#
+
+from typing import Any
+
+import torch
+from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
+from vllm.sequence import IntermediateTensors
+
+
+def _forward_edge_cloud_segment_eagle3(
+    self: Eagle3LlamaForCausalLM,
+    start_layer: int,
+    end_layer: int,
+    input_ids: torch.Tensor | None,
+    positions: torch.Tensor,
+    intermediate_tensors: IntermediateTensors | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+    hidden_states: torch.Tensor | None = None,
+    is_first_segment: bool | None = None,
+    is_last_segment: bool | None = None,
+    **extra_layer_kwargs: Any,
+) -> torch.Tensor | IntermediateTensors:
+    """Edge-cloud segmented forward for Eagle3LlamaForCausalLM.
+
+    Split:
+      - First segment (edge): embed input_ids and combine aux hidden states.
+      - Middle segment (cloud): run all decoder layers + final norm.
+      - Last segment (edge): return post-norm hidden states for logits sampling.
+
+    ``start_layer``/``end_layer`` are kept in the signature for compatibility
+    with ``EdgeCloudSegment`` but the actual split is driven by
+    ``is_first_segment``/``is_last_segment`` because Eagle3 has special
+    layer-0 embed+hidden concatenation and an external FC projection.
+    """
+    num_layers = len(self.model.layers)
+    if is_first_segment is None:
+        is_first_segment = start_layer == 0
+    if is_last_segment is None:
+        is_last_segment = end_layer == num_layers
+
+    if is_first_segment:
+        if inputs_embeds is None:
+            assert input_ids is not None, (
+                "input_ids is None in Eagle3 edge-cloud first segment; "
+                "either input_ids or inputs_embeds must be provided."
+            )
+            inputs_embeds = self.model.embed_input_ids(input_ids)
+        assert hidden_states is not None, (
+            "hidden_states is None in Eagle3 edge-cloud first segment; "
+            "Eagle3 requires target aux hidden states as input."
+        )
+        if self.model.use_aux_hidden_state:
+            hidden_size = self.model.config.hidden_size
+            # The proposer may already call combine_hidden_states() before
+            # passing hidden_states to the model (non-edge-cloud path).  In
+            # edge-cloud mode the raw aux hidden states (3*hidden_size) can also
+            # be sent directly.  Only combine when the input is still in the
+            # raw aux shape.
+            if hidden_states.shape[-1] == hidden_size * 3:
+                hidden_states = self.model.combine_hidden_states(hidden_states)
+        return IntermediateTensors(
+            {
+                "input_embeds": inputs_embeds,
+                "hidden_states": hidden_states,
+                "residual": None,
+            }
+        )
+
+    assert intermediate_tensors is not None, (
+        "intermediate_tensors is None in Eagle3 edge-cloud segment; "
+        "check that all TP ranks receive tensors correctly."
+    )
+    input_embeds = intermediate_tensors["input_embeds"]
+    hidden_states = intermediate_tensors["hidden_states"]
+    residual = intermediate_tensors.get("residual", None)
+
+    if not is_last_segment:
+        # Cloud segment: run all decoder layers and final norm.
+        for layer in self.model.layers:
+            hidden_states, residual = layer(
+                positions=positions,
+                embeds=input_embeds,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        hidden_states, hidden_prenorm = self.model.norm(hidden_states, residual)
+        return IntermediateTensors(
+            {
+                "hidden_states": hidden_states,
+                "residual": hidden_prenorm,
+            }
+        )
+
+    # Last segment (edge): return post-norm hidden states and pre-norm residual
+    # so that the proposer can sample logits and carry hidden_states to the
+    # next draft step, matching the tuple return of Eagle3LlamaForCausalLM.forward.
+    return hidden_states, residual
+
+
+def _eagle3_make_empty_intermediate_tensors(
+    self: Eagle3LlamaForCausalLM,
+    batch_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> IntermediateTensors:
+    hidden_size = self.model.config.hidden_size
+    return IntermediateTensors(
+        {
+            "input_embeds": torch.empty(
+                batch_size, hidden_size, dtype=dtype, device=device
+            ),
+            "hidden_states": torch.empty(
+                batch_size, hidden_size, dtype=dtype, device=device
+            ),
+            "residual": torch.empty(
+                batch_size, hidden_size, dtype=dtype, device=device
+            ),
+        }
+    )
+
+
+Eagle3LlamaForCausalLM.forward_edge_cloud_segment = (
+    _forward_edge_cloud_segment_eagle3
+)
+Eagle3LlamaForCausalLM.supports_pp = True
+Eagle3LlamaForCausalLM.make_empty_intermediate_tensors = (
+    _eagle3_make_empty_intermediate_tensors
+)
+
+# Clear stale _ModelInfo caches so that inspect_model_cls re-computes
+# supports_pp with the patched class instead of loading the old cached value.
+from pathlib import Path  # noqa: E402
+
+from vllm.envs import VLLM_CACHE_ROOT  # noqa: E402
+from vllm.model_executor.models.registry import _try_inspect_model_cls  # noqa: E402
+
+# Clear in-memory lru_cache in case it was populated before the patch.
+_try_inspect_model_cls.cache_clear()
+
+# Clear on-disk cache files for eagle3 draft architectures so the next
+# inspect runs _ModelInfo.from_model_cls on the patched class.
+_cache_dir = Path(VLLM_CACHE_ROOT) / "modelinfos"
+if _cache_dir.exists():
+    for _cache_file in _cache_dir.glob("*eagle3*"):
+        _cache_file.unlink()
+    for _cache_file in _cache_dir.glob("*llama_eagle3*"):
+        _cache_file.unlink()

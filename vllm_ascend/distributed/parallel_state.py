@@ -1186,7 +1186,7 @@ def edge_cloud_broadcast_recv(
     return recv_tensor_dict, [], [broadcast_postprocess]
 
 
-def edge_cloud_broadcast_recv_mtp() -> tuple[
+def edge_cloud_broadcast_recv_draft() -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
     list[Callable[[], None]],
@@ -1200,11 +1200,11 @@ def edge_cloud_broadcast_recv_mtp() -> tuple[
     ``pp_group.irecv_tensor_dict()`` / ``tp_group.broadcast_object()`` path
     that round-trips the metadata over the wire.
 
-    The MTP edge-cloud path originates from an older base branch and sends a
-    per-step tensor dict whose shape/keys are not fully described by the
-    pre-computed EdgeCloudTensorMeta, so it cannot use the locally-computed
-    fast path.  Keep this old implementation around — renamed — for the MTP
-    callers while the non-MTP edge-cloud worker path keeps the optimized one.
+    The draft edge-cloud path (MTP/Eagle3) sends a per-step tensor dict whose
+    shape/keys are not fully described by the pre-computed EdgeCloudTensorMeta,
+    so it cannot use the locally-computed fast path.  Keep this old
+    implementation around — renamed — for the draft callers while the
+    non-draft edge-cloud worker path keeps the optimized one.
     """
     pp_group = get_pp_group()
     tp_group = get_tp_group()
@@ -1213,7 +1213,7 @@ def edge_cloud_broadcast_recv_mtp() -> tuple[
     if is_pp_npu0:
         tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict()
         assert tensor_dict is not None, (
-            "edge_cloud_broadcast_recv_mtp: PP tensor_dict is None, "
+            "edge_cloud_broadcast_recv_draft: PP tensor_dict is None, "
             "sender may have failed."
         )
 
@@ -1265,3 +1265,7 @@ def edge_cloud_broadcast_recv_mtp() -> tuple[
             handle.wait()
 
     return recv_tensor_dict, [], [broadcast_postprocess]
+
+
+# Backward-compatible alias for legacy MTP callers.
+edge_cloud_broadcast_recv_mtp = edge_cloud_broadcast_recv_draft

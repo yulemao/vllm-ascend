@@ -143,6 +143,7 @@ class NPUPlatform(Platform):
         # Import edge-cloud model patches early so that ModelConfig sees the
         # updated supports_pp flags before is_pp_supported_model is checked.
         import vllm_ascend.patch.models.qwen3_5_edge_cloud  # noqa: F401
+        import vllm_ascend.patch.models.eagle3_edge_cloud  # noqa: F401
 
         # For online serving, "ascend" quantization method is not a choice natively,
         # so we need to add "ascend" quantization method to quantization methods list

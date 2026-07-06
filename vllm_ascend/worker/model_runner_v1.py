@@ -2703,7 +2703,16 @@ class NPUModelRunner(GPUModelRunner):
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
-                hidden_states, aux_hidden_states = hidden_states
+                if isinstance(hidden_states, IntermediateTensors):
+                    # Edge-cloud segmented forward returns IntermediateTensors
+                    # instead of the (hidden_states, aux_hidden_states) tuple.
+                    # The auxiliary hidden states for EAGLE3 are cached on the
+                    # cloud side in _eagle3_cloud_aux_hidden_states; leave
+                    # hidden_states as IntermediateTensors so the edge-cloud
+                    # early-return paths below can handle it.
+                    aux_hidden_states = None
+                else:
+                    hidden_states, aux_hidden_states = hidden_states
             if self.pcp_size > 1:
                 # NOTE we must `slice` hidden_states because pcp_allgather_restore_idx
                 # ignores the padding from CUDA Graph.
@@ -3330,6 +3339,10 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens, intermediate
             )
 
+            # Run cloud segment (all draft decoder layers are on cloud)
+            segment = self._edge_cloud_draft_segments["c"]
+            num_tokens = positions.shape[-1] if positions is not None else 0
+
             model_kwargs = {
                 "intermediate_tensors": intermediate,
                 "positions": positions,
@@ -3343,16 +3356,43 @@ class NPUModelRunner(GPUModelRunner):
                 spec_step_idx = tensor_dict["spec_step_idx"].item()
                 model_kwargs["spec_step_idx"] = spec_step_idx
 
+            # Only the first speculative step fuses the target model's auxiliary
+            # hidden states. Subsequent steps consume the previous draft step's
+            # hidden states sent by the edge side.
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.method == "eagle3"
+                and spec_step_idx == 0
+            ):
+                aux_hidden_states = getattr(
+                    self, "_eagle3_cloud_aux_hidden_states", None
+                )
+                if aux_hidden_states is None:
+                    # Warmup / profile_run: the target model has not produced aux
+                    # hidden states yet, but the cloud segment graph must be
+                    # captured along the aux-fusion branch. Create a dummy tensor
+                    # with the same shape so the captured graph can be replayed
+                    # with the real aux hidden states at runtime.
+                    draft_model = segment._edge_model
+                    fc = getattr(draft_model.model, "fc", None)
+                    if fc is not None and hasattr(fc, "input_size"):
+                        fc_input_size = fc.input_size
+                    else:
+                        fc_input_size = draft_model.model.config.hidden_size * 3
+                    aux_hidden_states = torch.zeros(
+                        num_tokens,
+                        fc_input_size,
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
+                model_kwargs["aux_hidden_states"] = aux_hidden_states
+
             # Build attention metadata for the draft decoder layers.
             # Without this, the Ascend attention backend silently
             # returns zeros, corrupting hidden states.
             draft_attn_metadata = self._build_mtp_cloud_attn_metadata(
                 positions, spec_step_idx
             )
-
-            # Run cloud segment (all draft decoder layers are on cloud)
-            segment = self._edge_cloud_draft_segments["c"]
-            num_tokens = positions.shape[-1] if positions is not None else 0
 
             # Determine cudagraph runtime mode for the draft cloud segment so
             # that ACLGraphWrapper can replay a captured graph during decode.

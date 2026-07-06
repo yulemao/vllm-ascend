@@ -2083,10 +2083,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if role == "edge":
             # Edge first segment: embed only for Eagle3 (fusion happens on the
             # cloud) or embed+fc for MTP.
+            spec_step_idx = model_kwargs.get("spec_step_idx", 0)
+            hidden_states_to_cloud = None
             if self.method == "eagle3":
-                model_kwargs.pop("hidden_states", None)
+                if spec_step_idx == 0:
+                    model_kwargs.pop("hidden_states", None)
+                else:
+                    # For speculative steps beyond the first, the cloud must
+                    # consume the previous draft step's hidden states instead
+                    # of fusing the target's auxiliary hidden states.
+                    hidden_states_to_cloud = model_kwargs.get("hidden_states")
             output = segments["a"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)
+            if hidden_states_to_cloud is not None:
+                output["hidden_states"] = hidden_states_to_cloud
 
             # Include positions and spec_step_idx so cloud can run the decoder
             # layers and build the correct attention metadata per step.
@@ -2159,7 +2169,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             model_kwargs["intermediate_tensors"] = intermediate
             for key in ("input_ids", "inputs_embeds", "hidden_states"):
                 model_kwargs.pop(key, None)
-            if self.method == "eagle3":
+
+            spec_step_idx = 0
+            if "spec_step_idx" in tensor_dict:
+                spec_step_idx = tensor_dict["spec_step_idx"].item()
+                model_kwargs["spec_step_idx"] = spec_step_idx
+
+            # Only the first speculative step fuses the target model's auxiliary
+            # hidden states. Subsequent steps consume the previous draft step's
+            # hidden states sent by the edge side.
+            if self.method == "eagle3" and spec_step_idx == 0:
                 aux_hidden_states = getattr(
                     self.runner, "_eagle3_cloud_aux_hidden_states", None
                 )
@@ -2181,10 +2200,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         device=self.device,
                     )
                 model_kwargs["aux_hidden_states"] = aux_hidden_states
-            spec_step_idx = 0
-            if "spec_step_idx" in tensor_dict:
-                spec_step_idx = tensor_dict["spec_step_idx"].item()
-                model_kwargs["spec_step_idx"] = spec_step_idx
             if positions is not None:
                 model_kwargs["positions"] = positions
             positions = model_kwargs.get("positions", None)

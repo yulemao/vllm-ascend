@@ -75,19 +75,29 @@ def _forward_edge_cloud_segment_eagle3(
     residual = intermediate_tensors.tensors.get("residual", None)
 
     if not is_last_segment:
-        # Cloud segment: fuse target aux hidden states, then run all decoder
-        # layers and final norm.
-        aux_hidden_states = extra_layer_kwargs.get("aux_hidden_states", None)
-        if aux_hidden_states is not None and self.model.use_aux_hidden_state:
-            hidden_states = self.model.combine_hidden_states(aux_hidden_states)
+        # Cloud segment: fuse target aux hidden states on the first draft step,
+        # or consume the previous-step draft hidden states on later steps.
+        spec_step_idx = extra_layer_kwargs.get("spec_step_idx", 0)
+        if spec_step_idx == 0:
+            aux_hidden_states = extra_layer_kwargs.get("aux_hidden_states", None)
+            if aux_hidden_states is not None and self.model.use_aux_hidden_state:
+                hidden_states = self.model.combine_hidden_states(aux_hidden_states)
+            else:
+                # Fallback for warmup / missing aux: use the placeholder hidden
+                # states sent by the edge. This should not happen in normal runtime.
+                hidden_states = intermediate_tensors["hidden_states"]
+                if hidden_states.numel() == 0:
+                    raise RuntimeError(
+                        "EAGLE3 cloud segment received empty aux_hidden_states "
+                        "and an empty placeholder hidden_states tensor."
+                    )
         else:
-            # Fallback for warmup / missing aux: use the placeholder hidden
-            # states sent by the edge. This should not happen in normal runtime.
             hidden_states = intermediate_tensors["hidden_states"]
             if hidden_states.numel() == 0:
                 raise RuntimeError(
-                    "EAGLE3 cloud segment received empty aux_hidden_states "
-                    "and an empty placeholder hidden_states tensor."
+                    "EAGLE3 cloud segment received empty hidden_states tensor "
+                    f"for spec_step_idx={spec_step_idx}; the edge side must "
+                    "send the previous draft step's hidden states."
                 )
         for layer in self.model.layers:
             hidden_states, residual = layer(

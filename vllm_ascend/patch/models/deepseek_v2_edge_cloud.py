@@ -55,15 +55,27 @@ def _forward_edge_cloud_segment_deepseek_v2(
 
     # DeepseekV2DecoderLayer.forward does not accept **kwargs; do not forward
     # extra_layer_kwargs here or unrelated model_kwargs will raise TypeError.
-    for layer in islice(self.layers, start_layer, end_layer):
+    aux_hidden_state_layers = getattr(self, "aux_hidden_state_layers", ())
+    aux_hidden_states: list[torch.Tensor] = []
+    for idx, layer in enumerate(
+        islice(self.layers, start_layer, end_layer), start=start_layer
+    ):
+        if idx in aux_hidden_state_layers:
+            aux_hidden_states.append(
+                hidden_states + residual if residual is not None else hidden_states
+            )
         hidden_states, residual = layer(positions, hidden_states, residual)
 
     if not is_last_segment:
         if residual is None:
             residual = torch.zeros_like(hidden_states)
-        return IntermediateTensors(
-            {"hidden_states": hidden_states, "residual": residual}
-        )
+        tensors: dict[str, torch.Tensor | None] = {
+            "hidden_states": hidden_states,
+            "residual": residual,
+        }
+        if aux_hidden_states:
+            tensors["aux_hidden_states"] = torch.cat(aux_hidden_states, dim=-1)
+        return IntermediateTensors(tensors)
 
     hidden_states, _ = self.norm(hidden_states, residual)
     return hidden_states

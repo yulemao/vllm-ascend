@@ -704,6 +704,11 @@ class NPUModelRunner(GPUModelRunner):
                 self.rejection_sampler = AscendRejectionSampler(self.sampler)
         self.discard_request_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.num_discarded_requests = 0
+        # Cloud-side cache for EAGLE3 aux hidden states produced by the target
+        # model. In edge-cloud embedding_only mode the target model runs entirely
+        # on the cloud; these aux hidden states are consumed by the draft model's
+        # cloud segment without crossing the edge-cloud boundary.
+        self._eagle3_cloud_aux_hidden_states: torch.Tensor | None = None
 
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
@@ -1016,10 +1021,11 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 return
             predictor = draft_model.model
+            # In cloud-fusion mode the fc projection (combine_hidden_states) and
+            # its optional input_norm run on the cloud together with the target
+            # model's aux hidden states. The edge side only embeds input_ids.
             edge_only_modules = (
                 "embed_tokens",
-                "fc",
-                "input_norm",
             )
         else:
             logger.warning(
@@ -2148,6 +2154,14 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states = mtp_hidden_states
 
             num_rejected_tokens_gpu = None
+            # In edge-cloud EAGLE3 mode the target model's aux hidden states are
+            # fused on the cloud side; the edge proposer only needs a placeholder
+            # tensor whose last dim matches the draft model's hidden size.
+            is_edge_cloud_eagle3 = (
+                self._edge_cloud_enabled
+                and self.speculative_config is not None
+                and self.speculative_config.method == "eagle3"
+            )
             if spec_decode_metadata is None:
                 # update pcp related params
                 if self.pcp_size > 1:
@@ -2156,14 +2170,30 @@ class NPUModelRunner(GPUModelRunner):
                     target_positions = self._get_positions(num_scheduled_tokens)
                     target_hidden_states = hidden_states
                     if self.use_aux_hidden_state_outputs:
-                        target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
+                        if is_edge_cloud_eagle3:
+                            target_hidden_states = torch.zeros(
+                                num_scheduled_tokens,
+                                self.drafter.hidden_size,
+                                dtype=hidden_states.dtype,
+                                device=hidden_states.device,
+                            )
+                        else:
+                            target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
                 else:
                     token_indices_to_sample = None
                     # input_ids can be None for multimodal models.
                     target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
                     target_positions = self._get_positions(num_scheduled_tokens)
                     if self.use_aux_hidden_state_outputs:
-                        target_hidden_states = torch.cat([h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1)
+                        if is_edge_cloud_eagle3:
+                            target_hidden_states = torch.zeros(
+                                num_scheduled_tokens,
+                                self.drafter.hidden_size,
+                                dtype=hidden_states.dtype,
+                                device=hidden_states.device,
+                            )
+                        else:
+                            target_hidden_states = torch.cat([h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1)
                     else:
                         target_hidden_states = hidden_states[:num_scheduled_tokens]
             else:
@@ -2193,12 +2223,28 @@ class NPUModelRunner(GPUModelRunner):
                     target_positions = positions
                     target_hidden_states = hidden_states
                     if self.use_aux_hidden_state_outputs:
-                        target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
+                        if is_edge_cloud_eagle3:
+                            target_hidden_states = torch.zeros(
+                                token_indices.shape[0],
+                                self.drafter.hidden_size,
+                                dtype=hidden_states.dtype,
+                                device=hidden_states.device,
+                            )
+                        else:
+                            target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
                 else:
                     target_token_ids = self.input_ids.gpu[token_indices]
                     target_positions = self._get_positions(token_indices)
                     if self.use_aux_hidden_state_outputs:
-                        target_hidden_states = torch.cat([h[token_indices] for h in aux_hidden_states], dim=-1)
+                        if is_edge_cloud_eagle3:
+                            target_hidden_states = torch.zeros(
+                                token_indices.shape[0],
+                                self.drafter.hidden_size,
+                                dtype=hidden_states.dtype,
+                                device=hidden_states.device,
+                            )
+                        else:
+                            target_hidden_states = torch.cat([h[token_indices] for h in aux_hidden_states], dim=-1)
                     else:
                         target_hidden_states = hidden_states[token_indices]
             assert self.drafter is not None
@@ -4065,6 +4111,23 @@ class NPUModelRunner(GPUModelRunner):
 
         # Cloud 必须返回 IntermediateTensors，供 Worker 层发回 Edge 并最终由 Edge 计算 logits
         assert isinstance(hidden_states, IntermediateTensors)
+        # In EAGLE3 edge-cloud mode the target model's cloud segment also returns
+        # the auxiliary hidden states used by the draft model. Keep them on the
+        # cloud side and remove them from the tensors sent back to the edge.
+        # Build a new IntermediateTensors instead of mutating the returned one,
+        # because the returned object may be reused by ACL graph replay.
+        if "aux_hidden_states" in hidden_states.tensors:
+            self._eagle3_cloud_aux_hidden_states = hidden_states.tensors[
+                "aux_hidden_states"
+            ]
+            return IntermediateTensors(
+                {
+                    k: v
+                    for k, v in hidden_states.tensors.items()
+                    if k != "aux_hidden_states"
+                }
+            )
+        self._eagle3_cloud_aux_hidden_states = None
         return hidden_states
 
     def _pad_for_sequence_parallelism(

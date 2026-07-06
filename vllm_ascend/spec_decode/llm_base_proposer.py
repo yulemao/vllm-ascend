@@ -626,7 +626,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         if self.method in ("eagle3", "dflash"):
             assert isinstance(self.get_model(), (Eagle3LlamaForCausalLM, DFlashQwen3ForCausalLM))
-            target_hidden_states = self.model.combine_hidden_states(target_hidden_states)
+            # In edge-cloud EAGLE3 mode the fc projection runs on the cloud
+            # using the target model's cached aux hidden states. The proposer
+            # should pass the raw aux hidden states (or the placeholder) and
+            # let the draft model's cloud segment perform combine_hidden_states.
+            is_edge_cloud_eagle3 = (
+                self.method == "eagle3"
+                and self.runner is not None
+                and getattr(self.runner, "_edge_cloud_enabled", False)
+            )
+            if not is_edge_cloud_eagle3:
+                target_hidden_states = self.model.combine_hidden_states(target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
 
         num_tokens, token_indices_to_sample, common_attn_metadata, long_seq_args = self.set_inputs_first_pass(
@@ -2055,7 +2065,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         role = self.runner.edge_cloud_cfg.role
 
         if role == "edge":
-            # Edge first segment: embed (+ combine for Eagle3) or embed+fc (MTP)
+            # Edge first segment: embed only for Eagle3 (fusion happens on the
+            # cloud) or embed+fc for MTP.
+            if self.method == "eagle3":
+                model_kwargs.pop("hidden_states", None)
             output = segments["a"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)
 
@@ -2130,6 +2143,28 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             model_kwargs["intermediate_tensors"] = intermediate
             for key in ("input_ids", "inputs_embeds", "hidden_states"):
                 model_kwargs.pop(key, None)
+            if self.method == "eagle3":
+                aux_hidden_states = getattr(
+                    self.runner, "_eagle3_cloud_aux_hidden_states", None
+                )
+                if aux_hidden_states is None:
+                    # Warmup / profile_run: the target model has not produced aux
+                    # hidden states yet, but the cloud segment graph must be
+                    # captured along the aux-fusion branch. Create a dummy tensor
+                    # with the same shape so the captured graph can be replayed
+                    # with the real aux hidden states at runtime.
+                    fc = getattr(self.model.model, "fc", None)
+                    if fc is not None and hasattr(fc, "input_size"):
+                        fc_input_size = fc.input_size
+                    else:
+                        fc_input_size = self.model.model.config.hidden_size * 3
+                    aux_hidden_states = torch.zeros(
+                        num_tokens,
+                        fc_input_size,
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
+                model_kwargs["aux_hidden_states"] = aux_hidden_states
             spec_step_idx = 0
             if "spec_step_idx" in tensor_dict:
                 spec_step_idx = tensor_dict["spec_step_idx"].item()

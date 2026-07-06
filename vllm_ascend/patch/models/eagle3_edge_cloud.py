@@ -25,17 +25,19 @@ def _forward_edge_cloud_segment_eagle3(
     is_last_segment: bool | None = None,
     **extra_layer_kwargs: Any,
 ) -> torch.Tensor | IntermediateTensors:
-    """Edge-cloud segmented forward for Eagle3LlamaForCausalLM.
+    """Edge-cloud segmented forward for Eagle3LlamaForCausalLM (cloud fusion).
 
     Split:
-      - First segment (edge): embed input_ids and combine aux hidden states.
-      - Middle segment (cloud): run all decoder layers + final norm.
+      - First segment (edge): embed input_ids only.
+      - Middle segment (cloud): combine target aux hidden states with input
+        embeds, then run all decoder layers + final norm.
       - Last segment (edge): return post-norm hidden states for logits sampling.
 
     ``start_layer``/``end_layer`` are kept in the signature for compatibility
     with ``EdgeCloudSegment`` but the actual split is driven by
-    ``is_first_segment``/``is_last_segment`` because Eagle3 has special
-    layer-0 embed+hidden concatenation and an external FC projection.
+    ``is_first_segment``/``is_last_segment``. In this cloud-fusion variant the
+    EAGLE3 fc projection runs on the cloud using the target model's aux hidden
+    states cached by the main model runner.
     """
     num_layers = len(self.model.layers)
     if is_first_segment is None:
@@ -50,23 +52,17 @@ def _forward_edge_cloud_segment_eagle3(
                 "either input_ids or inputs_embeds must be provided."
             )
             inputs_embeds = self.model.embed_input_ids(input_ids)
-        assert hidden_states is not None, (
-            "hidden_states is None in Eagle3 edge-cloud first segment; "
-            "Eagle3 requires target aux hidden states as input."
-        )
-        if self.model.use_aux_hidden_state:
-            hidden_size = self.model.config.hidden_size
-            # The proposer may already call combine_hidden_states() before
-            # passing hidden_states to the model (non-edge-cloud path).  In
-            # edge-cloud mode the raw aux hidden states (3*hidden_size) can also
-            # be sent directly.  Only combine when the input is still in the
-            # raw aux shape.
-            if hidden_states.shape[-1] == hidden_size * 3:
-                hidden_states = self.model.combine_hidden_states(hidden_states)
+        # Cloud-fusion mode: the edge side only sends input_embeds to the cloud.
+        # The cloud segment will fuse target aux hidden states via
+        # combine_hidden_states before running decoder layers.
         return IntermediateTensors(
             {
                 "input_embeds": inputs_embeds,
-                "hidden_states": hidden_states,
+                "hidden_states": torch.empty(
+                    0,
+                    dtype=inputs_embeds.dtype,
+                    device=inputs_embeds.device,
+                ),
                 "residual": None,
             }
         )
@@ -76,11 +72,23 @@ def _forward_edge_cloud_segment_eagle3(
         "check that all TP ranks receive tensors correctly."
     )
     input_embeds = intermediate_tensors["input_embeds"]
-    hidden_states = intermediate_tensors["hidden_states"]
     residual = intermediate_tensors.get("residual", None)
 
     if not is_last_segment:
-        # Cloud segment: run all decoder layers and final norm.
+        # Cloud segment: fuse target aux hidden states, then run all decoder
+        # layers and final norm.
+        aux_hidden_states = extra_layer_kwargs.get("aux_hidden_states", None)
+        if aux_hidden_states is not None and self.model.use_aux_hidden_state:
+            hidden_states = self.model.combine_hidden_states(aux_hidden_states)
+        else:
+            # Fallback for warmup / missing aux: use the placeholder hidden
+            # states sent by the edge. This should not happen in normal runtime.
+            hidden_states = intermediate_tensors["hidden_states"]
+            if hidden_states.numel() == 0:
+                raise RuntimeError(
+                    "EAGLE3 cloud segment received empty aux_hidden_states "
+                    "and an empty placeholder hidden_states tensor."
+                )
         for layer in self.model.layers:
             hidden_states, residual = layer(
                 positions=positions,
@@ -99,7 +107,7 @@ def _forward_edge_cloud_segment_eagle3(
     # Last segment (edge): return post-norm hidden states and pre-norm residual
     # so that the proposer can sample logits and carry hidden_states to the
     # next draft step, matching the tuple return of Eagle3LlamaForCausalLM.forward.
-    return hidden_states, residual
+    return intermediate_tensors["hidden_states"], intermediate_tensors["residual"]
 
 
 def _eagle3_make_empty_intermediate_tensors(

@@ -72,7 +72,7 @@ def _forward_edge_cloud_segment_eagle3(
         "check that all TP ranks receive tensors correctly."
     )
     input_embeds = intermediate_tensors["input_embeds"]
-    residual = intermediate_tensors.get("residual", None)
+    residual = intermediate_tensors.tensors.get("residual", None)
 
     if not is_last_segment:
         # Cloud segment: fuse target aux hidden states, then run all decoder

@@ -4989,7 +4989,10 @@ class NPUModelRunner(GPUModelRunner):
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
                 )
             if self.use_aux_hidden_state_outputs:
-                hidden_states, _ = outputs
+                if isinstance(outputs, IntermediateTensors):
+                    hidden_states = outputs["hidden_states"]
+                else:
+                    hidden_states, _ = outputs
             elif isinstance(outputs, IntermediateTensors):
                 hidden_states = outputs["hidden_states"]
             else:

@@ -466,11 +466,48 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
 
         is_edge_cloud = getattr(self.runner, "_edge_cloud_enabled", False)
-        if (
+        # Cloud side of edge-cloud MTP. Defined once here and reused by the
+        # embed_tokens branch below (which used to redefine it).
+        is_cloud_mtp = (
+            is_edge_cloud
+            and self.method == "mtp"
+            and self.runner is not None
+            and getattr(self.runner, "edge_cloud_cfg", None) is not None
+            and self.runner.edge_cloud_cfg.role == "cloud"
+        )
+
+        # FULL graph capture needs the per-step draft attention metadata built
+        # by the loop below (multi_steps_attn_metadata). Edge-cloud MTP (cloud
+        # side) additionally needs a fresh spec-decode common-metadata snapshot
+        # staged onto the runner so _build_mtp_cloud_attn_metadata runs its
+        # full logic (FIA + slot/positions staging) instead of short-circuiting
+        # to ``attn_metadata is None -> output.fill_(0)`` -- which would capture
+        # no real FIA op and reproduce the "first MTP forward hidden is wrong"
+        # symptom at runtime.
+        #
+        # That staging must refresh on EVERY dummy_run, including the eager
+        # (NONE) warmup passes vLLM runs before each bucket's FULL capture:
+        # _warmup_and_capture hard-codes cudagraph_runtime_mode=NONE for warmup.
+        # If staging only ran under FULL, smaller buckets would reuse the
+        # largest bucket's snapshot (stale num_reqs / query_start_loc) and FIA
+        # would crash with "queryT(N) must equal the last element of
+        # actualSequenceLengthQ(M)". execute_model overwrites this snapshot on
+        # every runtime forward, so refreshing it here never leaks into serving.
+        is_full_capture = (
             aclgraph_runtime_mode == CUDAGraphMode.FULL
             and len(self.runner.attn_groups) > 0
             and (not is_edge_cloud or len(self.draft_attn_groups) > 0)
-        ):
+        )
+        need_common_metadata = is_full_capture or (
+            # Skip the KV-cache profiling run (is_profile): the original code
+            # never staged there (FULL block was gated out under NONE), so the
+            # builder short-circuited and the draft ran fill_(0). Keep that to
+            # avoid running full FIA logic during memory profiling.
+            is_cloud_mtp and not is_profile and len(self.runner.attn_groups) > 0
+        )
+
+        common_attn_metadata = None
+        if need_common_metadata:
             num_computed_tokens_cpu = self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
 
             # num_reqs is already the padded version
@@ -504,45 +541,24 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     : num_reqs * self.decode_threshold
                 ]
 
-            # Edge-cloud MTP (cloud side): the FULL decode graph for the cloud
-            # draft segment ("c") is captured during this warmup via
-            # _run_mtp_edge_cloud -> _build_mtp_cloud_attn_metadata.  That
-            # builder relies on a runtime spec-decode common-metadata snapshot
-            # (runner._cloud_spec_decode_common_attn_metadata) which is only
-            # populated inside execute_model at request time, so during warmup
-            # it is None and the builder returns None -- every draft attention
-            # layer then hits ``if attn_metadata is None: return
-            # output.fill_(0)`` and the captured graph records no real FIA op
-            # and no KV-cache write (segment draft_graph_params.attn_params
-            # stays empty; runtime replay produces zero / wrong attention,
-            # i.e. the "first MTP forward hidden is wrong" symptom).
-            #
-            # Stage the warmup common metadata built just above onto the runner
-            # (before the per-step loop below rebinds/shallow-copies it) so the
-            # builder runs its *full* logic during capture -- including the
-            # _stage_cloud_mtp_slot_mapping / positions staging that binds the
-            # same stable buffer addresses the runtime path uses.  execute_model
-            # overwrites this with the real snapshot on every runtime forward,
-            # so this never leaks into serving.
-            if (
-                is_edge_cloud
-                and self.method == "mtp"
-                and self.runner is not None
-                and getattr(self.runner, "edge_cloud_cfg", None) is not None
-                and self.runner.edge_cloud_cfg.role == "cloud"
-            ):
-                self.runner._cloud_spec_decode_common_attn_metadata = (
-                    common_attn_metadata
-                )
-                self.runner._cloud_spec_decode_num_reqs = num_reqs
-                logger.info(
-                    "[MTP cloud capture] staged warmup common_attn_metadata "
-                    "(num_reqs=%d) so _build_mtp_cloud_attn_metadata runs its "
-                    "full logic (FIA + slot staging) during draft FULL graph "
-                    "capture.",
-                    num_reqs,
-                )
+        # Stage the fresh common metadata for the cloud MTP builder on every
+        # dummy_run (FULL capture AND eager warmup) so the snapshot always
+        # matches the current bucket rather than leaking from a previous one.
+        if is_cloud_mtp and common_attn_metadata is not None:
+            self.runner._cloud_spec_decode_common_attn_metadata = (
+                common_attn_metadata
+            )
+            self.runner._cloud_spec_decode_num_reqs = num_reqs
+            logger.info(
+                "[MTP cloud capture] staged warmup common_attn_metadata "
+                "(num_reqs=%d, mode=%s) so _build_mtp_cloud_attn_metadata "
+                "runs its full logic (FIA + slot staging) for the current "
+                "bucket.",
+                num_reqs,
+                aclgraph_runtime_mode,
+            )
 
+        if is_full_capture:
             assert len(self.draft_attn_groups) > 0
             builder = self.draft_attn_groups[0].get_metadata_builder()
             # update the tensor's address for each step.
@@ -576,13 +592,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # is replaced with PPMissingLayer, so embed_input_ids would return the
         # raw 1D input_ids instead of 2D embeddings. The cloud side does not
         # need inputs_embeds anyway — it receives intermediate tensors from
-        # the edge via broadcast.
-        is_cloud_mtp = (
-            self.method == "mtp"
-            and self.runner is not None
-            and getattr(self.runner, "_edge_cloud_enabled", False)
-            and self.runner.edge_cloud_cfg.role == "cloud"
-        )
+        # the edge via broadcast. (is_cloud_mtp is defined near the top of
+        # dummy_run, next to is_edge_cloud.)
         if self.supports_mm_inputs and not is_cloud_mtp:
             mm_embeds, is_mm_embed = (None, None)
             inputs_embeds = self.model.embed_input_ids(

@@ -3189,6 +3189,7 @@ class NPUModelRunner(GPUModelRunner):
         self,
         positions: torch.Tensor,
         spec_step_idx: int,
+        pad_for_full: bool = False,
     ) -> dict[str, Any] | None:
         """Build per-layer attention metadata for the MTP cloud decoder.
 
@@ -3238,16 +3239,8 @@ class NPUModelRunner(GPUModelRunner):
         common_attn_metadata.num_input_tokens = num_input_tokens
 
         if spec_step_idx > 0:
-            # For steps after the first, each request has exactly one
-            # query token and the sequence length has grown by
-            # spec_step_idx compared to the target model.
-            common_attn_metadata.max_query_len = 1
-            common_attn_metadata.decode_token_per_req = 1
-
-            # Increment seq_lens to account for previously accepted
-            # draft tokens.  The target model's seq_lens already
-            # includes one accepted token; each additional draft step
-            # adds one more.
+            # KV cache grew by spec_step_idx since the target forward (both
+            # eager and FULL-replay steps).
             common_attn_metadata.seq_lens = common_attn_metadata.seq_lens.clone()
             common_attn_metadata.seq_lens[:batch_size] += spec_step_idx
             if common_attn_metadata.seq_lens_cpu is not None:
@@ -3267,64 +3260,84 @@ class NPUModelRunner(GPUModelRunner):
                 common_attn_metadata.num_computed_tokens_cpu[:batch_size] += (
                     spec_step_idx
                 )
-
-            # Subsequent speculative steps are always decode-only.
             common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
 
-            # Edge sends the SAME (first-pass) snapshot of
-            # slot_mapping / query_start_loc / num_actual_tokens /
-            # actual_seq_lengths_q for every speculative step.  From
-            # the second step onward the cloud must rebuild them to
-            # reflect a decode-only batch where each request owns
-            # exactly one query token.  Without this rebuild the
-            # attention backend reads stale offsets, picks the wrong
-            # KV slot and num_decode_tokens (derived inside
-            # split_decodes_and_prefills) ends up matching the
-            # first-pass num_actual_tokens instead of batch_size.
-            device = common_attn_metadata.seq_lens.device
-            new_query_start_loc_cpu = torch.arange(
-                batch_size + 1, dtype=torch.int32, device="cpu"
-            )
-            common_attn_metadata.query_start_loc_cpu = new_query_start_loc_cpu
-            common_attn_metadata.query_start_loc = new_query_start_loc_cpu.to(
-                device, non_blocking=True
-            )
-            common_attn_metadata.num_actual_tokens = batch_size
-            common_attn_metadata.num_input_tokens = num_input_tokens
-            common_attn_metadata.actual_seq_lengths_q = list(
-                range(1, batch_size + 1)
-            )
-
-            # Recompute slot_mapping from the freshly received positions
-            # and the (still valid) block_table.  Each decode token maps
-            # to position // block_size -> slot offset within the block.
+            # Recompute slot_mapping for the new draft-token positions (shared
+            # by both branches below).
             block_table_tensor = common_attn_metadata.block_table_tensor
-            if (
+            slot_ready = (
                 block_table_tensor is not None
                 and positions is not None
                 and self.drafter is not None
                 and hasattr(self.drafter, "kernel_block_size")
-            ):
+            )
+            if slot_ready:
                 block_size = self.drafter.kernel_block_size
                 pos_flat = positions if positions.dim() == 1 else positions[0]
-                pos_flat = pos_flat[:batch_size]
-                exceeds = pos_flat >= self.model_config.max_model_len
-                clamped = torch.where(exceeds, torch.zeros_like(pos_flat), pos_flat)
+                pos_real = pos_flat[:batch_size]
+                exceeds = pos_real >= self.model_config.max_model_len
+                clamped = torch.where(exceeds, torch.zeros_like(pos_real), pos_real)
                 block_numbers = clamped // block_size
                 block_ids = block_table_tensor[:batch_size].gather(
                     dim=1, index=block_numbers.view(-1, 1).long()
                 ).view(-1)
-                new_slot_mapping = (
+                real_slots = (
                     block_ids * block_size + clamped % block_size
                 ).to(torch.int32)
-                new_slot_mapping.masked_fill_(exceeds, PADDING_SLOT_ID)
-                # reshape_and_cache (the draft KV-cache write) runs INSIDE the
-                # captured seg_c ACL graph and is keyed by slot_mapping.  A
-                # freshly-allocated tensor here is never seen by the replayed
-                # graph, so stage it into a stable persistent buffer instead.
-                common_attn_metadata.slot_mapping = (
-                    self._stage_cloud_mtp_slot_mapping(new_slot_mapping)
+                real_slots.masked_fill_(exceeds, PADDING_SLOT_ID)
+
+            if pad_for_full:
+                # FULL graph replay: the captured seg_c graph is step-0 shaped
+                # (num_input_tokens query rows), so step>0 must keep step 0's
+                # query structure -- do NOT shrink query_start_loc /
+                # actual_seq_lengths_q / num_actual_tokens to the real
+                # batch_size, or FIA sees queryT=num_input_tokens vs
+                # actual_seq_lengths_q[-1]=batch_size and crashes.  Only pad
+                # slot_mapping to num_input_tokens so it covers the captured
+                # buffer; the first batch_size rows are real, the rest are
+                # PADDING_SLOT_ID (reshape_and_cache skips them).
+                if slot_ready:
+                    pad_len = num_input_tokens - batch_size
+                    if pad_len > 0:
+                        pad_slots = torch.full(
+                            (pad_len,),
+                            PADDING_SLOT_ID,
+                            dtype=torch.int32,
+                            device=real_slots.device,
+                        )
+                        new_slot_mapping = torch.cat([real_slots, pad_slots])
+                    else:
+                        new_slot_mapping = real_slots
+                    # reshape_and_cache runs INSIDE the captured seg_c graph
+                    # and is keyed by slot_mapping; stage into the stable
+                    # persistent buffer the graph bound.
+                    common_attn_metadata.slot_mapping = (
+                        self._stage_cloud_mtp_slot_mapping(new_slot_mapping)
+                    )
+            else:
+                # Eager (no FULL graph, or this round is not a decode round):
+                # build the real 1-token-per-req decode batch.
+                # query_start_loc / actual_seq_lengths_q / num_actual_tokens
+                # reflect batch_size; slot_mapping covers only the real tokens.
+                common_attn_metadata.max_query_len = 1
+                common_attn_metadata.decode_token_per_req = 1
+                device = common_attn_metadata.seq_lens.device
+                new_query_start_loc_cpu = torch.arange(
+                    batch_size + 1, dtype=torch.int32, device="cpu"
                 )
+                common_attn_metadata.query_start_loc_cpu = new_query_start_loc_cpu
+                common_attn_metadata.query_start_loc = new_query_start_loc_cpu.to(
+                    device, non_blocking=True
+                )
+                common_attn_metadata.num_actual_tokens = batch_size
+                common_attn_metadata.num_input_tokens = num_input_tokens
+                common_attn_metadata.actual_seq_lengths_q = list(
+                    range(1, batch_size + 1)
+                )
+                if slot_ready:
+                    common_attn_metadata.slot_mapping = (
+                        self._stage_cloud_mtp_slot_mapping(real_slots)
+                    )
         else:
             # For the first speculative step, preserve the original attn_state
             # from the target model's forward pass (e.g. PrefillNoCache during
@@ -3692,13 +3705,11 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config else 1
         )
 
-        # is_decode_step is a property of the whole MTP round (one call here =
-        # one target forward), so judge it once at step 0 and reuse it for the
-        # remaining steps.  Per-step inspection is wrong because
-        # _build_mtp_cloud_attn_metadata forces AscendAttentionState.SpecDecoding
-        # for every step>0, which would mis-flag prefill-phase steps>0 as decode
-        # and dispatch FULL for them -- replaying the captured decode graph with
-        # prefill shapes crashes FIA ("queryT(N) must equal actualSequenceLengthQ(M)").
+        # is_decode_step controls FULL decode-graph replay for the cloud draft
+        # segment.  It is a property of the whole MTP round, so judge it once
+        # at step 0 (whose attn_state mirrors the target's real phase) and
+        # reuse it for steps>0 -- step>0 reuses step 0's captured graph thanks
+        # to the padded metadata built in _build_mtp_cloud_attn_metadata.
         is_decode_step = False
 
         for _ in range(num_steps):
@@ -3738,19 +3749,35 @@ class NPUModelRunner(GPUModelRunner):
             # Build attention metadata for the MTP decoder layers.
             # Without this, the Ascend attention backend silently
             # returns zeros, corrupting hidden states.
+            #
+            # step>0 metadata depends on whether this step will actually replay
+            # a FULL graph.  is_decode_step is known from step 0 by the time we
+            # reach step>0 (and is False for step 0 itself, which is never
+            # padded -- its real metadata already matches the captured graph).
+            # Only when step>0 will replay FULL do we pad its metadata to
+            # num_input_tokens (matching step 0's graph); otherwise (eager, or a
+            # non-decode round) we build the real 1-token-per-req decode batch.
+            full_graph_available = (
+                self.edge_cloud_cfg.enable_decode_graph
+                and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            )
+            will_full_replay = bool(is_decode_step and full_graph_available)
             draft_attn_metadata = self._build_mtp_cloud_attn_metadata(
-                positions, spec_step_idx
+                positions, spec_step_idx, pad_for_full=will_full_replay
             )
 
             # Run cloud segment (all MTP decoder layers are on cloud)
             segment = self._edge_cloud_mtp_segments["c"]
             num_tokens = positions.shape[-1] if positions is not None else 0
 
-            # Judge decode-vs-prefill ONLY at step 0 of this round (see the
-            # comment above the loop) and reuse the result for steps>0.  At
-            # step 0 the draft attn_state still reflects the target's real
-            # attn_state (prefill vs decode); for step>0 it is force-set to
-            # SpecDecoding, which is why the check must not run there.
+            # FULL decode-graph replay is a property of the whole MTP round,
+            # so judge it at step 0 (whose attn_state mirrors the target's real
+            # phase) and reuse it for steps>0.  step>0 reuses step 0's captured
+            # graph: the edge sends a num_input_tokens-sized (padded) buffer for
+            # every step, and _build_mtp_cloud_attn_metadata keeps step 0's
+            # query structure for step>0 (only seq_lens/slot_mapping change), so
+            # step>0's actual_seq_lengths_q[-1] == step 0's queryT and the
+            # replay is shape-consistent.
             if spec_step_idx == 0:
                 is_decode_step = False
                 if draft_attn_metadata:

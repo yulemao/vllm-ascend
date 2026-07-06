@@ -24,6 +24,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
 from vllm.triton_utils import HAS_TRITON, triton
@@ -303,6 +304,21 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 target_embed_tokens = target_language_model.model.embedding
             else:
                 raise AttributeError("Target model does not have 'embed_tokens' or 'embedding' attribute")
+
+            # Edge-cloud isolation: in edge-cloud mode, embed_tokens can be
+            # replaced with PPMissingLayer on ranks that do not own it.
+            # Skip sharing in that case without affecting the original PP logic.
+            is_edge_cloud = (
+                self.runner is not None
+                and getattr(self.runner, "_edge_cloud_enabled", False)
+            )
+            if is_edge_cloud and isinstance(target_embed_tokens, PPMissingLayer):
+                logger.info(
+                    "Since PP > 1 or other reasons the model head loaded its own vocab embedding"
+                    " weights instead of sharing them with the target model."
+                )
+                return
+
             # If pp>1, the weights of mtp and the main model's embedding are not on the same device.
             # check if mtp model use main model's embedding and LMhead
             share_embeddings = False

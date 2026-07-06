@@ -3692,6 +3692,17 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config else 1
         )
 
+        # One _run_mtp_cloud_segment call is a single MTP iteration over one
+        # target forward, so the whole loop shares one phase.  Determine it
+        # from step 0 (received first): decode-phase iff the target forward
+        # carried exactly 1 new token per request (num_tokens == num_reqs).
+        # Prefill-phase iterations have a variable per-req token count, for
+        # which no FULL graph is captured -- replaying/refreshing one crashes
+        # FIA ("queryT(N) must equal actualSequenceLengthQ(M)").  Hence every
+        # step of a prefill-phase iteration must run eagerly, while every step
+        # of a decode-phase iteration may replay the captured FULL graph.
+        is_decode_phase: bool | None = None
+
         for _ in range(num_steps):
             # Receive intermediate from edge (including positions and spec_step_idx)
             tensor_dict, comm_handles, comm_postprocess = (
@@ -3737,22 +3748,19 @@ class NPUModelRunner(GPUModelRunner):
             segment = self._edge_cloud_mtp_segments["c"]
             num_tokens = positions.shape[-1] if positions is not None else 0
 
-            # Determine cudagraph runtime mode for the MTP cloud segment so
-            # that ACLGraphWrapper can replay a captured graph during decode.
-            # Do NOT force a decode ACL graph onto a prefill step: the cloud
-            # segment's captured graph is for decode shapes; replaying it with
-            # prefill attention metadata leaves the attention params un-updated
-            # (the captured graph's attn_params bucket is empty for the prefill
-            # key), so the graph replays stale warmup tensors and corrupts the
-            # MTP hidden states.
-            is_decode_step = False
-            if draft_attn_metadata:
-                _first_meta = next(iter(draft_attn_metadata.values()))
-                _state = getattr(_first_meta, "attn_state", None)
-                is_decode_step = _state in (
-                    AscendAttentionState.DecodeOnly,
-                    AscendAttentionState.SpecDecoding,
+            # Determine the MTP phase once from step 0 (the first step received
+            # in this loop).  is_decode_step must reflect the *phase*, not the
+            # per-step attn_state: _build_mtp_cloud_attn_metadata forces
+            # SpecDecoding for every step>0 regardless of phase, so the old
+            # attn_state check mis-flagged prefill-phase steps>0 as decode and
+            # dispatched FULL for them -- replaying the captured (decode-shape)
+            # graph with prefill attention metadata crashes FIA.
+            if is_decode_phase is None:
+                _cloud_num_reqs = getattr(self, "_cloud_spec_decode_num_reqs", 0) or 0
+                is_decode_phase = (
+                    _cloud_num_reqs > 0 and num_tokens == _cloud_num_reqs
                 )
+            is_decode_step = bool(is_decode_phase)
 
             cudagraph_runtime_mode = CUDAGraphMode.NONE
             batch_descriptor = BatchDescriptor(num_tokens)

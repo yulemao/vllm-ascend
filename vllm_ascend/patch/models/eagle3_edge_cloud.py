@@ -132,6 +132,36 @@ def _eagle3_make_empty_intermediate_tensors(
     )
 
 
+# The upstream Eagle3LlamaForCausalLM.forward does not accept
+# ``intermediate_tensors``, so vLLM's static ``supports_pp()`` inspection
+# (which checks the forward signature) returns False even though we set
+# ``supports_pp = True`` above. Wrap the original forward to accept
+# ``intermediate_tensors``; the actual edge-cloud runtime path uses
+# ``forward_edge_cloud_segment`` instead of this wrapper.
+_original_eagle3_forward = Eagle3LlamaForCausalLM.forward
+
+
+def _eagle3_forward_with_pp(
+    self: Eagle3LlamaForCausalLM,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+    *,
+    intermediate_tensors: IntermediateTensors | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if intermediate_tensors is not None:
+        hidden_states = intermediate_tensors["hidden_states"]
+    if hidden_states is None:
+        raise ValueError(
+            "Eagle3LlamaForCausalLM.forward requires hidden_states or "
+            "intermediate_tensors containing hidden_states."
+        )
+    return _original_eagle3_forward(
+        self, input_ids, positions, hidden_states, inputs_embeds
+    )
+
+
 Eagle3LlamaForCausalLM.forward_edge_cloud_segment = (
     _forward_edge_cloud_segment_eagle3
 )
@@ -139,6 +169,7 @@ Eagle3LlamaForCausalLM.supports_pp = True
 Eagle3LlamaForCausalLM.make_empty_intermediate_tensors = (
     _eagle3_make_empty_intermediate_tensors
 )
+Eagle3LlamaForCausalLM.forward = _eagle3_forward_with_pp
 
 # Clear stale _ModelInfo caches so that inspect_model_cls re-computes
 # supports_pp with the patched class instead of loading the old cached value.

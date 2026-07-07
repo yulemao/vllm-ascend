@@ -67,13 +67,6 @@ if TYPE_CHECKING:
 
 
 MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024
-
-# ---- [TEMP DEBUG] verify eagle3 edge-cloud target capture/update seq-length mismatch ----
-# Dedup so each batch size (num_tokens) is logged once per path (capture vs update).
-# Remove this block once the root cause is confirmed.
-_MLA_DBG_CAPTURE_SEEN: set[int] = set()
-_MLA_DBG_UPDATE_SEEN: set[int] = set()
-# ---- [/TEMP DEBUG] ----
 BUILD_METADATA_STEP_PREFILL = 0
 BUILD_METADATA_STEP_DECODE = 1
 # token count limits within the mlapo operator
@@ -847,23 +840,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                 if speculative_config and speculative_config.use_eagle() and not _EXTRA_CTX.is_draft_model:
                     actual_seq_lengths = attn_metadata_current[key].decode.actual_seq_lengths_q
                     spec_multiple = speculative_config.num_speculative_tokens + 1
-                    # ---- [TEMP DEBUG] update-time (pre-replay) seq layout for eagle3 TARGET ----
-                    _dbg_kv_before = len(seq_lens_list)
-                    _dbg_qq_before = len(actual_seq_lengths)
                     seq_lens_list = seq_lens_list + [0] * (num_tokens // spec_multiple - len(seq_lens_list))
                     actual_seq_lengths = [spec_multiple * (i + 1) for i in range(num_tokens // spec_multiple)]
-                    if num_tokens not in _MLA_DBG_UPDATE_SEEN:
-                        _MLA_DBG_UPDATE_SEEN.add(num_tokens)
-                        logger.info(
-                            "[MLA-DBG][UPDATE] eagle3-TARGET num_tokens=%d spec_multiple=%d "
-                            "len(kvlen) %d->%d  len(qlen) %d->%d  new_qlen=%s  "
-                            "<<< if these lengths != CAPTURE lengths, replay hangs here",
-                            num_tokens, spec_multiple,
-                            _dbg_kv_before, len(seq_lens_list),
-                            _dbg_qq_before, len(actual_seq_lengths),
-                            list(actual_seq_lengths[:8]),
-                        )
-                    # ---- [/TEMP DEBUG] ----
                 elif _EXTRA_CTX.is_draft_model:
                     actual_seq_lengths = attn_metadata_current[key].decode.actual_seq_lengths_q
                     block_table = attn_metadata_current[key].decode.block_table
@@ -872,17 +850,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                         block_table = block_table[: len(actual_seq_lengths)]
                     seq_lens_list = seq_lens_list + [0] * (len(actual_seq_lengths) - len(seq_lens_list))
                 else:
-                    # ---- [TEMP DEBUG] update-time seq layout for NON-eagle3 (consistent baseline) ----
-                    _dbg_kv_before = len(seq_lens_list)
                     seq_lens_list = seq_lens_list + [0] * (num_tokens - len(seq_lens_list))
-                    if num_tokens not in _MLA_DBG_UPDATE_SEEN:
-                        _MLA_DBG_UPDATE_SEEN.add(num_tokens)
-                        logger.info(
-                            "[MLA-DBG][UPDATE] non-eagle3 num_tokens=%d "
-                            "len(kvlen) %d->%d (== num_tokens, consistent with CAPTURE -> works)",
-                            num_tokens, _dbg_kv_before, len(seq_lens_list),
-                        )
-                    # ---- [/TEMP DEBUG] ----
 
                 extra_args = {}
                 if dequant_scale_q_nope is not None:
@@ -1568,21 +1536,6 @@ class AscendMLAImpl(MLAAttentionImpl):
                 else:
                     update_graph_params_workspaces(num_tokens, workspace)
 
-            # ---- [TEMP DEBUG] capture-time seq layout (what the FIA op is recorded with) ----
-            # For edge-cloud eagle3 target (non-uniform FULL decode) this should be
-            # len == num_tokens for BOTH kvlen and qlen. Compare against [UPDATE].
-            if num_tokens not in _MLA_DBG_CAPTURE_SEEN:
-                _MLA_DBG_CAPTURE_SEEN.add(num_tokens)
-                _dbg_kv = decode_meta.seq_lens_list
-                _dbg_qq = actual_seq_lengths if actual_seq_lengths is not None else []
-                logger.info(
-                    "[MLA-DBG][CAPTURE] is_draft=%s num_tokens=%d "
-                    "len(kvlen)=%d len(qlen)=%d kvlen_head=%s qlen_head=%s",
-                    bool(_EXTRA_CTX.is_draft_model), num_tokens,
-                    len(_dbg_kv), len(_dbg_qq),
-                    list(_dbg_kv[:8]), list(_dbg_qq[:8]),
-                )
-            # ---- [/TEMP DEBUG] ----
             graph_params.attn_params[num_tokens].append(attn_params)
 
             torch.npu.graph_task_group_begin(stream)

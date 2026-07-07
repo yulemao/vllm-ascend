@@ -211,8 +211,29 @@ class ACLGraphWrapper:
         is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
         if not self.enable_enpu and need_sync:
+            logger.info(
+                "[DEBUG-HANG] ACLGraphWrapper synchronize before replay: "
+                "batch_descriptor=%s runtime_mode=%s",
+                entry.batch_descriptor,
+                self.runtime_mode,
+            )
             torch.npu.current_stream().synchronize()
+            logger.info(
+                "[DEBUG-HANG] ACLGraphWrapper synchronize done: batch_descriptor=%s",
+                entry.batch_descriptor,
+            )
+        logger.info(
+            "[DEBUG-HANG] ACLGraphWrapper replay start: batch_descriptor=%s "
+            "runtime_mode=%s is_draft_eagle=%s",
+            entry.batch_descriptor,
+            self.runtime_mode,
+            is_draft_eagle,
+        )
         entry.aclgraph.replay()
+        logger.info(
+            "[DEBUG-HANG] ACLGraphWrapper replay done: batch_descriptor=%s",
+            entry.batch_descriptor,
+        )
         return entry.output
 
 

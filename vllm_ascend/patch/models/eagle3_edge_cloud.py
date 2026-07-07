@@ -23,6 +23,8 @@ def _forward_edge_cloud_segment_eagle3(
     hidden_states: torch.Tensor | None = None,
     is_first_segment: bool | None = None,
     is_last_segment: bool | None = None,
+    aux_hidden_states: torch.Tensor | None = None,
+    spec_step_idx: int = 0,
     **extra_layer_kwargs: Any,
 ) -> torch.Tensor | IntermediateTensors:
     """Edge-cloud segmented forward for Eagle3LlamaForCausalLM (cloud fusion).
@@ -84,9 +86,11 @@ def _forward_edge_cloud_segment_eagle3(
     input_embeds = intermediate_tensors["input_embeds"]
     residual = intermediate_tensors.tensors.get("residual", None)
 
-    spec_step_idx = extra_layer_kwargs.get("spec_step_idx", 0)
+    # ``aux_hidden_states`` and ``spec_step_idx`` are promoted to explicit
+    # named parameters so that torch.compile/Dynamo sees a stable call
+    # signature instead of a varying ``**extra_layer_kwargs`` dict that can
+    # trigger KeyError when keys appear/disappear across calls.
     if spec_step_idx == 0:
-        aux_hidden_states = extra_layer_kwargs.get("aux_hidden_states", None)
         if aux_hidden_states is not None and self.model.use_aux_hidden_state:
             hidden_states = self.combine_hidden_states(aux_hidden_states)
         else:

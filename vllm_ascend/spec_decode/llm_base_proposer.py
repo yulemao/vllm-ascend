@@ -2177,28 +2177,35 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             # Only the first speculative step fuses the target model's auxiliary
             # hidden states. Subsequent steps consume the previous draft step's
-            # hidden states sent by the edge side.
-            if self.method == "eagle3" and spec_step_idx == 0:
-                aux_hidden_states = getattr(
-                    self.runner, "_eagle3_cloud_aux_hidden_states", None
-                )
-                if aux_hidden_states is None:
-                    # Warmup / profile_run: the target model has not produced aux
-                    # hidden states yet, but the cloud segment graph must be
-                    # captured along the aux-fusion branch. Create a dummy tensor
-                    # with the same shape so the captured graph can be replayed
-                    # with the real aux hidden states at runtime.
-                    fc = getattr(self.model.model, "fc", None)
-                    if fc is not None and hasattr(fc, "input_size"):
-                        fc_input_size = fc.input_size
-                    else:
-                        fc_input_size = self.model.model.config.hidden_size * 3
-                    aux_hidden_states = torch.zeros(
-                        num_tokens,
-                        fc_input_size,
-                        dtype=self.dtype,
-                        device=self.device,
+            # hidden states sent by the edge side. Always include the key in
+            # model_kwargs so that torch.compile sees a stable kwargs signature
+            # across spec_step_idx values; otherwise Dynamo may raise KeyError
+            # when the compiled graph was captured with the key present but
+            # replayed without it.
+            if self.method == "eagle3":
+                if spec_step_idx == 0:
+                    aux_hidden_states = getattr(
+                        self.runner, "_eagle3_cloud_aux_hidden_states", None
                     )
+                    if aux_hidden_states is None:
+                        # Warmup / profile_run: the target model has not produced
+                        # aux hidden states yet, but the cloud segment graph must
+                        # be captured along the aux-fusion branch. Create a dummy
+                        # tensor with the same shape so the captured graph can be
+                        # replayed with the real aux hidden states at runtime.
+                        fc = getattr(self.model.model, "fc", None)
+                        if fc is not None and hasattr(fc, "input_size"):
+                            fc_input_size = fc.input_size
+                        else:
+                            fc_input_size = self.model.model.config.hidden_size * 3
+                        aux_hidden_states = torch.zeros(
+                            num_tokens,
+                            fc_input_size,
+                            dtype=self.dtype,
+                            device=self.device,
+                        )
+                else:
+                    aux_hidden_states = None
                 model_kwargs["aux_hidden_states"] = aux_hidden_states
             if positions is not None:
                 model_kwargs["positions"] = positions

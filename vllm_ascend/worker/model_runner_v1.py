@@ -2050,6 +2050,13 @@ class NPUModelRunner(GPUModelRunner):
         sample_hidden_states: torch.Tensor = None,
         target_model_batch_desc: BatchDescriptor = None,
     ) -> list[list[int]] | None:
+        logger.info(
+            "[DEBUG-HANG] propose_draft_token_ids start: drafter=%s "
+            "edge_cloud=%s role=%s",
+            type(self.drafter).__name__ if self.drafter else None,
+            self._edge_cloud_enabled,
+            self.edge_cloud_cfg.role if self._edge_cloud_enabled else "n/a",
+        )
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
@@ -2306,6 +2313,10 @@ class NPUModelRunner(GPUModelRunner):
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
+        logger.info(
+            "[DEBUG-HANG] propose_draft_token_ids end: draft_token_ids_shape=%s",
+            draft_token_ids.shape if torch.is_tensor(draft_token_ids) else "n/a",
+        )
         return draft_token_ids
 
     def _copy_draft_token_ids_to_cpu(
@@ -2344,6 +2355,15 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        logger.info(
+            "[DEBUG-HANG] execute_model start: edge_cloud=%s role=%s mode=%s "
+            "intermediate_tensors=%s total_scheduled=%d",
+            self._edge_cloud_enabled,
+            self.edge_cloud_cfg.role if self._edge_cloud_enabled else "n/a",
+            self.edge_cloud_cfg.mode if self._edge_cloud_enabled else "n/a",
+            intermediate_tensors is not None,
+            scheduler_output.total_num_scheduled_tokens,
+        )
         if self.vllm_config.model_config.enable_return_routed_experts:
             if vllm_version_is("0.20.2"):
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -2860,6 +2880,14 @@ class NPUModelRunner(GPUModelRunner):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        logger.info(
+            "[DEBUG-HANG] sample_tokens start: edge_cloud=%s role=%s "
+            "execute_model_state=%s speculative_method=%s",
+            self._edge_cloud_enabled,
+            self.edge_cloud_cfg.role if self._edge_cloud_enabled else "n/a",
+            self.execute_model_state is not None,
+            self.speculative_config.method if self.speculative_config else None,
+        )
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
@@ -3353,6 +3381,7 @@ class NPUModelRunner(GPUModelRunner):
             edge_cloud_broadcast_recv_draft,
         )
 
+        logger.info("[DEBUG-HANG] _run_draft_cloud_segment start")
         # The edge side calls the draft model for each speculative step
         # (including the first pass).  We loop the same number of times so
         # that every edge request has a matching cloud response.
@@ -3360,8 +3389,10 @@ class NPUModelRunner(GPUModelRunner):
             self.speculative_config.num_speculative_tokens
             if self.speculative_config else 1
         )
+        logger.info("[DEBUG-HANG] _run_draft_cloud_segment num_steps=%d", num_steps)
 
-        for _ in range(num_steps):
+        for step_idx in range(num_steps):
+            logger.info("[DEBUG-HANG] _run_draft_cloud_segment step=%d recv", step_idx)
             # Receive intermediate from edge (including positions and spec_step_idx)
             tensor_dict, comm_handles, comm_postprocess = (
                 edge_cloud_broadcast_recv_draft()
@@ -3471,6 +3502,13 @@ class NPUModelRunner(GPUModelRunner):
             #         )
             #     )
 
+            logger.info(
+                "[DEBUG-HANG] _run_draft_cloud_segment step=%d run segment "
+                "spec_step_idx=%d num_tokens=%d",
+                step_idx,
+                spec_step_idx,
+                num_tokens,
+            )
             with set_ascend_forward_context(
                 attn_metadata=draft_attn_metadata,
                 vllm_config=self.vllm_config,
@@ -3482,6 +3520,9 @@ class NPUModelRunner(GPUModelRunner):
             ):
                 output = segment(**model_kwargs)
             assert isinstance(output, IntermediateTensors)
+            logger.info(
+                "[DEBUG-HANG] _run_draft_cloud_segment step=%d segment done", step_idx
+            )
 
             # Send back to edge
             if get_pp_group().world_size == 2:
@@ -3491,6 +3532,9 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 for handle in send_work:
                     handle.wait()
+            logger.info(
+                "[DEBUG-HANG] _run_draft_cloud_segment step=%d send done", step_idx
+            )
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):

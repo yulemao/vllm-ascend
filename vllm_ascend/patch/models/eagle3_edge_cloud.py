@@ -71,53 +71,55 @@ def _forward_edge_cloud_segment_eagle3(
         "intermediate_tensors is None in Eagle3 edge-cloud segment; "
         "check that all TP ranks receive tensors correctly."
     )
+
+    if is_last_segment:
+        # Last segment (edge): return post-norm hidden states and pre-norm residual
+        # so that the proposer can sample logits and carry hidden_states to the
+        # next draft step, matching the tuple return of Eagle3LlamaForCausalLM.forward.
+        return intermediate_tensors["hidden_states"], intermediate_tensors["residual"]
+
+    # Cloud segment: needs input_embeds from the edge side. Fuse target aux
+    # hidden states on the first draft step, or consume the previous-step draft
+    # hidden states on later steps.
     input_embeds = intermediate_tensors["input_embeds"]
     residual = intermediate_tensors.tensors.get("residual", None)
 
-    if not is_last_segment:
-        # Cloud segment: fuse target aux hidden states on the first draft step,
-        # or consume the previous-step draft hidden states on later steps.
-        spec_step_idx = extra_layer_kwargs.get("spec_step_idx", 0)
-        if spec_step_idx == 0:
-            aux_hidden_states = extra_layer_kwargs.get("aux_hidden_states", None)
-            if aux_hidden_states is not None and self.model.use_aux_hidden_state:
-                hidden_states = self.combine_hidden_states(aux_hidden_states)
-            else:
-                # Fallback for warmup / missing aux: use the placeholder hidden
-                # states sent by the edge. This should not happen in normal runtime.
-                hidden_states = intermediate_tensors["hidden_states"]
-                if hidden_states.numel() == 0:
-                    raise RuntimeError(
-                        "EAGLE3 cloud segment received empty aux_hidden_states "
-                        "and an empty placeholder hidden_states tensor."
-                    )
+    spec_step_idx = extra_layer_kwargs.get("spec_step_idx", 0)
+    if spec_step_idx == 0:
+        aux_hidden_states = extra_layer_kwargs.get("aux_hidden_states", None)
+        if aux_hidden_states is not None and self.model.use_aux_hidden_state:
+            hidden_states = self.combine_hidden_states(aux_hidden_states)
         else:
+            # Fallback for warmup / missing aux: use the placeholder hidden
+            # states sent by the edge. This should not happen in normal runtime.
             hidden_states = intermediate_tensors["hidden_states"]
             if hidden_states.numel() == 0:
                 raise RuntimeError(
-                    "EAGLE3 cloud segment received empty hidden_states tensor "
-                    f"for spec_step_idx={spec_step_idx}; the edge side must "
-                    "send the previous draft step's hidden states."
+                    "EAGLE3 cloud segment received empty aux_hidden_states "
+                    "and an empty placeholder hidden_states tensor."
                 )
-        for layer in self.model.layers:
-            hidden_states, residual = layer(
-                positions=positions,
-                embeds=input_embeds,
-                hidden_states=hidden_states,
-                residual=residual,
+    else:
+        hidden_states = intermediate_tensors["hidden_states"]
+        if hidden_states.numel() == 0:
+            raise RuntimeError(
+                "EAGLE3 cloud segment received empty hidden_states tensor "
+                f"for spec_step_idx={spec_step_idx}; the edge side must "
+                "send the previous draft step's hidden states."
             )
-        hidden_states, hidden_prenorm = self.model.norm(hidden_states, residual)
-        return IntermediateTensors(
-            {
-                "hidden_states": hidden_states,
-                "residual": hidden_prenorm,
-            }
+    for layer in self.model.layers:
+        hidden_states, residual = layer(
+            positions=positions,
+            embeds=input_embeds,
+            hidden_states=hidden_states,
+            residual=residual,
         )
-
-    # Last segment (edge): return post-norm hidden states and pre-norm residual
-    # so that the proposer can sample logits and carry hidden_states to the
-    # next draft step, matching the tuple return of Eagle3LlamaForCausalLM.forward.
-    return intermediate_tensors["hidden_states"], intermediate_tensors["residual"]
+    hidden_states, hidden_prenorm = self.model.norm(hidden_states, residual)
+    return IntermediateTensors(
+        {
+            "hidden_states": hidden_states,
+            "residual": hidden_prenorm,
+        }
+    )
 
 
 def _eagle3_make_empty_intermediate_tensors(

@@ -2884,8 +2884,9 @@ class NPUModelRunner(GPUModelRunner):
 
                 # Edge-cloud sync: receive num_accepted_tokens (and optionally
                 # valid_sampled_token_count) from edge so that cloud can update
-                # num_computed_tokens for the main model in embed_only MTP mode,
-                # or run _update_states_after_model_execute() for hybrid models.
+                # num_computed_tokens for the main model in embed_only MTP/EAGLE3
+                # mode, or run _update_states_after_model_execute() for hybrid
+                # models.
                 if (
                     self._edge_cloud_enabled
                     and self.edge_cloud_cfg.role == "cloud"
@@ -2894,7 +2895,7 @@ class NPUModelRunner(GPUModelRunner):
                         self.model_config.is_hybrid
                         or (
                             self.edge_cloud_cfg.mode == "embedding_only"
-                            and self.speculative_config.method == "mtp"
+                            and self.speculative_config.method in ("mtp", "eagle3")
                         )
                     )
                     and self._last_scheduler_output is not None
@@ -2919,13 +2920,13 @@ class NPUModelRunner(GPUModelRunner):
                     num_reqs = num_accepted.size(0)
                     self.num_accepted_tokens.gpu[:num_reqs] = num_accepted
 
-                    # For embed_only MTP, the cloud also needs the rejection-
-                    # corrected valid_sampled_token_count and the prev-batch
-                    # request mapping so that _prepare_inputs can run the async
-                    # spec-decode correction kernel.
+                    # For embed_only MTP/EAGLE3, the cloud also needs the
+                    # rejection-corrected valid_sampled_token_count and the
+                    # prev-batch request mapping so that _prepare_inputs can run
+                    # the async spec-decode correction kernel.
                     if (
                         self.edge_cloud_cfg.mode == "embedding_only"
-                        and self.speculative_config.method == "mtp"
+                        and self.speculative_config.method in ("mtp", "eagle3")
                         and "valid_sampled_token_count" in tensor_dict
                     ):
                         self.valid_sampled_token_count_gpu = tensor_dict[
@@ -2960,8 +2961,9 @@ class NPUModelRunner(GPUModelRunner):
                                 self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
                             )
                     else:
-                        # For non-hybrid embed_only MTP, keep CPU mirror in sync
-                        # so _prepare_inputs sees corrected num_accepted_tokens.
+                        # For non-hybrid embed_only MTP/EAGLE3, keep CPU mirror
+                        # in sync so _prepare_inputs sees corrected
+                        # num_accepted_tokens.
                         self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                             self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
                         )
@@ -3072,7 +3074,7 @@ class NPUModelRunner(GPUModelRunner):
             # Edge-cloud sync: send num_accepted_tokens (and optionally
             # valid_sampled_token_count) to cloud so that cloud can run
             # _update_states_after_model_execute() for hybrid models, or correct
-            # num_computed_tokens for embed_only MTP speculative decoding.
+            # num_computed_tokens for embed_only MTP/EAGLE3 speculative decoding.
             if (
                 self._edge_cloud_enabled
                 and self.edge_cloud_cfg.role != "cloud"
@@ -3081,7 +3083,7 @@ class NPUModelRunner(GPUModelRunner):
                     self.model_config.is_hybrid
                     or (
                         self.edge_cloud_cfg.mode == "embedding_only"
-                        and self.speculative_config.method == "mtp"
+                        and self.speculative_config.method in ("mtp", "eagle3")
                     )
                 )
             ):
@@ -3090,7 +3092,7 @@ class NPUModelRunner(GPUModelRunner):
                 tensor_dict_to_send = {"num_accepted_tokens": num_accepted}
                 if (
                     self.edge_cloud_cfg.mode == "embedding_only"
-                    and self.speculative_config.method == "mtp"
+                    and self.speculative_config.method in ("mtp", "eagle3")
                     and self.valid_sampled_token_count_gpu is not None
                 ):
                     tensor_dict_to_send["valid_sampled_token_count"] = (

@@ -81,7 +81,7 @@ def _forward_edge_cloud_segment_eagle3(
         if spec_step_idx == 0:
             aux_hidden_states = extra_layer_kwargs.get("aux_hidden_states", None)
             if aux_hidden_states is not None and self.model.use_aux_hidden_state:
-                hidden_states = self.model.combine_hidden_states(aux_hidden_states)
+                hidden_states = self.combine_hidden_states(aux_hidden_states)
             else:
                 # Fallback for warmup / missing aux: use the placeholder hidden
                 # states sent by the edge. This should not happen in normal runtime.

@@ -5102,10 +5102,10 @@ class NPUModelRunner(GPUModelRunner):
                     outputs = self._model_forward(
                         num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
                     )
-                if self.use_aux_hidden_state_outputs:
-                    hidden_states, _ = outputs
-                elif isinstance(outputs, IntermediateTensors):
+                if isinstance(outputs, IntermediateTensors):
                     hidden_states = outputs["hidden_states"]
+                elif isinstance(outputs, (tuple, list)):
+                    hidden_states, _ = outputs
                 else:
                     hidden_states = outputs
                 dummy_compute_logits(hidden_states)

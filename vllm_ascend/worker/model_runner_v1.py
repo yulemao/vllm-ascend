@@ -940,6 +940,25 @@ class NPUModelRunner(GPUModelRunner):
                     self.drafter.model, self.speculative_config.method
                 )
 
+            # In edge-cloud EAGLE3 mode the target model also needs its
+            # auxiliary hidden-state layers configured, just like the standard
+            # (non-edge-cloud) load path. The cloud segment reads these layers
+            # in forward_edge_cloud_segment to produce aux_hidden_states for the
+            # draft model. Without this the aux_hidden_states key is missing
+            # from the cloud segment output, which causes KeyError or makes the
+            # draft model fall back to dummy zero states.
+            if self.use_aux_hidden_state_outputs:
+                from vllm.model_executor.models.interfaces import supports_eagle3
+                if not supports_eagle3(self.model):
+                    raise RuntimeError(
+                        "Model does not support EAGLE3 interface but "
+                        "aux_hidden_state_outputs was requested"
+                    )
+                aux_layers = self._get_eagle3_aux_layers_from_config()
+                if not aux_layers:
+                    aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
+                self.model.set_aux_hidden_state_layers(aux_layers)
+
     def _get_mtp_predictor(self, mtp_model: nn.Module) -> nn.Module | None:
         """Locate the MTP predictor module inside the draft model.
 

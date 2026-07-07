@@ -2187,25 +2187,36 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     aux_hidden_states = getattr(
                         self.runner, "_eagle3_cloud_aux_hidden_states", None
                     )
-                    if aux_hidden_states is None:
-                        # Warmup / profile_run: the target model has not produced
-                        # aux hidden states yet, but the cloud segment graph must
-                        # be captured along the aux-fusion branch. Create a dummy
-                        # tensor with the same shape so the captured graph can be
-                        # replayed with the real aux hidden states at runtime.
-                        fc = getattr(self.model.model, "fc", None)
-                        if fc is not None and hasattr(fc, "input_size"):
-                            fc_input_size = fc.input_size
-                        else:
-                            fc_input_size = self.model.model.config.hidden_size * 3
-                        aux_hidden_states = torch.zeros(
-                            num_tokens,
-                            fc_input_size,
-                            dtype=self.dtype,
-                            device=self.device,
-                        )
                 else:
+                    # For speculative steps beyond the first, the cloud segment
+                    # consumes the previous draft step's hidden states (carried
+                    # in intermediate_tensors["hidden_states"]) and must NOT fuse
+                    # the target model's aux hidden states. The segment forward
+                    # ignores aux_hidden_states in this branch (see
+                    # eagle3_edge_cloud.py _forward_edge_cloud_segment_eagle3).
                     aux_hidden_states = None
+
+                if aux_hidden_states is None:
+                    # The cloud segment is wrapped by EdgeCloudCompiledSegment
+                    # (torch.compile) when acl_graph is enabled. Dynamo traces it
+                    # with aux_hidden_states as a tensor and installs size-guards
+                    # that call call_size(aux, dim). Feeding None on a later
+                    # draft step makes that guard evaluate call_size(None, ...)
+                    # -> 'NoneType' object has no attribute 'size', crashing graph
+                    # capture/replay. Always feed a real zero tensor of the fusion
+                    # shape so the compiled graph's input contract stays stable;
+                    # it is ignored by the forward when spec_step_idx > 0.
+                    fc = getattr(self.model.model, "fc", None)
+                    if fc is not None and hasattr(fc, "input_size"):
+                        fc_input_size = fc.input_size
+                    else:
+                        fc_input_size = self.model.model.config.hidden_size * 3
+                    aux_hidden_states = torch.zeros(
+                        num_tokens,
+                        fc_input_size,
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
                 model_kwargs["aux_hidden_states"] = aux_hidden_states
             if positions is not None:
                 model_kwargs["positions"] = positions

@@ -2704,15 +2704,20 @@ class NPUModelRunner(GPUModelRunner):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 if isinstance(hidden_states, IntermediateTensors):
-                    # Edge-cloud segmented forward returns IntermediateTensors
+                    # Edge-cloud non-last segments return IntermediateTensors
                     # instead of the (hidden_states, aux_hidden_states) tuple.
                     # The auxiliary hidden states for EAGLE3 are cached on the
                     # cloud side in _eagle3_cloud_aux_hidden_states; leave
                     # hidden_states as IntermediateTensors so the edge-cloud
                     # early-return paths below can handle it.
                     aux_hidden_states = None
-                else:
+                elif isinstance(hidden_states, (tuple, list)):
                     hidden_states, aux_hidden_states = hidden_states
+                else:
+                    # Edge-cloud last segment returns a plain hidden-states
+                    # tensor (no auxiliary outputs). The EAGLE3 aux states are
+                    # kept on the cloud side, so there is nothing to unpack.
+                    aux_hidden_states = None
             if self.pcp_size > 1:
                 # NOTE we must `slice` hidden_states because pcp_allgather_restore_idx
                 # ignores the padding from CUDA Graph.

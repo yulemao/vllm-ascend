@@ -793,6 +793,23 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_options=None,
         )
 
+    def _get_edge_cloud_segment_model(self, segment: Any) -> torch.nn.Module:
+        """Unwrap ACLGraph / compiled wrappers to reach the EdgeCloudSegment.
+
+        Edge-cloud draft segments may be wrapped by ``EdgeCloudCompiledSegment``
+        (torch.compile) and/or ``EdgeCloudACLGraphWrapper`` (runtime graph
+        capture).  Both wrappers hide the original ``EdgeCloudSegment`` and its
+        ``_edge_model`` attribute.  This helper peels off the wrappers so that
+        callers can access the underlying draft model for configuration lookups
+        such as ``model.fc.input_size``.
+        """
+        while isinstance(segment, (EdgeCloudCompiledSegment, EdgeCloudACLGraphWrapper)):
+            if isinstance(segment, EdgeCloudCompiledSegment):
+                segment = segment._segment
+            else:
+                segment = segment.unwrap()
+        return segment._edge_model
+
     def _load_model_edge_cloud(self) -> None:
         """边云场景的模型加载流程（复用 vLLM 标准 PP 初始化，直接加载到 NPU）。
 
@@ -3414,7 +3431,7 @@ class NPUModelRunner(GPUModelRunner):
                     # capture/replay. Always feed a real zero tensor of the fusion
                     # shape so the compiled graph's input contract stays stable;
                     # it is ignored by the forward when spec_step_idx > 0.
-                    draft_model = segment._edge_model
+                    draft_model = self._get_edge_cloud_segment_model(segment)
                     fc = getattr(draft_model.model, "fc", None)
                     if fc is not None and hasattr(fc, "input_size"):
                         fc_input_size = fc.input_size

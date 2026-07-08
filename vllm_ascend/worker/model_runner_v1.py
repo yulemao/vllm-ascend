@@ -4159,6 +4159,15 @@ class NPUModelRunner(GPUModelRunner):
         #seg_e = self.segment_e
         seg_a_graph = isinstance(seg_a, ACLGraphWrapper)
         seg_e_graph = isinstance(seg_e, ACLGraphWrapper)
+        logger.info(
+            "[DEBUG-HANG] _edge_cloud_forward_edge: use_graph=%s seg_a_graph=%s "
+            "seg_e_graph=%s intermediate_tensors=%s capturing=%s",
+            use_graph,
+            seg_a_graph,
+            seg_e_graph,
+            intermediate_tensors is not None,
+            forward_context.capturing,
+        )
 
         if intermediate_tensors is None:
             # Step 1：执行 Segment A（embedding + 首 head_k 层）
@@ -4169,22 +4178,30 @@ class NPUModelRunner(GPUModelRunner):
                 _EXTRA_CTX.layer_idx = 0
             try:
                 if seg_a_graph and not forward_context.capturing:
+                    logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_a update params start")
                     self._update_full_graph_params_if_needed(
                         forward_context, num_tokens_padded, positions,
                         layer_indices=list(range(0, self.head_k)),
                         graph_wrapper=seg_a,
                     )
+                    logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_a update params done")
+                logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_a call start")
                 hidden_states = seg_a(
                     input_ids=input_ids,
                     positions=positions,
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+                logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_a call done")
             finally:
                 if old_layer_idx is not None:
                     _EXTRA_CTX.layer_idx = old_layer_idx
 
             assert isinstance(hidden_states, IntermediateTensors)
+            logger.info(
+                "[DEBUG-HANG] _edge_cloud_forward_edge segment_a return: hidden_states_type=%s",
+                type(hidden_states).__name__,
+            )
             return hidden_states
 
         # Step 2：执行 Segment E（尾 tail_k 层 + norm）
@@ -4206,21 +4223,29 @@ class NPUModelRunner(GPUModelRunner):
                 self.num_layers,
             ))
             if seg_e_graph and not forward_context.capturing:
+                logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_e update params start")
                 self._update_full_graph_params_if_needed(
                     forward_context, num_tokens_padded, positions,
                     layer_indices=tail_layer_indices,
                     graph_wrapper=seg_e,
                 )
+                logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_e update params done")
+            logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_e call start")
             hidden_states = seg_e(
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 **model_kwargs,
             )
+            logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_e call done")
         finally:
             # segment_e 执行完毕后恢复原始 layer_idx
             if old_layer_idx is not None:
                 _EXTRA_CTX.layer_idx = old_layer_idx
 
+        logger.info(
+            "[DEBUG-HANG] _edge_cloud_forward_edge segment_e return: hidden_states_type=%s",
+            type(hidden_states).__name__,
+        )
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states

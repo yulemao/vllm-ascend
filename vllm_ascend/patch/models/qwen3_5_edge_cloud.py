@@ -289,9 +289,10 @@ def _forward_edge_cloud_segment_qwen3_5_mtp(
     is_last_segment: bool | None = None,
     **extra_layer_kwargs: Any,
 ) -> torch.Tensor | IntermediateTensors:
-    # All MTP decoder layers run on the cloud side; edge only handles
-    # embed+fc (first segment) and norm (last segment).  start_layer/end_layer
-    # are kept in the signature for backward compatibility but ignored here.
+    # All MTP decoder layers and the final RMSNorm run on the cloud side;
+    # edge only handles embed+fc (first segment) and passes through the
+    # post-norm result (last segment).  start_layer/end_layer are kept in
+    # the signature for backward compatibility but ignored here.
     num_layers = len(self.layers)
 
     if is_first_segment is None:
@@ -317,6 +318,8 @@ def _forward_edge_cloud_segment_qwen3_5_mtp(
         residual = intermediate_tensors["residual"]
 
     # Cloud segment: execute exactly one decoder layer selected by spec_step_idx.
+    # The final RMSNorm is also placed on the cloud side so that the edge
+    # does not need the real residual returned from the cloud.
     if not is_first_segment and not is_last_segment:
         actual_idx = spec_step_idx % self.num_mtp_layers
         hidden_states, residual = self.layers[actual_idx](
@@ -324,13 +327,16 @@ def _forward_edge_cloud_segment_qwen3_5_mtp(
             hidden_states=hidden_states,
             residual=residual,
         )
+        hidden_states, _ = self.norm(hidden_states, residual)
+        residual = None
 
     if not is_last_segment:
         return IntermediateTensors(
             {"hidden_states": hidden_states, "residual": residual}
         )
 
-    hidden_states, _ = self.norm(hidden_states, residual)
+    # Edge last segment: the cloud has already applied the final norm, so
+    # just return the post-norm hidden_states.
     return hidden_states
 
 

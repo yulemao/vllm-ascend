@@ -4216,7 +4216,13 @@ class NPUModelRunner(GPUModelRunner):
         # cloud side and remove them from the tensors sent back to the edge.
         # Build a new IntermediateTensors instead of mutating the returned one,
         # because the returned object may be reused by ACL graph replay.
+        # The segment now returns each aux tensor as a separate graph output
+        # (aux_hidden_states_0, aux_hidden_states_1, ...) so that ACL Graph
+        # treats them as outputs rather than intermediate values. Concatenate
+        # them here after replay, matching the non-edge-cloud fusion shape.
         if "aux_hidden_states" in hidden_states.tensors:
+            # Backward compatibility: some segments may still return the fused
+            # single tensor under the legacy key.
             self._eagle3_cloud_aux_hidden_states = hidden_states.tensors[
                 "aux_hidden_states"
             ]
@@ -4225,6 +4231,24 @@ class NPUModelRunner(GPUModelRunner):
                     k: v
                     for k, v in hidden_states.tensors.items()
                     if k != "aux_hidden_states"
+                }
+            )
+        aux_keys = sorted(
+            (
+                k for k in hidden_states.tensors
+                if k.startswith("aux_hidden_states_")
+            ),
+            key=lambda k: int(k.rsplit("_", 1)[-1]),
+        )
+        if aux_keys:
+            self._eagle3_cloud_aux_hidden_states = torch.cat(
+                [hidden_states.tensors[k] for k in aux_keys], dim=-1
+            )
+            return IntermediateTensors(
+                {
+                    k: v
+                    for k, v in hidden_states.tensors.items()
+                    if not k.startswith("aux_hidden_states_")
                 }
             )
         self._eagle3_cloud_aux_hidden_states = None

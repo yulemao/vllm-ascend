@@ -73,8 +73,16 @@ def _forward_edge_cloud_segment_deepseek_v2(
             "hidden_states": hidden_states,
             "residual": residual,
         }
-        if aux_hidden_states:
-            tensors["aux_hidden_states"] = torch.cat(aux_hidden_states, dim=-1)
+        # Keep each auxiliary hidden state as a separate graph output instead of
+        # concatenating them inside the segment. When ACL Graph captures the
+        # cloud segment, the per-layer aux tensors are intermediate values if
+        # only the concatenated result is returned; on some NPU graph paths this
+        # causes the replay of ``torch.cat`` to access stale/freed intermediate
+        # memory and hang. Exposing each aux tensor as a graph output matches
+        # the non-edge-cloud behavior (tuple of hidden_states + aux list) and
+        # lets the runner concatenate after replay.
+        for i, aux in enumerate(aux_hidden_states):
+            tensors[f"aux_hidden_states_{i}"] = aux
         return IntermediateTensors(tensors)
 
     hidden_states, _ = self.norm(hidden_states, residual)

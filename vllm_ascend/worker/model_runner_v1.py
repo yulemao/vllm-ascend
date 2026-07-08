@@ -1107,7 +1107,7 @@ class NPUModelRunner(GPUModelRunner):
         synced: dict[str, torch.Tensor | Any] = {}
         for key, value in intermediate_tensors.items():
             if key not in buffers.tensors or not isinstance(value, torch.Tensor):
-                # positions/spec_step_idx or any non-tensor metadata pass through
+                # positions or any non-tensor metadata pass through
                 synced[key] = value
                 continue
             dst = buffers[key][:copy_len]
@@ -3226,8 +3226,9 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config else 1
         )
 
-        for _ in range(num_steps):
-            # Receive intermediate from edge (including positions and spec_step_idx)
+        for spec_step_idx in range(num_steps):
+            # Receive intermediate from edge (including positions).
+            # spec_step_idx is derived directly from the loop counter.
             tensor_dict, comm_handles, comm_postprocess = (
                 edge_cloud_broadcast_recv_mtp()
             )
@@ -3250,11 +3251,8 @@ class NPUModelRunner(GPUModelRunner):
             model_kwargs = {
                 "intermediate_tensors": intermediate,
                 "positions": positions,
+                "spec_step_idx": spec_step_idx,
             }
-            spec_step_idx = 0
-            if "spec_step_idx" in tensor_dict:
-                spec_step_idx = tensor_dict["spec_step_idx"].item()
-                model_kwargs["spec_step_idx"] = spec_step_idx
 
             # Build attention metadata for the MTP decoder layers.
             # Without this, the Ascend attention backend silently

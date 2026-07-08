@@ -1006,13 +1006,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # participate in every round or the edge blocks on recv.
                 if self.num_speculative_tokens > 1:
                     for draft_step in range(self.num_speculative_tokens - 1):
-                        # The cloud path populates intermediate_tensors,
-                        # positions, and spec_step_idx from the received
-                        # tensor_dict; pass placeholders for keys it will pop.
+                        # The cloud path populates intermediate_tensors and
+                        # positions from the received tensor_dict; pass
+                        # placeholders for keys it will pop.
                         cloud_kwargs: dict[str, Any] = {}
                         if self.pass_hidden_states_to_model:
                             cloud_kwargs["input_ids"] = None
                             cloud_kwargs["hidden_states"] = None
+                        # spec_step_idx is not sent by the edge; pass it
+                        # directly since the cloud side knows the loop counter.
+                        cloud_kwargs["spec_step_idx"] = draft_step + 1
                         self._run_mtp_edge_cloud(**cloud_kwargs)
                 # Logits computation and token sampling happen exclusively on
                 # the edge side.
@@ -2057,17 +2060,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             output = segments["a"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)
 
-            # Include positions and spec_step_idx so cloud can run the correct
-            # decoder layer.
+            # Include positions so cloud can run the decoder layers.
+            # spec_step_idx is derived from the cloud-side loop counter, so it
+            # does not need to be sent over the wire.
             output["positions"] = model_kwargs["positions"]
-            if "spec_step_idx" in model_kwargs:
-                output["spec_step_idx"] = torch.tensor(
-                    model_kwargs["spec_step_idx"], dtype=torch.int64, device="cpu"
-                )
-            else:
-                output["spec_step_idx"] = torch.tensor(
-                    0, dtype=torch.int64, device="cpu"
-                )
             if get_pp_group().world_size == 2:
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v
@@ -2128,10 +2124,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             model_kwargs["intermediate_tensors"] = intermediate
             for key in ("input_ids", "inputs_embeds", "hidden_states"):
                 model_kwargs.pop(key, None)
-            spec_step_idx = 0
-            if "spec_step_idx" in tensor_dict:
-                spec_step_idx = tensor_dict["spec_step_idx"].item()
-                model_kwargs["spec_step_idx"] = spec_step_idx
+            # spec_step_idx is not sent by the edge; derive it from the loop
+            # counter supplied by the caller.
+            spec_step_idx = model_kwargs.get("spec_step_idx", 0)
             if positions is not None:
                 model_kwargs["positions"] = positions
             positions = model_kwargs.get("positions", None)

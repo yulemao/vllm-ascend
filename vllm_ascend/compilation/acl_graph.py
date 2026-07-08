@@ -205,9 +205,24 @@ class ACLGraphWrapper:
             # manage the memory during acl graph capture
             return output
 
+        logger.info(
+            "[DEBUG-HANG] ACLGraphWrapper.__call__ replay path: "
+            "batch_descriptor=%s entry_existed=%s",
+            batch_descriptor,
+            entry_existed,
+        )
+        # check if the input addresses are the same
+        new_input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
+        logger.info(
+            "[DEBUG-HANG] ACLGraphWrapper replay input addresses: "
+            "batch_descriptor=%s entry_existed=%s expected=%s got=%s match=%s",
+            entry.batch_descriptor,
+            entry_existed,
+            entry.input_addresses,
+            new_input_addresses,
+            new_input_addresses == entry.input_addresses,
+        )
         if self.is_debugging_mode:
-            # check if the input addresses are the same
-            new_input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
             assert new_input_addresses == entry.input_addresses, (
                 f"Input addresses for aclgraphs are different "
                 f"during replay. Expected {entry.input_addresses}, "
@@ -227,16 +242,22 @@ class ACLGraphWrapper:
         is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
         if not self.enable_enpu and need_sync:
+            import time
+            sync_start = time.monotonic()
             logger.info(
                 "[DEBUG-HANG] ACLGraphWrapper synchronize before replay: "
-                "batch_descriptor=%s runtime_mode=%s",
+                "batch_descriptor=%s runtime_mode=%s sync_start=%f",
                 entry.batch_descriptor,
                 self.runtime_mode,
+                sync_start,
             )
             torch.npu.current_stream().synchronize()
+            sync_end = time.monotonic()
             logger.info(
-                "[DEBUG-HANG] ACLGraphWrapper synchronize done: batch_descriptor=%s",
+                "[DEBUG-HANG] ACLGraphWrapper synchronize done: "
+                "batch_descriptor=%s elapsed_ms=%f",
                 entry.batch_descriptor,
+                (sync_end - sync_start) * 1000,
             )
         logger.info(
             "[DEBUG-HANG] ACLGraphWrapper replay start: batch_descriptor=%s "

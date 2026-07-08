@@ -4241,6 +4241,14 @@ class NPUModelRunner(GPUModelRunner):
                 self.num_layers - self.tail_k,
                 self.num_layers,
             ))
+            logger.info(
+                "[DEBUG-HANG] _edge_cloud_forward_edge segment_e intermediate_tensors: "
+                "tail_layer_indices=%s intermediate_tensors_keys=%s shapes=%s",
+                tail_layer_indices,
+                list(intermediate_tensors.tensors.keys()) if intermediate_tensors is not None else None,
+                {k: tuple(v.shape) for k, v in intermediate_tensors.tensors.items()}
+                if intermediate_tensors is not None else None,
+            )
             if seg_e_graph and not forward_context.capturing:
                 logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_e update params start")
                 self._update_full_graph_params_if_needed(
@@ -4316,6 +4324,18 @@ class NPUModelRunner(GPUModelRunner):
             self.num_layers - self.tail_k,
         ))
         # intermediate_tensors 已由 NPUWorker 从 Edge 侧接收
+        logger.info(
+            "[DEBUG-HANG] _edge_cloud_forward_cloud intermediate_tensors: "
+            "num_layers=%d head_k=%d tail_k=%d cloud_layer_indices=%s "
+            "intermediate_tensors_keys=%s shapes=%s",
+            self.num_layers,
+            self.head_k,
+            self.tail_k,
+            cloud_layer_indices,
+            list(intermediate_tensors.tensors.keys()) if intermediate_tensors is not None else None,
+            {k: tuple(v.shape) for k, v in intermediate_tensors.tensors.items()}
+            if intermediate_tensors is not None else None,
+        )
         from vllm_ascend.ascend_forward_context import _EXTRA_CTX
         old_layer_idx = _EXTRA_CTX.layer_idx
         if _EXTRA_CTX.layer_idx is not None:

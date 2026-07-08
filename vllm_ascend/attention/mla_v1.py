@@ -850,9 +850,9 @@ class AscendMLAImpl(MLAAttentionImpl):
                 if _EXTRA_CTX.is_draft_model:
                     draft_step = attn_count // num_layers
                     attn_metadata_current = attn_metadata[draft_step]
-                    attn_count = attn_count + 1
                 else:
                     attn_metadata_current = attn_metadata
+                attn_count = attn_count + 1
 
                 seq_lens_list = attn_metadata_current[key].decode.seq_lens_list
                 if speculative_config and speculative_config.use_eagle() and not _EXTRA_CTX.is_draft_model:

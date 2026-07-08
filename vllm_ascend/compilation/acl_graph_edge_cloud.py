@@ -80,9 +80,20 @@ def graph_params_scope(
         yield
     finally:
         if graph_params is not None:
-            logger.info("[DEBUG-HANG] graph_params_scope synchronize start")
+            import time
+            sync_start = time.monotonic()
+            logger.info(
+                "[DEBUG-HANG] graph_params_scope synchronize start: "
+                "graph_params_id=%s sync_start=%f",
+                id(graph_params), sync_start,
+            )
             torch.npu.current_stream().synchronize()
-            logger.info("[DEBUG-HANG] graph_params_scope synchronize done")
+            sync_end = time.monotonic()
+            logger.info(
+                "[DEBUG-HANG] graph_params_scope synchronize done: "
+                "graph_params_id=%s elapsed_ms=%f",
+                id(graph_params), (sync_end - sync_start) * 1000,
+            )
         _acl_graph._graph_params = old_graph_params
         _acl_graph._draft_graph_params = old_draft_graph_params
         logger.info("[DEBUG-HANG] graph_params_scope exit")

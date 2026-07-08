@@ -113,6 +113,15 @@ class ACLGraphWrapper:
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
+        entry_existed = batch_descriptor in self.concrete_aclgraph_entries
+        logger.info(
+            "[DEBUG-HANG] ACLGraphWrapper.__call__ enter: "
+            "batch_descriptor=%s runtime_mode=%s wrapper_mode=%s entry_existed=%s",
+            batch_descriptor,
+            aclgraph_runtime_mode,
+            self.runtime_mode,
+            entry_existed,
+        )
 
         if aclgraph_runtime_mode == CUDAGraphMode.NONE or aclgraph_runtime_mode != self.runtime_mode:
             # CUDAGraphMode.NONE could mean the profile run, a warmup run, or
@@ -121,6 +130,7 @@ class ACLGraphWrapper:
             # matches. This enables properly dispatching to the correct
             # CUDAGraphWrapper when nesting multiple instances with different
             # runtime modes.
+            logger.info("[DEBUG-HANG] ACLGraphWrapper.__call__ direct runnable")
             return self.runnable(*args, **kwargs)
 
         if batch_descriptor not in self.concrete_aclgraph_entries:
@@ -130,6 +140,12 @@ class ACLGraphWrapper:
         entry = self.concrete_aclgraph_entries[batch_descriptor]
 
         if entry.aclgraph is None:
+            logger.info(
+                "[DEBUG-HANG] ACLGraphWrapper.__call__ capture path: "
+                "batch_descriptor=%s entry_existed=%s",
+                batch_descriptor,
+                entry_existed,
+            )
             if self.aclgraph_options.debug_log_enable:
                 # Since we capture aclgraph for many different shapes and
                 # capturing is fast, we don't need to log it for every
@@ -279,6 +295,19 @@ def update_full_graph_params(
     with graph_params_scope(graph_params, draft_graph_params), set_current_vllm_config(vllm_config):
         impl_cls = attn_backend.get_impl_cls()
 
+        gp = get_graph_params() if not _EXTRA_CTX.is_draft_model else get_draft_graph_params()
+        logger.info(
+            "[DEBUG-HANG] update_full_graph_params graph_params: "
+            "id=%s num_tokens=%d attn=%d handles=%d events=%d conv1d=%d workspaces=%s",
+            id(gp) if gp is not None else None,
+            num_tokens,
+            len(gp.attn_params.get(num_tokens, [])) if gp is not None else -1,
+            len(gp.handles.get(num_tokens, [])) if gp is not None else -1,
+            len(gp.events.get(num_tokens, [])) if gp is not None else -1,
+            len(gp.conv1d_params.get(num_tokens, [])) if gp is not None else -1,
+            list(gp.workspaces.keys()) if gp is not None else None,
+        )
+
         # Use the caller-supplied unfiltered metadata if available;
         # otherwise fall back to forward_context.attn_metadata (non-edge-cloud path).
         unfiltered_metadata = unfiltered_attn_metadata or forward_context.attn_metadata
@@ -291,8 +320,21 @@ def update_full_graph_params(
                 "layer_indices must be in ascending natural order to align with "
                 "graph_params.attn_params append order."
             )
+            logger.info(
+                "[DEBUG-HANG] update_full_graph_params filter: "
+                "num_tokens=%d layer_indices=%s unfiltered_keys=%s",
+                num_tokens,
+                layer_indices,
+                list(forward_context.attn_metadata.keys()) if forward_context.attn_metadata else None,
+            )
             filtered_metadata = _filter_attn_metadata_for_layers(
                 forward_context.attn_metadata, layer_indices
+            )
+            logger.info(
+                "[DEBUG-HANG] update_full_graph_params filtered: "
+                "num_tokens=%d filtered_keys=%s",
+                num_tokens,
+                list(filtered_metadata.keys()),
             )
             forward_context.attn_metadata = filtered_metadata
 
@@ -355,9 +397,18 @@ def _filter_attn_metadata_for_layers(
     """
     result: dict = {}
     skipped_no_key_layers: list[int] = []
+    logger.info(
+        "[DEBUG-HANG] _filter_attn_metadata_for_layers start: "
+        "layer_indices=%s attn_metadata_keys=%s",
+        layer_indices,
+        list(attn_metadata.keys()) if attn_metadata else None,
+    )
     for idx in layer_indices:
         needle = f".layers.{idx}."
         matched_keys = [k for k in attn_metadata if needle in k]
+        logger.info(
+            "[DEBUG-HANG] _filter layer=%d matched_keys=%s", idx, matched_keys
+        )
         if not matched_keys:
             skipped_no_key_layers.append(idx)
             continue
@@ -390,6 +441,15 @@ def _filter_attn_metadata_for_layers(
             f"This breaks the 1:1 alignment between attn_metadata and attn_params."
         )
 
+    if skipped_no_key_layers:
+        logger.info(
+            "[DEBUG-HANG] _filter_attn_metadata_for_layers skipped layers: %s",
+            skipped_no_key_layers,
+        )
+    logger.info(
+        "[DEBUG-HANG] _filter_attn_metadata_for_layers result keys: %s",
+        list(result.keys()),
+    )
     return result
 
 

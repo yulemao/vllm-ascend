@@ -10,6 +10,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.compilation.cuda_graph import CUDAGraphOptions
 from vllm.config import CUDAGraphMode
+from vllm.logger import logger
 
 from vllm_ascend.compilation import acl_graph as _acl_graph
 from vllm_ascend.compilation.acl_graph import (
@@ -63,6 +64,14 @@ def graph_params_scope(
     """
     old_graph_params = _acl_graph._graph_params
     old_draft_graph_params = _acl_graph._draft_graph_params
+    logger.info(
+        "[DEBUG-HANG] graph_params_scope enter: "
+        "graph_params_id=%s draft_graph_params_id=%s old_id=%s old_draft_id=%s",
+        id(graph_params) if graph_params is not None else None,
+        id(draft_graph_params) if draft_graph_params is not None else None,
+        id(old_graph_params) if old_graph_params is not None else None,
+        id(old_draft_graph_params) if old_draft_graph_params is not None else None,
+    )
     if graph_params is not None:
         _acl_graph._graph_params = graph_params
     if draft_graph_params is not None:
@@ -71,9 +80,12 @@ def graph_params_scope(
         yield
     finally:
         if graph_params is not None:
+            logger.info("[DEBUG-HANG] graph_params_scope synchronize start")
             torch.npu.current_stream().synchronize()
+            logger.info("[DEBUG-HANG] graph_params_scope synchronize done")
         _acl_graph._graph_params = old_graph_params
         _acl_graph._draft_graph_params = old_draft_graph_params
+        logger.info("[DEBUG-HANG] graph_params_scope exit")
 
 
 # ============================================================
@@ -112,5 +124,11 @@ class EdgeCloudACLGraphWrapper(ACLGraphWrapper):
         self.draft_graph_params: GraphParams | None = None
 
     def __call__(self, *args, **kwargs):
+        logger.info(
+            "[DEBUG-HANG] EdgeCloudACLGraphWrapper.__call__: "
+            "graph_params_id=%s draft_graph_params_id=%s",
+            id(self.graph_params) if self.graph_params is not None else None,
+            id(self.draft_graph_params) if self.draft_graph_params is not None else None,
+        )
         with graph_params_scope(self.graph_params, self.draft_graph_params):
             return super().__call__(*args, **kwargs)

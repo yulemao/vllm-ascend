@@ -3738,6 +3738,16 @@ class NPUModelRunner(GPUModelRunner):
             and not self.use_sparse
         ):
             assert positions is not None
+            logger.info(
+                "[DEBUG-HANG] _update_full_graph_params_if_needed: "
+                "num_tokens_padded=%d layer_indices=%s graph_wrapper_type=%s "
+                "graph_params_id=%s draft_graph_params_id=%s",
+                num_tokens_padded,
+                layer_indices,
+                type(graph_wrapper).__name__ if graph_wrapper is not None else None,
+                id(graph_wrapper.graph_params) if graph_wrapper is not None else None,
+                id(graph_wrapper.draft_graph_params) if graph_wrapper is not None else None,
+            )
             if graph_wrapper is not None:
                 assert graph_wrapper.graph_params is not None
             # Edge-cloud segments may contain mixed DSA+FIA layers.
@@ -4185,14 +4195,23 @@ class NPUModelRunner(GPUModelRunner):
                         graph_wrapper=seg_a,
                     )
                     logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_a update params done")
-                logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_a call start")
+                logger.info(
+                    "[DEBUG-HANG] _edge_cloud_forward_edge segment_a call start: "
+                    "seg_a_graph_params_id=%s seg_a_draft_graph_params_id=%s",
+                    id(seg_a.graph_params) if isinstance(seg_a, EdgeCloudACLGraphWrapper) else None,
+                    id(seg_a.draft_graph_params) if isinstance(seg_a, EdgeCloudACLGraphWrapper) else None,
+                )
                 hidden_states = seg_a(
                     input_ids=input_ids,
                     positions=positions,
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
-                logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_a call done")
+                logger.info(
+                    "[DEBUG-HANG] _edge_cloud_forward_edge segment_a call done: "
+                    "seg_a_graph_params_id=%s",
+                    id(seg_a.graph_params) if isinstance(seg_a, EdgeCloudACLGraphWrapper) else None,
+                )
             finally:
                 if old_layer_idx is not None:
                     _EXTRA_CTX.layer_idx = old_layer_idx
@@ -4230,13 +4249,22 @@ class NPUModelRunner(GPUModelRunner):
                     graph_wrapper=seg_e,
                 )
                 logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_e update params done")
-            logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_e call start")
+            logger.info(
+                "[DEBUG-HANG] _edge_cloud_forward_edge segment_e call start: "
+                "seg_e_graph_params_id=%s seg_e_draft_graph_params_id=%s",
+                id(seg_e.graph_params) if isinstance(seg_e, EdgeCloudACLGraphWrapper) else None,
+                id(seg_e.draft_graph_params) if isinstance(seg_e, EdgeCloudACLGraphWrapper) else None,
+            )
             hidden_states = seg_e(
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 **model_kwargs,
             )
-            logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_e call done")
+            logger.info(
+                "[DEBUG-HANG] _edge_cloud_forward_edge segment_e call done: "
+                "seg_e_graph_params_id=%s",
+                id(seg_e.graph_params) if isinstance(seg_e, EdgeCloudACLGraphWrapper) else None,
+            )
         finally:
             # segment_e 执行完毕后恢复原始 layer_idx
             if old_layer_idx is not None:
@@ -4304,13 +4332,22 @@ class NPUModelRunner(GPUModelRunner):
                     graph_wrapper=seg_c,
                 )
                 logger.info("[DEBUG-HANG] _edge_cloud_forward_cloud update graph params done")
-            logger.info("[DEBUG-HANG] _edge_cloud_forward_cloud segment_c start")
+            logger.info(
+                "[DEBUG-HANG] _edge_cloud_forward_cloud segment_c start: "
+                "seg_c_graph_params_id=%s seg_c_draft_graph_params_id=%s",
+                id(seg_c.graph_params) if isinstance(seg_c, EdgeCloudACLGraphWrapper) else None,
+                id(seg_c.draft_graph_params) if isinstance(seg_c, EdgeCloudACLGraphWrapper) else None,
+            )
             hidden_states = seg_c(
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 **model_kwargs,
             )
-            logger.info("[DEBUG-HANG] _edge_cloud_forward_cloud segment_c done")
+            logger.info(
+                "[DEBUG-HANG] _edge_cloud_forward_cloud segment_c done: "
+                "seg_c_graph_params_id=%s",
+                id(seg_c.graph_params) if isinstance(seg_c, EdgeCloudACLGraphWrapper) else None,
+            )
         finally:
             if old_layer_idx is not None:
                 _EXTRA_CTX.layer_idx = old_layer_idx

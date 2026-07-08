@@ -801,6 +801,19 @@ class AscendMLAImpl(MLAAttentionImpl):
             return
         if _EXTRA_CTX.is_draft_model:
             attn_keys = attn_keys * (len(graph_params.attn_params[num_tokens]) // num_layers)
+        logger.info(
+            "[DEBUG-HANG] AscendMLAImpl.update_graph_params: "
+            "is_draft=%s graph_params_id=%s num_tokens=%d num_layers=%d "
+            "attn_params=%d handles=%d events=%d attn_keys=%s",
+            _EXTRA_CTX.is_draft_model,
+            id(graph_params),
+            num_tokens,
+            num_layers,
+            len(graph_params.attn_params.get(num_tokens, [])),
+            len(graph_params.handles.get(num_tokens, [])),
+            len(graph_params.events.get(num_tokens, [])),
+            attn_keys,
+        )
         attn_count = 0
         with torch.npu.stream(update_stream):
             for key, param, handle, event in zip(
@@ -829,6 +842,11 @@ class AscendMLAImpl(MLAAttentionImpl):
                     dequant_scale_q_nope,
                     fak_descale_float,
                 ) = param
+                logger.info(
+                    "[DEBUG-HANG] AscendMLAImpl.update_graph_params loop: "
+                    "attn_count=%d key=%s",
+                    attn_count, key,
+                )
                 if _EXTRA_CTX.is_draft_model:
                     draft_step = attn_count // num_layers
                     attn_metadata_current = attn_metadata[draft_step]
@@ -887,6 +905,12 @@ class AscendMLAImpl(MLAAttentionImpl):
                 torch.npu.graph_task_update_end(update_stream)
 
                 event.record(update_stream)
+
+        logger.info(
+            "[DEBUG-HANG] AscendMLAImpl.update_graph_params done: "
+            "is_draft=%s num_tokens=%d total_attn_count=%d",
+            _EXTRA_CTX.is_draft_model, num_tokens, attn_count,
+        )
 
     def _v_up_proj(self, x):
         # Convert from (N, B, L)/(N, B, 1, L) to (N, B, L)

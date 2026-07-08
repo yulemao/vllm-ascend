@@ -791,6 +791,8 @@ class NPUModelRunner(GPUModelRunner):
             self.vllm_config,
             runtime_mode=runtime_mode,
             cudagraph_options=None,
+            use_eagle=self.use_eagle,
+            enable_enpu=self.enable_enpu,
         )
 
     def _get_edge_cloud_segment_model(self, segment: Any) -> torch.nn.Module:
@@ -4190,11 +4192,21 @@ class NPUModelRunner(GPUModelRunner):
         old_layer_idx = _EXTRA_CTX.layer_idx
         if _EXTRA_CTX.layer_idx is not None:
             _EXTRA_CTX.layer_idx = self.head_k
+
+        # EAGLE3 + ACL graph: the edge-cloud path normally pre-updates graph
+        # params before replay, but for EAGLE3 this can deadlock because the
+        # update stream's graph_task_update_begin may wait on a graph-completion
+        # fence that has not been signaled yet (there is no previous replay).
+        # The non-edge-cloud path always updates graph params *after* the replay,
+        # and that ordering is known to work for EAGLE3. Use post-update for
+        # EAGLE3 and keep the original pre-update ordering for other configs.
+        use_post_update = seg_c_graph and self.use_aux_hidden_state_outputs
+
         try:
-            # 图回放前预更新 attention 参数（seq_lens、block_table、KV cache 指针等），
-            # 确保第一次 decode 回放不使用 warmup 时期的 stale 参数（否则 attention kernel
-            # 用错误的 seq_lens 访问 KV cache 越界 → NaN）。
-            if seg_c_graph and not forward_context.capturing:
+            if seg_c_graph and not forward_context.capturing and not use_post_update:
+                # Pre-update attention params (seq_lens, block_table, KV cache
+                # pointers, etc.) before replay, so the current replay uses
+                # fresh metadata instead of stale warmup values.
                 self._update_full_graph_params_if_needed(
                     forward_context, num_tokens_padded, positions,
                     layer_indices=cloud_layer_indices,
@@ -4205,6 +4217,15 @@ class NPUModelRunner(GPUModelRunner):
                 intermediate_tensors=intermediate_tensors,
                 **model_kwargs,
             )
+            if seg_c_graph and not forward_context.capturing and use_post_update:
+                # Update attention params after the replay, matching the
+                # non-edge-cloud flow for EAGLE3 and avoiding the first-replay
+                # deadlock described above.
+                self._update_full_graph_params_if_needed(
+                    forward_context, num_tokens_padded, positions,
+                    layer_indices=cloud_layer_indices,
+                    graph_wrapper=seg_c,
+                )
         finally:
             if old_layer_idx is not None:
                 _EXTRA_CTX.layer_idx = old_layer_idx

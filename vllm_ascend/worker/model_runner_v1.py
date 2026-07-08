@@ -3226,9 +3226,14 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config else 1
         )
 
+        # Cache the step1 positions on the cloud side; steps >= 2 are simply
+        # step1 + (spec_step_idx - 1).
+        mtp_base_positions: torch.Tensor | None = None
+
         for spec_step_idx in range(num_steps):
-            # Receive intermediate from edge (including positions).
-            # spec_step_idx is derived directly from the loop counter.
+            # Receive intermediate from edge.  Positions are omitted for
+            # step0 (reconstructed from the saved main-model metadata) and for
+            # steps >= 2 (derived from the cached step1 positions).
             tensor_dict, comm_handles, comm_postprocess = (
                 edge_cloud_broadcast_recv_mtp()
             )
@@ -3239,8 +3244,32 @@ class NPUModelRunner(GPUModelRunner):
             intermediate = IntermediateTensors(tensor_dict)
 
             # Build kwargs for cloud segment
+            hidden_states = intermediate.tensors.get("hidden_states", None)
+            num_tokens = (
+                hidden_states.shape[0]
+                if hidden_states is not None
+                else 0
+            )
+
             positions = intermediate.tensors.get("positions", None)
-            num_tokens = positions.shape[-1] if positions is not None else 0
+            if positions is None:
+                if spec_step_idx == 0:
+                    positions = self._reconstruct_mtp_step0_positions(
+                        num_tokens
+                    )
+                elif mtp_base_positions is not None:
+                    positions = self._clamp_mtp_positions(
+                        mtp_base_positions + (spec_step_idx - 1)
+                    )
+                else:
+                    raise RuntimeError(
+                        f"MTP cloud segment did not receive positions for "
+                        f"spec_step_idx={spec_step_idx} and has no base "
+                        f"positions to derive from."
+                    )
+            elif spec_step_idx == 1:
+                # Save the step1 positions so we can construct steps 2..N.
+                mtp_base_positions = positions.clone()
 
             # Copy received tensors into persistent buffers so that the
             # ACLGraphWrapper-wrapped segment_c sees stable input addresses.
@@ -3263,7 +3292,6 @@ class NPUModelRunner(GPUModelRunner):
 
             # Run cloud segment (all MTP decoder layers are on cloud)
             segment = self._edge_cloud_mtp_segments["c"]
-            num_tokens = positions.shape[-1] if positions is not None else 0
 
             # Determine cudagraph runtime mode for the MTP cloud segment so
             # that ACLGraphWrapper can replay a captured graph during decode.
@@ -3302,6 +3330,78 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 for handle in send_work:
                     handle.wait()
+
+    def _clamp_mtp_positions(
+        self,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the same max_model_len clamp that the edge proposer uses."""
+        max_model_len = self.model_config.max_model_len
+        if positions.dim() > 1:
+            # M-RoPE: clamp based on the first dimension.
+            exceeds = positions[0] >= max_model_len
+            return torch.where(
+                exceeds.unsqueeze(0), torch.zeros_like(positions), positions
+            )
+        exceeds = positions >= max_model_len
+        return torch.where(exceeds, torch.zeros_like(positions), positions)
+
+    def _reconstruct_mtp_step0_positions(
+        self,
+        reduced_num_tokens: int,
+    ) -> torch.Tensor:
+        """Reconstruct step0 MTP positions on the cloud side.
+
+        The edge sends reduced/SP-chunked positions for the first MTP pass.
+        The cloud already has the unreduced main-model positions in
+        ``_cloud_spec_decode_common_attn_metadata.positions``; applying the
+        same TP reduction that the edge uses yields the identical tensor.
+        """
+        if (
+            not hasattr(self, "_cloud_spec_decode_common_attn_metadata")
+            or self._cloud_spec_decode_common_attn_metadata is None
+        ):
+            raise RuntimeError(
+                "Cannot reconstruct MTP step0 positions: cloud spec-decode "
+                "attention metadata is not available."
+            )
+
+        common = self._cloud_spec_decode_common_attn_metadata
+        if common.positions is None:
+            raise RuntimeError(
+                "Cannot reconstruct MTP step0 positions: positions field is "
+                "missing from cloud spec-decode attention metadata."
+            )
+
+        full_positions = common.positions
+        if full_positions.shape[-1] == reduced_num_tokens:
+            # No TP/SP reduction on positions; use directly.
+            return full_positions[:reduced_num_tokens].to(torch.int32)
+
+        # Apply the same reduction that the edge uses for MTP positions
+        # (see llm_base_proposer.maybe_pad_and_reduce).  The edge pads to the
+        # next TP multiple and then reduce-scatters along the token dimension.
+        # We already know the reduced length, so we can reconstruct the padded
+        # unreduced length directly without depending on the current forward
+        # context's pad_size.
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        if tp_size == 1:
+            return full_positions[:reduced_num_tokens].to(torch.int32)
+
+        unreduced_len = reduced_num_tokens * tp_size
+        if full_positions.shape[-1] < unreduced_len:
+            raise RuntimeError(
+                f"Cannot reconstruct MTP step0 positions: saved positions "
+                f"length {full_positions.shape[-1]} is smaller than the "
+                f"required unreduced length {unreduced_len}."
+            )
+
+        from vllm.distributed import tensor_model_parallel_reduce_scatter
+
+        padded = full_positions[:unreduced_len].to(torch.int32).unsqueeze(-1)
+        reduced = tensor_model_parallel_reduce_scatter(padded, dim=0)
+        reduced = reduced.squeeze(-1)
+        return self._clamp_mtp_positions(reduced[:reduced_num_tokens])
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):

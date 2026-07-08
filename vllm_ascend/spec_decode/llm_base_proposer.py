@@ -2063,7 +2063,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Include positions so cloud can run the decoder layers.
             # spec_step_idx is derived from the cloud-side loop counter, so it
             # does not need to be sent over the wire.
-            output["positions"] = model_kwargs["positions"]
+            #
+            # Optimization: for plain 1-D positions the sequence after step1 is
+            # purely deterministic (step1 + k).  The cloud can reconstruct step0
+            # from the saved main-model attention metadata, so we only need to
+            # send the step1 positions across the wire.  Non-1-D / M-RoPE schemes
+            # fall back to sending every step.
+            spec_step_idx = model_kwargs.get("spec_step_idx", 0)
+            positions = model_kwargs["positions"]
+            if (
+                spec_step_idx == 1
+                or positions.dim() != 1
+                or self.uses_mrope
+            ):
+                output["positions"] = positions
             if get_pp_group().world_size == 2:
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v
@@ -2114,7 +2127,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Copy received tensors into persistent buffers so that the
             # ACLGraphWrapper-wrapped segment_c sees stable input addresses.
             positions = tensor_dict.get("positions")
-            num_tokens = positions.shape[-1] if positions is not None else 0
+            num_tokens = (
+                positions.shape[-1]
+                if positions is not None
+                else intermediate["hidden_states"].shape[0]
+            )
             intermediate = (
                 self.runner._sync_edge_cloud_mtp_intermediate_tensors(
                     num_tokens, intermediate
@@ -2127,10 +2144,22 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # spec_step_idx is not sent by the edge; derive it from the loop
             # counter supplied by the caller.
             spec_step_idx = model_kwargs.get("spec_step_idx", 0)
-            if positions is not None:
-                model_kwargs["positions"] = positions
-            positions = model_kwargs.get("positions", None)
-            num_tokens = positions.shape[-1] if positions is not None else 0
+            if positions is None:
+                # Fallback reconstruction (should not normally be reached; the
+                # main cloud loop in model_runner_v1 handles this).
+                if (
+                    spec_step_idx == 0
+                    and hasattr(self.runner, "_reconstruct_mtp_step0_positions")
+                ):
+                    positions = self.runner._reconstruct_mtp_step0_positions(
+                        num_tokens
+                    )
+                else:
+                    raise RuntimeError(
+                        f"MTP cloud fallback path did not receive positions "
+                        f"for spec_step_idx={spec_step_idx}"
+                    )
+            model_kwargs["positions"] = positions
 
             # Build attention metadata for the MTP decoder layers on
             # the cloud side.  Without this, the Ascend attention

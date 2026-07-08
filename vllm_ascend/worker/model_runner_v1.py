@@ -3536,6 +3536,15 @@ class NPUModelRunner(GPUModelRunner):
                 "[DEBUG-HANG] _run_draft_cloud_segment step=%d send done", step_idx
             )
 
+        # [VERIFY-HANG] eager draft 段结束后、下一次 execute_model 中目标 verify
+        # segment_c 图回放之前，插入一次全设备同步（排空 HCCL 通信流，而非仅
+        # compute current_stream），用于验证假设：
+        #   "eager draft 的集合通信与 segment_c FULL 图内捕获的集合通信
+        #    交错 / 通信器状态不一致 -> 图回放死锁"。
+        # 若加完此处后 verify 不再卡死，则根因确认。
+        torch.npu.synchronize()
+        logger.info("[VERIFY-HANG] _run_draft_cloud_segment end: device synced")
+
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
         # Sample the next token and get logprobs if needed.

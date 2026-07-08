@@ -155,8 +155,15 @@ class ACLGraphWrapper:
             # validate that aclgraph capturing is legal at this point.
             validate_cudagraph_capturing_enabled()
 
-            input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
+            input_addresses = _extract_tensor_addresses(args) + _extract_tensor_addresses(kwargs)
             entry.input_addresses = input_addresses
+            logger.info(
+                "[DEBUG-HANG] ACLGraphWrapper capture input addresses: "
+                "batch_descriptor=%s num_tensors=%s addresses=%s",
+                batch_descriptor,
+                len(input_addresses),
+                input_addresses,
+            )
             aclgraph = torch.npu.NPUGraph()
 
             with ExitStack() as stack:
@@ -212,7 +219,7 @@ class ACLGraphWrapper:
             entry_existed,
         )
         # check if the input addresses are the same
-        new_input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
+        new_input_addresses = _extract_tensor_addresses(args) + _extract_tensor_addresses(kwargs)
         logger.info(
             "[DEBUG-HANG] ACLGraphWrapper replay input addresses: "
             "batch_descriptor=%s entry_existed=%s expected=%s got=%s match=%s",
@@ -281,6 +288,29 @@ def weak_ref_workspaces(params):
         if params.workspaces[num_tokens] is None:
             continue
         params.workspaces[num_tokens] = weak_ref_tensors(params.workspaces[num_tokens])
+
+
+def _extract_tensor_addresses(obj: Any) -> list[int]:
+    """递归从 args/kwargs/IntermediateTensors 等结构中抽取 Tensor 的 data_ptr。
+
+    ACLGraphWrapper 原实现只检查 positional args 中的 tensor 地址，
+    但 segment_c/segment_e 通过 kwargs 传入 positions 和 intermediate_tensors，
+    导致地址检查失效。这里递归遍历 tuple/list/dict/IntermediateTensors，
+    把捕获和回放时的所有 tensor 地址都记录下来做对比。
+    """
+    addresses: list[int] = []
+    if isinstance(obj, torch.Tensor):
+        addresses.append(obj.data_ptr())
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            addresses.extend(_extract_tensor_addresses(item))
+    elif isinstance(obj, dict):
+        for item in obj.values():
+            addresses.extend(_extract_tensor_addresses(item))
+    elif hasattr(obj, "tensors") and isinstance(obj.tensors, dict):
+        # IntermediateTensors
+        addresses.extend(_extract_tensor_addresses(obj.tensors))
+    return addresses
 
 
 def update_full_graph_params(

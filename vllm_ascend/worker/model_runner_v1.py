@@ -4319,29 +4319,37 @@ class NPUModelRunner(GPUModelRunner):
         seg_c = self.segment_c_wrapper if use_graph else self.segment_c
         seg_c_graph = isinstance(seg_c, ACLGraphWrapper)
 
-        # [VERIFY-RECAPTURE] 一次性探针：清掉 warmup 捕获的 segment_c 图缓存，
-        # 并把 segment_c 自己的 graph_params 重置为空，让第一个真实 verify 就地
-        # 重新捕获（完全复刻 warmup 的捕获流程，但在真实 verify 上下文里）。
-        # 用环境变量 VLLM_ASCEND_VERIFY_RECAPTURE=1 开启，只执行一次。
-        import os as _os
-        if (
-            seg_c_graph
-            and _os.environ.get("VLLM_ASCEND_VERIFY_RECAPTURE") == "1"
-            and not getattr(self, "_seg_c_recaptured", False)
-        ):
-            from vllm_ascend.compilation.acl_graph_edge_cloud import make_graph_params
-            seg_c.concrete_aclgraph_entries.clear()
-            if isinstance(seg_c, EdgeCloudACLGraphWrapper):
-                seg_c.graph_params = make_graph_params(self.cudagraph_batch_sizes)
-                if self.speculative_config:
-                    seg_c.draft_graph_params = make_graph_params(
-                        self.cudagraph_batch_sizes)
-            self._seg_c_recaptured = True
+        # [VERIFY-META] 在 capture 阶段(_monitor.cudagraph_capturing_enabled=True)
+        # 和真实 replay 阶段(=False)都 dump 一份 segment_c 的 attention 上下文，
+        # 用来对比 warmup 捕获 vs 真实 verify 是否一致（结构/元数据是否对得上）。
+        try:
+            _phase = "CAPTURE" if _monitor.cudagraph_capturing_enabled else "REPLAY"
+            _am = forward_context.attn_metadata or {}
+            _first_v = next(iter(_am.values()), None)
+            _fields: dict = {}
+            if _first_v is not None:
+                for _f in ("seq_lens", "num_actual_tokens", "num_reqs",
+                           "query_len", "max_query_len", "block_table",
+                           "slot_mapping"):
+                    _v = getattr(_first_v, _f, "<missing>")
+                    if isinstance(_v, torch.Tensor):
+                        # 只记 shape/device，避免触发 NPU sync 改变时序
+                        _fields[_f] = f"Tensor{tuple(_v.shape)}/{_v.device}"
+                    else:
+                        _fields[_f] = _v
             logger.info(
-                "[VERIFY-RECAPTURE] cleared segment_c aclgraph cache + graph_params "
-                "(one-shot); next verify will RE-CAPTURE num_tokens=%d in real context",
+                "[VERIFY-META] phase=%s num_tokens=%d batch_desc=%s "
+                "attn_entries=%d first_key=%s meta_type=%s fields=%s",
+                _phase,
                 num_tokens_padded,
+                forward_context.batch_descriptor,
+                len(_am),
+                next(iter(_am.keys()), None),
+                type(_first_v).__name__ if _first_v is not None else None,
+                _fields,
             )
+        except Exception as _e:  # noqa: BLE001
+            logger.info("[VERIFY-META] dump failed: %s", _e)
 
         cloud_layer_indices = list(range(
             self.head_k,

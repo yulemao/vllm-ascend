@@ -3536,15 +3536,6 @@ class NPUModelRunner(GPUModelRunner):
                 "[DEBUG-HANG] _run_draft_cloud_segment step=%d send done", step_idx
             )
 
-        # [VERIFY-HANG] eager draft 段结束后、下一次 execute_model 中目标 verify
-        # segment_c 图回放之前，插入一次全设备同步（排空 HCCL 通信流，而非仅
-        # compute current_stream），用于验证假设：
-        #   "eager draft 的集合通信与 segment_c FULL 图内捕获的集合通信
-        #    交错 / 通信器状态不一致 -> 图回放死锁"。
-        # 若加完此处后 verify 不再卡死，则根因确认。
-        torch.npu.synchronize()
-        logger.info("[VERIFY-HANG] _run_draft_cloud_segment end: device synced")
-
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
         # Sample the next token and get logprobs if needed.
@@ -4327,6 +4318,30 @@ class NPUModelRunner(GPUModelRunner):
 
         seg_c = self.segment_c_wrapper if use_graph else self.segment_c
         seg_c_graph = isinstance(seg_c, ACLGraphWrapper)
+
+        # [VERIFY-RECAPTURE] 一次性探针：清掉 warmup 捕获的 segment_c 图缓存，
+        # 并把 segment_c 自己的 graph_params 重置为空，让第一个真实 verify 就地
+        # 重新捕获（完全复刻 warmup 的捕获流程，但在真实 verify 上下文里）。
+        # 用环境变量 VLLM_ASCEND_VERIFY_RECAPTURE=1 开启，只执行一次。
+        import os as _os
+        if (
+            seg_c_graph
+            and _os.environ.get("VLLM_ASCEND_VERIFY_RECAPTURE") == "1"
+            and not getattr(self, "_seg_c_recaptured", False)
+        ):
+            from vllm_ascend.compilation.acl_graph_edge_cloud import make_graph_params
+            seg_c.concrete_aclgraph_entries.clear()
+            if isinstance(seg_c, EdgeCloudACLGraphWrapper):
+                seg_c.graph_params = make_graph_params(self.cudagraph_batch_sizes)
+                if self.speculative_config:
+                    seg_c.draft_graph_params = make_graph_params(
+                        self.cudagraph_batch_sizes)
+            self._seg_c_recaptured = True
+            logger.info(
+                "[VERIFY-RECAPTURE] cleared segment_c aclgraph cache + graph_params "
+                "(one-shot); next verify will RE-CAPTURE num_tokens=%d in real context",
+                num_tokens_padded,
+            )
 
         cloud_layer_indices = list(range(
             self.head_k,

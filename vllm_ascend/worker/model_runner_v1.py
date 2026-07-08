@@ -4348,6 +4348,23 @@ class NPUModelRunner(GPUModelRunner):
                 type(_first_v).__name__ if _first_v is not None else None,
                 _fields,
             )
+            # REPLAY 时额外把 MLA 关键元数据的"值"读出来（seq_lens 在 cpu；
+            # slot_mapping 仅 4 个元素，读它会触发一次 sync，但发生在回放之前，
+            # 不改变卡死行为）。值 sane -> 排除元数据错配，坐实通信/图本身；
+            # 值异常(0/越界/巨大) -> 元数据值错导致 kernel 挂起。
+            if _phase == "REPLAY":
+                try:
+                    _sl = getattr(_first_v, "seq_lens", None)
+                    _sm = getattr(_first_v, "slot_mapping", None)
+                    logger.info(
+                        "[VERIFY-META-VAL] REPLAY num_tokens=%d "
+                        "seq_lens=%s slot_mapping=%s",
+                        num_tokens_padded,
+                        _sl.tolist() if isinstance(_sl, torch.Tensor) else _sl,
+                        _sm.tolist() if isinstance(_sm, torch.Tensor) else _sm,
+                    )
+                except Exception as _ve:  # noqa: BLE001
+                    logger.info("[VERIFY-META-VAL] dump failed: %s", _ve)
         except Exception as _e:  # noqa: BLE001
             logger.info("[VERIFY-META] dump failed: %s", _e)
 

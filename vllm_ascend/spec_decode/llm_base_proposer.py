@@ -2080,7 +2080,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 )
             ) or getattr(self.runner, "_in_mtp_dummy_run", False)
             if (
-                spec_step_idx == 1
+                spec_step_idx <= 1
                 or is_warmup_or_capture
             ):
                 output["positions"] = positions

@@ -2084,6 +2084,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 or is_warmup_or_capture
             ):
                 output["positions"] = positions
+            else:
+                output["positions"] = None
             if get_pp_group().world_size == 2:
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v

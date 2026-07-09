@@ -1023,7 +1023,6 @@ class NPUModelRunner(GPUModelRunner):
             for module_name in (
                 "embed_tokens",
                 "fc",
-                "norm",
                 "pre_fc_norm_hidden",
                 "pre_fc_norm_embedding",
             ):

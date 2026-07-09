@@ -15,6 +15,7 @@ from vllm_ascend.compilation import acl_graph as _acl_graph
 from vllm_ascend.compilation.acl_graph import (
     ACLGraphWrapper,
     GraphParams,
+    _dump_aclgraph_state,
 )
 
 if TYPE_CHECKING:
@@ -112,5 +113,9 @@ class EdgeCloudACLGraphWrapper(ACLGraphWrapper):
         self.draft_graph_params: GraphParams | None = None
 
     def __call__(self, *args, **kwargs):
+        _dump_aclgraph_state(
+            "BEFORE_EDGE_CLOUD_REPLAY", self, args, kwargs,
+            graph_params=self.graph_params,
+            draft_graph_params=self.draft_graph_params)
         with graph_params_scope(self.graph_params, self.draft_graph_params):
             return super().__call__(*args, **kwargs)

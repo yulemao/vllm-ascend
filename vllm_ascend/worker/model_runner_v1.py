@@ -653,6 +653,11 @@ class NPUModelRunner(GPUModelRunner):
         # _run_mtp_cloud_segment() which runs later in sample_tokens().
         self._cloud_spec_decode_common_attn_metadata: AscendCommonAttentionMetadata | None = None
         self._cloud_spec_decode_num_reqs: int = 0
+
+        # Set to True while the drafter's dummy_run is executing, so the
+        # edge-cloud MTP edge path sends positions for every step.
+        self._in_mtp_dummy_run: bool = False
+
         self.enable_hamming_sparse = (self.ascend_config.enable_hamming_sparse is True)
         self.enable_hamming_sparse = self.enable_hamming_sparse and not vllm_config.speculative_config
         if self.enable_hamming_sparse is True:
@@ -4843,7 +4848,7 @@ class NPUModelRunner(GPUModelRunner):
             if self.use_compress:
                 self.positions.fill_(127)
                 self._dsa_positions_cpu_buf.fill_(127)
-            attn_metadata, spec_decode_common_attn_metadata = self._build_attention_metadata(
+            attn_metadata, _ = self._build_attention_metadata(
                 num_tokens=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded,
                 num_reqs=num_reqs,
@@ -4853,20 +4858,6 @@ class NPUModelRunner(GPUModelRunner):
                 for_cudagraph_capture=is_graph_capturing,
                 num_scheduled_tokens_np=num_scheduled_tokens,
             )
-            # Save spec-decode attention metadata on the cloud side during
-            # dummy/warmup runs so that _run_mtp_cloud_segment can reconstruct
-            # step0 positions even when the edge omits them to save transfer
-            # latency. In production this is set during execute_model();
-            # capturing it here covers warmup/capture paths where execute_model
-            # does not run or does not save it.
-            if (
-                self._edge_cloud_enabled
-                and self.edge_cloud_cfg.role == "cloud"
-                and self.speculative_config
-                and spec_decode_common_attn_metadata is not None
-            ):
-                self._cloud_spec_decode_common_attn_metadata = spec_decode_common_attn_metadata
-                self._cloud_spec_decode_num_reqs = num_reqs
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
@@ -4994,6 +4985,11 @@ class NPUModelRunner(GPUModelRunner):
             dummy_compute_logits(hidden_states)
 
             if self.drafter:
+                # Mark that we are inside the drafter's dummy run so the
+                # edge-cloud MTP edge path always sends positions to the cloud
+                # (warmup/capture paths may otherwise omit them and leave the
+                # cloud without enough info to reconstruct).
+                self._in_mtp_dummy_run = True
                 self.drafter.dummy_run(
                     num_tokens=num_tokens_padded,
                     with_prefill=with_prefill,
@@ -5005,6 +5001,7 @@ class NPUModelRunner(GPUModelRunner):
                     in_graph_capturing=not force_attention,
                     is_profile=is_profile,
                 )
+                self._in_mtp_dummy_run = False
             if is_profile and self.dynamic_eplb:
                 target = self.model.language_model if hasattr(self.model, "language_model") else self.model
                 target.clear_all_moe_loads()

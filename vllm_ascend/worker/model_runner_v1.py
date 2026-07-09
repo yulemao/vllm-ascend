@@ -779,12 +779,25 @@ class NPUModelRunner(GPUModelRunner):
         self,
         segment: Any,
         runtime_mode: CUDAGraphMode = CUDAGraphMode.FULL,
+        is_draft: bool = False,
     ) -> Any:
         if not self.edge_cloud_cfg.enable_decode_graph:
             return segment
         if not self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             return segment
         if self._is_dummy_or_profile_run():
+            return segment
+        # 与标准（非边云）流程对齐：draft/proposer 仅在
+        # `_use_aclgraph() and not speculative_config.enforce_eager` 时才用图
+        # （见 llm_base_proposer.py:166 —— eagle3 enforce_eager=True 即代表 draft
+        # 跑 eager）。注意：target 模型段的图开关由 model_config.enforce_eager /
+        # cudagraph_mode 决定，与 speculative_config.enforce_eager 无关，因此该
+        # 分支只对 draft 段（_edge_cloud_draft_segments）生效。
+        if (
+            is_draft
+            and self.speculative_config is not None
+            and self.speculative_config.enforce_eager
+        ):
             return segment
         return EdgeCloudACLGraphWrapper(
             segment,
@@ -1161,13 +1174,16 @@ class NPUModelRunner(GPUModelRunner):
             seg_e = self._create_segment_callable(
                 draft_model, 0, 0, is_first_segment=False, is_last_segment=True
             )
-            self._edge_cloud_draft_segments["a"] = self._wrap_segment_if_needed(seg_a)
-            self._edge_cloud_draft_segments["e"] = self._wrap_segment_if_needed(seg_e)
+            self._edge_cloud_draft_segments["a"] = self._wrap_segment_if_needed(
+                seg_a, is_draft=True)
+            self._edge_cloud_draft_segments["e"] = self._wrap_segment_if_needed(
+                seg_e, is_draft=True)
         else:
             seg_c = self._create_segment_callable(
                 draft_model, 0, 0, is_first_segment=False, is_last_segment=False
             )
-            self._edge_cloud_draft_segments["c"] = self._wrap_segment_if_needed(seg_c)
+            self._edge_cloud_draft_segments["c"] = self._wrap_segment_if_needed(
+                seg_c, is_draft=True)
 
     def _sync_edge_cloud_draft_intermediate_tensors(
         self,

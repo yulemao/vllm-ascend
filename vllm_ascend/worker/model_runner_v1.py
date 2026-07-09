@@ -791,6 +791,12 @@ class NPUModelRunner(GPUModelRunner):
             self.vllm_config,
             runtime_mode=runtime_mode,
             cudagraph_options=None,
+            # 与标准（非边云）流程的 ACLGraphWrapper 构造保持一致（model_runner_v1.py:5298），
+            # 否则边云 wrapper 的 use_eagle 恒为 False：
+            #  - target 验证路径（is_draft_model=False）不受影响（need_sync 恒为 True），
+            #  - 但 draft 段（is_draft_model=True）回放前的 synchronize 屏障决策会与非边云分叉。
+            use_eagle=self.use_eagle,
+            enable_enpu=self.enable_enpu,
         )
 
     def _get_edge_cloud_segment_model(self, segment: Any) -> torch.nn.Module:

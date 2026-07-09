@@ -192,6 +192,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # since final block table tensor is not ready in __init__, it is delayed until dummy_run
         self.block_table_tensor_clone: torch.Tensor | None = None
 
+        # Cloud-side cache for step1 positions in the edge-cloud MTP fallback
+        # path (used during warmup/capture when sample_tokens is not reached).
+        # Steps >= 2 are derived as step1 + (spec_step_idx - 1).
+        self._mtp_cloud_base_positions: torch.Tensor | None = None
+
         self._runnable = self._run_merged_draft
         self.is_multimodal_model = self.vllm_config.model_config.is_multimodal_model
         if self.uses_mrope:
@@ -2071,16 +2076,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # fall back to sending every step.
             spec_step_idx = model_kwargs.get("spec_step_idx", 0)
             positions = model_kwargs["positions"]
+            forward_context = get_forward_context()
+            is_warmup_or_capture = (
+                forward_context is not None
+                and (
+                    getattr(forward_context, "in_profile_run", False)
+                    or getattr(forward_context, "capturing", False)
+                )
+            )
             if (
                 spec_step_idx == 1
-                or positions.dim() != 1
-                or self.uses_mrope
+                or is_warmup_or_capture
             ):
                 output["positions"] = positions
             if get_pp_group().world_size == 2:
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v
-                     for k, v in output.items()}
+                     for k, v in output.items() if v is not None}
                 )
                 for handle in send_work:
                     handle.wait()
@@ -2144,21 +2156,29 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # spec_step_idx is not sent by the edge; derive it from the loop
             # counter supplied by the caller.
             spec_step_idx = model_kwargs.get("spec_step_idx", 0)
-            if positions is None:
-                # Fallback reconstruction (should not normally be reached; the
-                # main cloud loop in model_runner_v1 handles this).
-                if (
-                    spec_step_idx == 0
-                    and hasattr(self.runner, "_reconstruct_mtp_step0_positions")
-                ):
+            if spec_step_idx == 0:
+                # Step0 starts a new speculative sequence; clear the cached
+                # step1 positions.
+                self._mtp_cloud_base_positions = None
+                if positions is None:
                     positions = self.runner._reconstruct_mtp_step0_positions(
                         num_tokens
                     )
-                else:
+            elif positions is None:
+                # Steps >= 2 can be derived from the cached step1 positions
+                # when the edge omits them (normal runtime optimization).
+                if self._mtp_cloud_base_positions is None:
                     raise RuntimeError(
                         f"MTP cloud fallback path did not receive positions "
-                        f"for spec_step_idx={spec_step_idx}"
+                        f"for spec_step_idx={spec_step_idx} and has no base "
+                        f"positions to derive from."
                     )
+                positions = self.runner._clamp_mtp_positions(
+                    self._mtp_cloud_base_positions + (spec_step_idx - 1)
+                )
+            elif spec_step_idx == 1:
+                # Cache step1 positions so we can construct steps 2..N.
+                self._mtp_cloud_base_positions = positions.clone()
             model_kwargs["positions"] = positions
 
             # Build attention metadata for the MTP decoder layers on
@@ -2208,7 +2228,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if get_pp_group().world_size == 2:
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v
-                     for k, v in output.items()}
+                     for k, v in output.items() if v is not None}
                 )
                 for handle in send_work:
                     handle.wait()

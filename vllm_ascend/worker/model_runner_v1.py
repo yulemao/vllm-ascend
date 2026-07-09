@@ -3325,7 +3325,7 @@ class NPUModelRunner(GPUModelRunner):
             if get_pp_group().world_size == 2:
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v
-                     for k, v in output.items()}
+                     for k, v in output.items() if v is not None}
                 )
                 for handle in send_work:
                     handle.wait()
@@ -4843,7 +4843,7 @@ class NPUModelRunner(GPUModelRunner):
             if self.use_compress:
                 self.positions.fill_(127)
                 self._dsa_positions_cpu_buf.fill_(127)
-            attn_metadata, _ = self._build_attention_metadata(
+            attn_metadata, spec_decode_common_attn_metadata = self._build_attention_metadata(
                 num_tokens=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded,
                 num_reqs=num_reqs,
@@ -4853,6 +4853,20 @@ class NPUModelRunner(GPUModelRunner):
                 for_cudagraph_capture=is_graph_capturing,
                 num_scheduled_tokens_np=num_scheduled_tokens,
             )
+            # Save spec-decode attention metadata on the cloud side during
+            # dummy/warmup runs so that _run_mtp_cloud_segment can reconstruct
+            # step0 positions even when the edge omits them to save transfer
+            # latency. In production this is set during execute_model();
+            # capturing it here covers warmup/capture paths where execute_model
+            # does not run or does not save it.
+            if (
+                self._edge_cloud_enabled
+                and self.edge_cloud_cfg.role == "cloud"
+                and self.speculative_config
+                and spec_decode_common_attn_metadata is not None
+            ):
+                self._cloud_spec_decode_common_attn_metadata = spec_decode_common_attn_metadata
+                self._cloud_spec_decode_num_reqs = num_reqs
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,

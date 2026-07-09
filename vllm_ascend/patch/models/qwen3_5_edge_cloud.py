@@ -315,7 +315,7 @@ def _forward_edge_cloud_segment_qwen3_5_mtp(
             "check that all TP ranks receive tensors correctly."
         )
         hidden_states = intermediate_tensors["hidden_states"]
-        residual = intermediate_tensors["residual"]
+        residual = None #intermediate_tensors["residual"]
 
     # Cloud segment: execute exactly one decoder layer selected by spec_step_idx.
     # The final RMSNorm is also placed on the cloud side so that the edge

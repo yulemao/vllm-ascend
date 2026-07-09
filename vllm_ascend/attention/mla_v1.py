@@ -464,6 +464,14 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
         decode_metadata = None
         if self.num_decodes > 0:
             decode_metadata = self.build_decode_metadata(common_prefix_len, common_attn_metadata)
+        logger.info(
+            "[DEBUG-ATTNSTATE] AttentionMetadataBuilder.build: "
+            "attn_state=%s num_prefills=%d num_decodes=%d num_actual_tokens=%d",
+            common_attn_metadata.attn_state.name if common_attn_metadata.attn_state is not None else None,
+            self.num_prefills,
+            self.num_decodes,
+            self.num_actual_tokens,
+        )
         return self.metadata_cls(  # type: ignore
             num_actual_tokens_pcp_padded=self.num_actual_tokens,
             num_input_tokens=common_attn_metadata.num_input_tokens,
@@ -814,6 +822,25 @@ class AscendMLAImpl(MLAAttentionImpl):
             len(graph_params.events.get(num_tokens, [])),
             attn_keys,
         )
+        if attn_keys:
+            sample_key = attn_keys[0]
+            if _EXTRA_CTX.is_draft_model:
+                sample_meta = attn_metadata[0].get(sample_key)
+            else:
+                sample_meta = attn_metadata.get(sample_key)
+            sample_attn_state = (
+                sample_meta.attn_state.name
+                if sample_meta is not None and sample_meta.attn_state is not None
+                else None
+            )
+            logger.info(
+                "[DEBUG-ATTNSTATE] AscendMLAImpl.update_graph_params: "
+                "sample_attn_state=%s sample_key=%s is_draft=%s num_tokens=%d",
+                sample_attn_state,
+                sample_key,
+                _EXTRA_CTX.is_draft_model,
+                num_tokens,
+            )
         attn_count = 0
         with torch.npu.stream(update_stream):
             for key, param, handle, event in zip(
@@ -1424,6 +1451,13 @@ class AscendMLAImpl(MLAAttentionImpl):
             k_pe = k_pe.view(-1, self.num_kv_heads, block_size, self.qk_rope_head_dim)
 
         attn_output_shape: tuple | None = None
+        logger.info(
+            "[DEBUG-ATTNSTATE] AscendMLAImpl.forward decode: "
+            "attn_state=%s num_tokens=%d has_spec_config=%s",
+            attn_metadata.attn_state.name if attn_metadata.attn_state is not None else None,
+            num_tokens,
+            self.speculative_config is not None,
+        )
         if (
             attn_metadata.attn_state
             in [

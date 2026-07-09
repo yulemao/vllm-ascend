@@ -1934,6 +1934,13 @@ class NPUModelRunner(GPUModelRunner):
         else:
             self.attn_state = attn_state  # type: ignore
 
+        logger.info(
+            "[DEBUG-ATTNSTATE] _build_attn_state: computed=%s final_self.attn_state=%s method=%s",
+            attn_state.name if attn_state is not None else None,
+            self.attn_state.name if self.attn_state is not None else None,
+            self.speculative_config.method if self.speculative_config else None,
+        )
+
         return attn_state
 
     def _calc_spec_decode_metadata(
@@ -4842,6 +4849,14 @@ class NPUModelRunner(GPUModelRunner):
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
         )
+        logger.info(
+            "[DEBUG-ATTNSTATE] _build_attention_metadata: cm_base.attn_state=%s "
+            "num_actual_tokens=%d num_reqs=%d use_async_spec=%s",
+            cm_base.attn_state.name if cm_base.attn_state is not None else None,
+            cm_base.num_actual_tokens,
+            cm_base.num_reqs,
+            self.use_async_spec_decode,
+        )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)
@@ -5142,6 +5157,14 @@ class NPUModelRunner(GPUModelRunner):
                     self.attn_state = AscendAttentionState.SpecDecoding
                 else:
                     self.attn_state = AscendAttentionState.ChunkedPrefill
+            logger.info(
+                "[DEBUG-ATTNSTATE] _dummy_run capture attn_state: %s "
+                "method=%s use_mla=%s num_tokens=%d",
+                self.attn_state.name if self.attn_state is not None else None,
+                self.speculative_config.method if self.speculative_config else None,
+                self.vllm_config.model_config.use_mla,
+                num_tokens,
+            )
             # The reason why we use a fixed seq_len rather than max_query_len is that
             # _npu_paged_attention_get_workspace only returns max workspace with specific
             # seq_lens. We use this seq_len only when capturing graph, and still use max_query_len

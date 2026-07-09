@@ -55,7 +55,14 @@ def _forward_edge_cloud_segment_deepseek_v2(
 
     # DeepseekV2DecoderLayer.forward does not accept **kwargs; do not forward
     # extra_layer_kwargs here or unrelated model_kwargs will raise TypeError.
-    aux_hidden_state_layers = getattr(self, "aux_hidden_state_layers", ())
+    # [VERIFY-AUX] 临时开关：关掉 target segment_c 的 aux_hidden_states 产出，
+    # 验证 "eagle3 独有的 aux 输出是否就是 verify 图回放死锁的触发点"。
+    # 开启后 draft 会拿到零张量兜底（输出错但不挂），用于判断 target 图能否回放。
+    import os as _os
+    if _os.environ.get("VLLM_ASCEND_DISABLE_AUX") == "1":
+        aux_hidden_state_layers = ()
+    else:
+        aux_hidden_state_layers = getattr(self, "aux_hidden_state_layers", ())
     aux_hidden_states: list[torch.Tensor] = []
     for idx, layer in enumerate(
         islice(self.layers, start_layer, end_layer), start=start_layer

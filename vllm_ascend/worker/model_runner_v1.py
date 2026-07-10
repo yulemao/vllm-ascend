@@ -3436,6 +3436,22 @@ class NPUModelRunner(GPUModelRunner):
                     aux_hidden_states = getattr(
                         self, "_eagle3_cloud_aux_hidden_states", None
                     )
+                    # The target-model cloud segment may carry cudagraph/SP
+                    # padding in aux_hidden_states (e.g. 64 tokens) while the
+                    # draft cloud segment receives unpadded edge tensors (e.g.
+                    # 60 tokens). Slice to the actual draft num_tokens so that
+                    # Eagle3 layer-0 cat([embeds, hidden_states]) sees matching
+                    # batch dimensions.
+                    if (
+                        aux_hidden_states is not None
+                        and aux_hidden_states.shape[0] != num_tokens
+                    ):
+                        assert aux_hidden_states.shape[0] > num_tokens, (
+                            f"aux_hidden_states batch size "
+                            f"{aux_hidden_states.shape[0]} is smaller than "
+                            f"draft num_tokens {num_tokens}"
+                        )
+                        aux_hidden_states = aux_hidden_states[:num_tokens]
                 else:
                     # For speculative steps beyond the first, the cloud segment
                     # consumes the previous draft step's hidden states (carried

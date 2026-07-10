@@ -635,18 +635,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_scheduled_tokens: int = 0,
         num_rejected_tokens_gpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        logger.info(
-            "[DEBUG-HANG] AscendSpecDecodeBaseProposer._propose start: method=%s "
-            "edge_cloud=%s role=%s num_spec_tokens=%d batch_size=%d "
-            "use_cuda_graph=%s",
-            self.method,
-            getattr(self.runner, "_edge_cloud_enabled", False),
-            getattr(self.runner, "edge_cloud_cfg", None).role
-            if getattr(self.runner, "_edge_cloud_enabled", False) else "n/a",
-            self.num_speculative_tokens,
-            common_attn_metadata.batch_size(),
-            self.use_cuda_graph,
-        )
         batch_size = common_attn_metadata.batch_size()
 
         if token_indices_to_sample is None:
@@ -667,7 +655,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 target_hidden_states = self.model.combine_hidden_states(target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
 
-        logger.info("[DEBUG-HANG] _propose before set_inputs_first_pass")
         num_tokens, token_indices_to_sample, common_attn_metadata, long_seq_args = self.set_inputs_first_pass(
             target_token_ids=target_token_ids,
             next_token_ids=next_token_ids,
@@ -681,7 +668,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_prefill_reqs=num_prefill_reqs,
             num_decode_reqs=num_decode_reqs,
         )
-        logger.info("[DEBUG-HANG] _propose after set_inputs_first_pass num_tokens=%d", num_tokens)
         if self.pcp_size * self.dcp_size > 1:
             assert long_seq_args is not None
             query_lens_d, ori_token_indices_to_sample = long_seq_args
@@ -982,29 +968,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             run_draft = partial(self._runnable, **model_inputs)
 
-            logger.info(
-                "[DEBUG-HANG] _propose run_draft start: num_input_tokens=%d "
-                "num_tokens=%d aclgraph_runtime_mode=%s enable_enpu=%s "
-                "edge_cloud=%s role=%s",
-                num_input_tokens,
-                num_tokens,
-                aclgraph_runtime_mode,
-                self.enable_enpu,
-                getattr(self.runner, "_edge_cloud_enabled", False),
-                getattr(self.runner, "edge_cloud_cfg", None).role
-                if getattr(self.runner, "_edge_cloud_enabled", False) else "n/a",
-            )
             if self.enable_enpu:
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
                 draft_token_ids = run_draft()
             else:
                 draft_token_ids = run_draft()
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
-            logger.info(
-                "[DEBUG-HANG] _propose run_draft done: draft_token_ids_shape=%s",
-                draft_token_ids.shape if torch.is_tensor(draft_token_ids) else "n/a",
-            )
-        logger.info("[DEBUG-HANG] AscendSpecDecodeBaseProposer._propose end")
         return draft_token_ids
 
     def compute_draft_token_ids(self, hidden_states: torch.Tensor):
@@ -1029,17 +998,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_tokens,
         is_prefill=None,
     ) -> torch.Tensor:
-        logger.info(
-            "[DEBUG-HANG] _run_merged_draft start: method=%s num_input_tokens=%d "
-            "batch_size=%d num_tokens=%d edge_cloud=%s role=%s",
-            self.method,
-            num_input_tokens,
-            batch_size,
-            num_tokens,
-            getattr(self.runner, "_edge_cloud_enabled", False),
-            getattr(self.runner, "edge_cloud_cfg", None).role
-            if getattr(self.runner, "_edge_cloud_enabled", False) else "n/a",
-        )
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
         # speculative tokens' proposings. `model_input_ids`, `model_positions` and
         # `model_hidden_states` represent the speculative model inputs.
@@ -1067,7 +1025,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             and self.runner is not None
             and getattr(self.runner, "_edge_cloud_enabled", False)
         ):
-            logger.info("[DEBUG-HANG] _run_merged_draft edge-cloud path")
             ret_hidden_states = self._run_draft_edge_cloud(**model_kwargs)
             if self.runner.edge_cloud_cfg.role == "cloud":
                 # When num_speculative_tokens > 1, the edge side iterates
@@ -1089,9 +1046,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # the edge side.
                 return torch.empty(0, dtype=torch.int64, device=self.device)
         else:
-            logger.info("[DEBUG-HANG] _run_merged_draft first model forward start")
             ret_hidden_states = self.model(**model_kwargs)
-            logger.info("[DEBUG-HANG] _run_merged_draft first model forward done")
 
         if not self.model_returns_tuple():
             last_hidden_states = ret_hidden_states
@@ -1203,7 +1158,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         _EXTRA_CTX.num_accept_tokens = batch_size
 
         for draft_step in range(self.num_speculative_tokens - 1):
-            logger.info("[DEBUG-HANG] _run_merged_draft draft loop iter=%d start", draft_step)
             # Reset MOE layer index for each draft step iteration
             forward_context = get_forward_context()
             if forward_context is not None:
@@ -1279,29 +1233,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # draft_step + 1 because the first draft token was already
                 # generated in the first pass.
                 model_kwargs["spec_step_idx"] = draft_step + 1
-                logger.info(
-                    "[DEBUG-HANG] _run_merged_draft draft loop iter=%d edge-cloud",
-                    draft_step,
-                )
                 ret_hidden_states = self._run_draft_edge_cloud(**model_kwargs)
                 if self.runner.edge_cloud_cfg.role == "cloud":
                     # Cloud has already sent hidden states back to edge;
                     # logits are computed on the edge side.
-                    logger.info(
-                        "[DEBUG-HANG] _run_merged_draft draft loop iter=%d cloud continue",
-                        draft_step,
-                    )
                     continue
             else:
-                logger.info(
-                    "[DEBUG-HANG] _run_merged_draft draft loop iter=%d model forward start",
-                    draft_step,
-                )
                 ret_hidden_states = self.model(**model_kwargs)
-                logger.info(
-                    "[DEBUG-HANG] _run_merged_draft draft loop iter=%d model forward done",
-                    draft_step,
-                )
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
@@ -1355,16 +1293,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # TODO(wenlong): get more than one token for tree attention
             hidden_states = hidden_states[:batch_size]
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
-            logger.info(
-                "[DEBUG-HANG] _run_merged_draft draft loop iter=%d done", draft_step
-            )
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
-        logger.info(
-            "[DEBUG-HANG] _run_merged_draft end: draft_token_ids_shape=%s",
-            draft_token_ids.shape,
-        )
         return draft_token_ids
 
     def set_inputs_first_pass(
@@ -2148,21 +2079,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     def _run_draft_edge_cloud(self, **model_kwargs) -> torch.Tensor:
         segments = self.runner._edge_cloud_draft_segments
         role = self.runner.edge_cloud_cfg.role
-        spec_step_idx = model_kwargs.get("spec_step_idx", 0)
-        positions = model_kwargs.get("positions")
-        num_tokens = positions.shape[-1] if positions is not None else 0
-        logger.info(
-            "[DEBUG-HANG] _run_draft_edge_cloud start: role=%s method=%s "
-            "spec_step_idx=%d num_tokens=%d",
-            role,
-            self.method,
-            spec_step_idx,
-            num_tokens,
-        )
 
         if role == "edge":
             # Edge first segment: embed only for Eagle3 (fusion happens on the
             # cloud) or embed+fc for MTP.
+            spec_step_idx = model_kwargs.get("spec_step_idx", 0)
             hidden_states_to_cloud = None
             if self.method == "eagle3":
                 if spec_step_idx == 0:
@@ -2172,10 +2093,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     # consume the previous draft step's hidden states instead
                     # of fusing the target's auxiliary hidden states.
                     hidden_states_to_cloud = model_kwargs.get("hidden_states")
-            logger.info("[DEBUG-HANG] _run_draft_edge_cloud edge segment_a start")
             output = segments["a"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)
-            logger.info("[DEBUG-HANG] _run_draft_edge_cloud edge segment_a done")
             if hidden_states_to_cloud is not None:
                 output["hidden_states"] = hidden_states_to_cloud
 
@@ -2191,17 +2110,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     0, dtype=torch.int64, device="cpu"
                 )
             if get_pp_group().world_size == 2:
-                logger.info("[DEBUG-HANG] _run_draft_edge_cloud edge send start")
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v
                      for k, v in output.items()}
                 )
                 for handle in send_work:
                     handle.wait()
-                logger.info("[DEBUG-HANG] _run_draft_edge_cloud edge send done")
 
             # Receive cloud segment result (all decoder layers run on cloud)
-            logger.info("[DEBUG-HANG] _run_draft_edge_cloud edge recv start")
             tensor_dict, comm_handles, comm_postprocess = (
                 edge_cloud_broadcast_recv_draft()
             )
@@ -2210,7 +2126,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             for postprocess in comm_postprocess:
                 postprocess()
             intermediate = IntermediateTensors(tensor_dict)
-            logger.info("[DEBUG-HANG] _run_draft_edge_cloud edge recv done")
 
             # Copy received tensors into persistent buffers so that the
             # ACLGraphWrapper-wrapped segment_e sees stable input addresses.
@@ -2221,21 +2136,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     num_tokens, intermediate
                 )
             )
-            logger.info("[DEBUG-HANG] _run_draft_edge_cloud edge sync intermediate done")
 
             # Edge last segment: compute logits (Eagle3) or final norm (MTP).
             model_kwargs["intermediate_tensors"] = intermediate
             for key in ("input_ids", "inputs_embeds", "hidden_states", "spec_step_idx"):
                 model_kwargs.pop(key, None)
-            logger.info("[DEBUG-HANG] _run_draft_edge_cloud edge segment_e start")
             final_output = segments["e"](**model_kwargs)
-            logger.info("[DEBUG-HANG] _run_draft_edge_cloud edge segment_e done")
             return final_output
         else:
             # Cloud path: this should normally not be reached because cloud
             # sample_tokens returns None before calling _run_merged_draft.
             # Kept here as a fallback if the calling context changes.
-            logger.info("[DEBUG-HANG] _run_draft_edge_cloud cloud recv start")
             tensor_dict, comm_handles, comm_postprocess = (
                 edge_cloud_broadcast_recv_draft()
             )
@@ -2244,7 +2155,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             for postprocess in comm_postprocess:
                 postprocess()
             intermediate = IntermediateTensors(tensor_dict)
-            logger.info("[DEBUG-HANG] _run_draft_edge_cloud cloud recv done")
 
             # Copy received tensors into persistent buffers so that the
             # ACLGraphWrapper-wrapped segment_c sees stable input addresses.
@@ -2255,7 +2165,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     num_tokens, intermediate
                 )
             )
-            logger.info("[DEBUG-HANG] _run_draft_edge_cloud cloud sync intermediate done")
 
             model_kwargs["intermediate_tensors"] = intermediate
             for key in ("input_ids", "inputs_embeds", "hidden_states"):
@@ -2346,12 +2255,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 batch_descriptor = BatchDescriptor(num_tokens)
                 num_actual_tokens = num_tokens
 
-            logger.info(
-                "[DEBUG-HANG] _run_draft_edge_cloud cloud segment_c start "
-                "spec_step_idx=%d num_tokens=%d",
-                spec_step_idx,
-                num_tokens,
-            )
             with set_ascend_forward_context(
                 attn_metadata=draft_attn_metadata,
                 vllm_config=self.vllm_config,
@@ -2363,19 +2266,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             ):
                 output = segments["c"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)
-            logger.info("[DEBUG-HANG] _run_draft_edge_cloud cloud segment_c done")
 
             if get_pp_group().world_size == 2:
-                logger.info("[DEBUG-HANG] _run_draft_edge_cloud cloud send start")
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v
                      for k, v in output.items()}
                 )
                 for handle in send_work:
                     handle.wait()
-                logger.info("[DEBUG-HANG] _run_draft_edge_cloud cloud send done")
 
-            logger.info("[DEBUG-HANG] _run_draft_edge_cloud cloud end")
             return output["hidden_states"]
 
     # adjusting tensor into desired size

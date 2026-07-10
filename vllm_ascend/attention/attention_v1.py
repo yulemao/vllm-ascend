@@ -417,19 +417,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     graph_params = get_draft_graph_params()
             else:
                 graph_params = get_graph_params()
-            logger.info(
-                "[DEBUG-HANG] AscendAttentionBackendImpl.update_graph_params paged: "
-                "is_draft=%s graph_params_id=%s num_tokens=%d "
-                "attn_params=%d handles=%d events=%d keys=%s",
-                _EXTRA_CTX.is_draft_model,
-                id(graph_params),
-                num_tokens,
-                len(graph_params.attn_params.get(num_tokens, [])),
-                len(graph_params.handles.get(num_tokens, [])),
-                len(graph_params.events.get(num_tokens, [])),
-                list(forward_context.attn_metadata.keys()) if forward_context.attn_metadata else None,
-            )
-            attn_count = 0
             with torch.npu.stream(update_stream):
                 for key, param, handle, event in zip(
                     forward_context.attn_metadata,
@@ -437,11 +424,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     graph_params.handles[num_tokens],
                     graph_params.events[num_tokens],
                 ):
-                    logger.info(
-                        "[DEBUG-HANG] AscendAttentionBackendImpl.update_graph_params paged loop: "
-                        "attn_count=%d key=%s",
-                        attn_count, key,
-                    )
                     (
                         query,
                         key_cache,
@@ -481,12 +463,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     )
                     torch.npu.graph_task_update_end(update_stream)
                     event.record(update_stream)
-                    attn_count = attn_count + 1
-            logger.info(
-                "[DEBUG-HANG] AscendAttentionBackendImpl.update_graph_params paged done: "
-                "num_tokens=%d total_attn_count=%d",
-                num_tokens, attn_count,
-            )
         elif _EXTRA_CTX.sinks:
             # FIA update logic
             if _EXTRA_CTX.is_draft_model:
@@ -509,19 +485,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 return
             if _EXTRA_CTX.is_draft_model:
                 attn_keys = attn_keys * (len(graph_params.attn_params[num_tokens]) // num_layers)
-            logger.info(
-                "[DEBUG-HANG] AscendAttentionBackendImpl.update_graph_params fia_sinks: "
-                "is_draft=%s graph_params_id=%s num_tokens=%d num_layers=%d "
-                "attn_params=%d handles=%d events=%d attn_keys=%s",
-                _EXTRA_CTX.is_draft_model,
-                id(graph_params),
-                num_tokens,
-                num_layers,
-                len(graph_params.attn_params.get(num_tokens, [])),
-                len(graph_params.handles.get(num_tokens, [])),
-                len(graph_params.events.get(num_tokens, [])),
-                attn_keys,
-            )
             attn_count = 0
             with torch.npu.stream(update_stream):
                 for key, param, handle, event in zip(
@@ -530,11 +493,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     graph_params.handles[num_tokens],
                     graph_params.events[num_tokens],
                 ):
-                    logger.info(
-                        "[DEBUG-HANG] AscendAttentionBackendImpl.update_graph_params fia_sinks loop: "
-                        "attn_count=%d key=%s",
-                        attn_count, key,
-                    )
                     (
                         query,
                         key_cache,
@@ -584,12 +542,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     )
                     torch.npu.graph_task_update_end(update_stream)
                     event.record(update_stream)
-                    attn_count = attn_count + 1
-            logger.info(
-                "[DEBUG-HANG] AscendAttentionBackendImpl.update_graph_params fia_sinks done: "
-                "num_tokens=%d total_attn_count=%d",
-                num_tokens, attn_count,
-            )
         else:
             # FIA update logic
             if _EXTRA_CTX.is_draft_model:
@@ -634,19 +586,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 return
             if _EXTRA_CTX.is_draft_model:
                 attn_keys = attn_keys * (len(graph_params.attn_params[num_tokens]) // num_layers)
-            logger.info(
-                "[DEBUG-HANG] AscendAttentionBackendImpl.update_graph_params fia: "
-                "is_draft=%s graph_params_id=%s num_tokens=%d num_layers=%d "
-                "attn_params=%d handles=%d events=%d attn_keys=%s",
-                _EXTRA_CTX.is_draft_model,
-                id(graph_params),
-                num_tokens,
-                num_layers,
-                len(graph_params.attn_params.get(num_tokens, [])),
-                len(graph_params.handles.get(num_tokens, [])),
-                len(graph_params.events.get(num_tokens, [])),
-                attn_keys,
-            )
             attn_count = 0
             with torch.npu.stream(update_stream):
                 for key, param, handle, event in zip(
@@ -655,11 +594,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     graph_params.handles[num_tokens],
                     graph_params.events[num_tokens],
                 ):
-                    logger.info(
-                        "[DEBUG-HANG] AscendAttentionBackendImpl.update_graph_params fia loop: "
-                        "attn_count=%d key=%s",
-                        attn_count, key,
-                    )
                     (
                         query,
                         key_cache,
@@ -742,12 +676,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     torch.npu.graph_task_update_end(update_stream)
 
                     event.record(update_stream)
-                    attn_count = attn_count + 1
-            logger.info(
-                "[DEBUG-HANG] AscendAttentionBackendImpl.update_graph_params fia done: "
-                "num_tokens=%d total_attn_count=%d",
-                num_tokens, attn_count,
-            )
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)

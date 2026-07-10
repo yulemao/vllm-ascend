@@ -1934,13 +1934,6 @@ class NPUModelRunner(GPUModelRunner):
         else:
             self.attn_state = attn_state  # type: ignore
 
-        logger.info(
-            "[DEBUG-ATTNSTATE] _build_attn_state: computed=%s final_self.attn_state=%s method=%s",
-            attn_state.name if attn_state is not None else None,
-            self.attn_state.name if self.attn_state is not None else None,
-            self.speculative_config.method if self.speculative_config else None,
-        )
-
         return attn_state
 
     def _calc_spec_decode_metadata(
@@ -2057,13 +2050,6 @@ class NPUModelRunner(GPUModelRunner):
         sample_hidden_states: torch.Tensor = None,
         target_model_batch_desc: BatchDescriptor = None,
     ) -> list[list[int]] | None:
-        logger.info(
-            "[DEBUG-HANG] propose_draft_token_ids start: drafter=%s "
-            "edge_cloud=%s role=%s",
-            type(self.drafter).__name__ if self.drafter else None,
-            self._edge_cloud_enabled,
-            self.edge_cloud_cfg.role if self._edge_cloud_enabled else "n/a",
-        )
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
@@ -2320,10 +2306,6 @@ class NPUModelRunner(GPUModelRunner):
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
-        logger.info(
-            "[DEBUG-HANG] propose_draft_token_ids end: draft_token_ids_shape=%s",
-            draft_token_ids.shape if torch.is_tensor(draft_token_ids) else "n/a",
-        )
         return draft_token_ids
 
     def _copy_draft_token_ids_to_cpu(
@@ -2362,15 +2344,6 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        logger.info(
-            "[DEBUG-HANG] execute_model start: edge_cloud=%s role=%s mode=%s "
-            "intermediate_tensors=%s total_scheduled=%d",
-            self._edge_cloud_enabled,
-            self.edge_cloud_cfg.role if self._edge_cloud_enabled else "n/a",
-            self.edge_cloud_cfg.mode if self._edge_cloud_enabled else "n/a",
-            intermediate_tensors is not None,
-            scheduler_output.total_num_scheduled_tokens,
-        )
         if self.vllm_config.model_config.enable_return_routed_experts:
             if vllm_version_is("0.20.2"):
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -2887,14 +2860,6 @@ class NPUModelRunner(GPUModelRunner):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
-        logger.info(
-            "[DEBUG-HANG] sample_tokens start: edge_cloud=%s role=%s "
-            "execute_model_state=%s speculative_method=%s",
-            self._edge_cloud_enabled,
-            self.edge_cloud_cfg.role if self._edge_cloud_enabled else "n/a",
-            self.execute_model_state is not None,
-            self.speculative_config.method if self.speculative_config else None,
-        )
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
@@ -3388,7 +3353,6 @@ class NPUModelRunner(GPUModelRunner):
             edge_cloud_broadcast_recv_draft,
         )
 
-        logger.info("[DEBUG-HANG] _run_draft_cloud_segment start")
         # The edge side calls the draft model for each speculative step
         # (including the first pass).  We loop the same number of times so
         # that every edge request has a matching cloud response.
@@ -3396,10 +3360,8 @@ class NPUModelRunner(GPUModelRunner):
             self.speculative_config.num_speculative_tokens
             if self.speculative_config else 1
         )
-        logger.info("[DEBUG-HANG] _run_draft_cloud_segment num_steps=%d", num_steps)
 
-        for step_idx in range(num_steps):
-            logger.info("[DEBUG-HANG] _run_draft_cloud_segment step=%d recv", step_idx)
+        for _ in range(num_steps):
             # Receive intermediate from edge (including positions and spec_step_idx)
             tensor_dict, comm_handles, comm_postprocess = (
                 edge_cloud_broadcast_recv_draft()
@@ -3509,13 +3471,6 @@ class NPUModelRunner(GPUModelRunner):
             #         )
             #     )
 
-            logger.info(
-                "[DEBUG-HANG] _run_draft_cloud_segment step=%d run segment "
-                "spec_step_idx=%d num_tokens=%d",
-                step_idx,
-                spec_step_idx,
-                num_tokens,
-            )
             with set_ascend_forward_context(
                 attn_metadata=draft_attn_metadata,
                 vllm_config=self.vllm_config,
@@ -3527,9 +3482,6 @@ class NPUModelRunner(GPUModelRunner):
             ):
                 output = segment(**model_kwargs)
             assert isinstance(output, IntermediateTensors)
-            logger.info(
-                "[DEBUG-HANG] _run_draft_cloud_segment step=%d segment done", step_idx
-            )
 
             # Send back to edge
             if get_pp_group().world_size == 2:
@@ -3539,9 +3491,6 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 for handle in send_work:
                     handle.wait()
-            logger.info(
-                "[DEBUG-HANG] _run_draft_cloud_segment step=%d send done", step_idx
-            )
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
@@ -3745,16 +3694,6 @@ class NPUModelRunner(GPUModelRunner):
             and not self.use_sparse
         ):
             assert positions is not None
-            logger.info(
-                "[DEBUG-HANG] _update_full_graph_params_if_needed: "
-                "num_tokens_padded=%d layer_indices=%s graph_wrapper_type=%s "
-                "graph_params_id=%s draft_graph_params_id=%s",
-                num_tokens_padded,
-                layer_indices,
-                type(graph_wrapper).__name__ if graph_wrapper is not None else None,
-                id(graph_wrapper.graph_params) if graph_wrapper is not None else None,
-                id(graph_wrapper.draft_graph_params) if graph_wrapper is not None else None,
-            )
             if graph_wrapper is not None:
                 assert graph_wrapper.graph_params is not None
             # Edge-cloud segments may contain mixed DSA+FIA layers.
@@ -3800,24 +3739,11 @@ class NPUModelRunner(GPUModelRunner):
         **model_kwargs: dict[str, Any],
     ):
         """模型前向入口。标准路径与边云路径完全分离，职责单一。"""
-        logger.info(
-            "[DEBUG-HANG] _model_forward start: edge_cloud=%s role=%s "
-            "num_tokens_padded=%d intermediate_tensors=%s",
-            self._edge_cloud_enabled,
-            self.edge_cloud_cfg.role if self._edge_cloud_enabled else "n/a",
-            num_tokens_padded,
-            intermediate_tensors is not None,
-        )
         if self._edge_cloud_enabled:
-            hidden_states = self._edge_cloud_forward(
+            return self._edge_cloud_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors,
                 inputs_embeds, **model_kwargs,
             )
-            logger.info(
-                "[DEBUG-HANG] _model_forward end (edge-cloud): hidden_states_type=%s",
-                type(hidden_states).__name__,
-            )
-            return hidden_states
 
         # ==================== 标准非边云路径（原逻辑完全保留，不做任何修改） ====================
         assert self.model is not None
@@ -3851,10 +3777,6 @@ class NPUModelRunner(GPUModelRunner):
             )
         if get_forward_context().flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
-        logger.info(
-            "[DEBUG-HANG] _model_forward end (standard): hidden_states_type=%s",
-            type(hidden_states).__name__,
-        )
         return hidden_states
 
     def _run_input_preparation(
@@ -4127,14 +4049,6 @@ class NPUModelRunner(GPUModelRunner):
               • intermediate_tensors is not None → 执行 segment_e（尾段，输出 hidden_states）
           - Cloud 角色：始终执行 segment_c（中段，输出 IntermediateTensors）
         """
-        logger.info(
-            "[DEBUG-HANG] _edge_cloud_forward start: role=%s num_tokens_padded=%d "
-            "intermediate_tensors=%s use_graph=%s",
-            self.edge_cloud_cfg.role,
-            num_tokens_padded,
-            intermediate_tensors is not None,
-            self.edge_cloud_cfg.enable_decode_graph,
-        )
         assert self.model is not None
         forward_context = get_forward_context()
         assert forward_context is not None
@@ -4176,15 +4090,6 @@ class NPUModelRunner(GPUModelRunner):
         #seg_e = self.segment_e
         seg_a_graph = isinstance(seg_a, ACLGraphWrapper)
         seg_e_graph = isinstance(seg_e, ACLGraphWrapper)
-        logger.info(
-            "[DEBUG-HANG] _edge_cloud_forward_edge: use_graph=%s seg_a_graph=%s "
-            "seg_e_graph=%s intermediate_tensors=%s capturing=%s",
-            use_graph,
-            seg_a_graph,
-            seg_e_graph,
-            intermediate_tensors is not None,
-            forward_context.capturing,
-        )
 
         if intermediate_tensors is None:
             # Step 1：执行 Segment A（embedding + 首 head_k 层）
@@ -4195,39 +4100,22 @@ class NPUModelRunner(GPUModelRunner):
                 _EXTRA_CTX.layer_idx = 0
             try:
                 if seg_a_graph and not forward_context.capturing:
-                    logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_a update params start")
                     self._update_full_graph_params_if_needed(
                         forward_context, num_tokens_padded, positions,
                         layer_indices=list(range(0, self.head_k)),
                         graph_wrapper=seg_a,
                     )
-                    logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_a update params done")
-                logger.info(
-                    "[DEBUG-HANG] _edge_cloud_forward_edge segment_a call start: "
-                    "seg_a_graph_params_id=%s seg_a_draft_graph_params_id=%s",
-                    id(seg_a.graph_params) if isinstance(seg_a, EdgeCloudACLGraphWrapper) else None,
-                    id(seg_a.draft_graph_params) if isinstance(seg_a, EdgeCloudACLGraphWrapper) else None,
-                )
                 hidden_states = seg_a(
                     input_ids=input_ids,
                     positions=positions,
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
-                logger.info(
-                    "[DEBUG-HANG] _edge_cloud_forward_edge segment_a call done: "
-                    "seg_a_graph_params_id=%s",
-                    id(seg_a.graph_params) if isinstance(seg_a, EdgeCloudACLGraphWrapper) else None,
-                )
             finally:
                 if old_layer_idx is not None:
                     _EXTRA_CTX.layer_idx = old_layer_idx
 
             assert isinstance(hidden_states, IntermediateTensors)
-            logger.info(
-                "[DEBUG-HANG] _edge_cloud_forward_edge segment_a return: hidden_states_type=%s",
-                type(hidden_states).__name__,
-            )
             return hidden_states
 
         # Step 2：执行 Segment E（尾 tail_k 层 + norm）
@@ -4248,47 +4136,22 @@ class NPUModelRunner(GPUModelRunner):
                 self.num_layers - self.tail_k,
                 self.num_layers,
             ))
-            logger.info(
-                "[DEBUG-HANG] _edge_cloud_forward_edge segment_e intermediate_tensors: "
-                "tail_layer_indices=%s intermediate_tensors_keys=%s shapes=%s",
-                tail_layer_indices,
-                list(intermediate_tensors.tensors.keys()) if intermediate_tensors is not None else None,
-                {k: tuple(v.shape) for k, v in intermediate_tensors.tensors.items()}
-                if intermediate_tensors is not None else None,
-            )
             if seg_e_graph and not forward_context.capturing:
-                logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_e update params start")
                 self._update_full_graph_params_if_needed(
                     forward_context, num_tokens_padded, positions,
                     layer_indices=tail_layer_indices,
                     graph_wrapper=seg_e,
                 )
-                logger.info("[DEBUG-HANG] _edge_cloud_forward_edge segment_e update params done")
-            logger.info(
-                "[DEBUG-HANG] _edge_cloud_forward_edge segment_e call start: "
-                "seg_e_graph_params_id=%s seg_e_draft_graph_params_id=%s",
-                id(seg_e.graph_params) if isinstance(seg_e, EdgeCloudACLGraphWrapper) else None,
-                id(seg_e.draft_graph_params) if isinstance(seg_e, EdgeCloudACLGraphWrapper) else None,
-            )
             hidden_states = seg_e(
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 **model_kwargs,
-            )
-            logger.info(
-                "[DEBUG-HANG] _edge_cloud_forward_edge segment_e call done: "
-                "seg_e_graph_params_id=%s",
-                id(seg_e.graph_params) if isinstance(seg_e, EdgeCloudACLGraphWrapper) else None,
             )
         finally:
             # segment_e 执行完毕后恢复原始 layer_idx
             if old_layer_idx is not None:
                 _EXTRA_CTX.layer_idx = old_layer_idx
 
-        logger.info(
-            "[DEBUG-HANG] _edge_cloud_forward_edge segment_e return: hidden_states_type=%s",
-            type(hidden_states).__name__,
-        )
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
         return hidden_states
@@ -4303,14 +4166,6 @@ class NPUModelRunner(GPUModelRunner):
         **model_kwargs: dict[str, Any],
     ):
         """Cloud 侧分段执行：segment_c（中段）。"""
-        logger.info(
-            "[DEBUG-HANG] _edge_cloud_forward_cloud start: num_tokens_padded=%d "
-            "use_graph=%s seg_c_graph=%s in_warmup=%s",
-            num_tokens_padded,
-            use_graph,
-            isinstance(self.segment_c_wrapper, ACLGraphWrapper) if use_graph else False,
-            getattr(forward_context, "in_profile_run", False),
-        )
         assert self.edge_cloud_cfg.role == "cloud", (
             "Cloud segment_c should only be executed when role == 'cloud'"
         )
@@ -4326,72 +4181,11 @@ class NPUModelRunner(GPUModelRunner):
         seg_c = self.segment_c_wrapper if use_graph else self.segment_c
         seg_c_graph = isinstance(seg_c, ACLGraphWrapper)
 
-        # [VERIFY-META] 在 capture 阶段(_monitor.cudagraph_capturing_enabled=True)
-        # 和真实 replay 阶段(=False)都 dump 一份 segment_c 的 attention 上下文，
-        # 用来对比 warmup 捕获 vs 真实 verify 是否一致（结构/元数据是否对得上）。
-        try:
-            _phase = "CAPTURE" if _monitor.cudagraph_capturing_enabled else "REPLAY"
-            _am = forward_context.attn_metadata or {}
-            _first_v = next(iter(_am.values()), None)
-            _fields: dict = {}
-            if _first_v is not None:
-                for _f in ("seq_lens", "num_actual_tokens", "num_reqs",
-                           "query_len", "max_query_len", "block_table",
-                           "slot_mapping"):
-                    _v = getattr(_first_v, _f, "<missing>")
-                    if isinstance(_v, torch.Tensor):
-                        # 只记 shape/device，避免触发 NPU sync 改变时序
-                        _fields[_f] = f"Tensor{tuple(_v.shape)}/{_v.device}"
-                    else:
-                        _fields[_f] = _v
-            logger.info(
-                "[VERIFY-META] phase=%s num_tokens=%d batch_desc=%s "
-                "attn_entries=%d first_key=%s meta_type=%s fields=%s",
-                _phase,
-                num_tokens_padded,
-                forward_context.batch_descriptor,
-                len(_am),
-                next(iter(_am.keys()), None),
-                type(_first_v).__name__ if _first_v is not None else None,
-                _fields,
-            )
-            # REPLAY 时额外把 MLA 关键元数据的"值"读出来（seq_lens 在 cpu；
-            # slot_mapping 仅 4 个元素，读它会触发一次 sync，但发生在回放之前，
-            # 不改变卡死行为）。值 sane -> 排除元数据错配，坐实通信/图本身；
-            # 值异常(0/越界/巨大) -> 元数据值错导致 kernel 挂起。
-            if _phase == "REPLAY":
-                try:
-                    _sl = getattr(_first_v, "seq_lens", None)
-                    _sm = getattr(_first_v, "slot_mapping", None)
-                    logger.info(
-                        "[VERIFY-META-VAL] REPLAY num_tokens=%d "
-                        "seq_lens=%s slot_mapping=%s",
-                        num_tokens_padded,
-                        _sl.tolist() if isinstance(_sl, torch.Tensor) else _sl,
-                        _sm.tolist() if isinstance(_sm, torch.Tensor) else _sm,
-                    )
-                except Exception as _ve:  # noqa: BLE001
-                    logger.info("[VERIFY-META-VAL] dump failed: %s", _ve)
-        except Exception as _e:  # noqa: BLE001
-            logger.info("[VERIFY-META] dump failed: %s", _e)
-
         cloud_layer_indices = list(range(
             self.head_k,
             self.num_layers - self.tail_k,
         ))
         # intermediate_tensors 已由 NPUWorker 从 Edge 侧接收
-        logger.info(
-            "[DEBUG-HANG] _edge_cloud_forward_cloud intermediate_tensors: "
-            "num_layers=%d head_k=%d tail_k=%d cloud_layer_indices=%s "
-            "intermediate_tensors_keys=%s shapes=%s",
-            self.num_layers,
-            self.head_k,
-            self.tail_k,
-            cloud_layer_indices,
-            list(intermediate_tensors.tensors.keys()) if intermediate_tensors is not None else None,
-            {k: tuple(v.shape) for k, v in intermediate_tensors.tensors.items()}
-            if intermediate_tensors is not None else None,
-        )
         from vllm_ascend.ascend_forward_context import _EXTRA_CTX
         old_layer_idx = _EXTRA_CTX.layer_idx
         if _EXTRA_CTX.layer_idx is not None:
@@ -4401,28 +4195,15 @@ class NPUModelRunner(GPUModelRunner):
             # 确保第一次 decode 回放不使用 warmup 时期的 stale 参数（否则 attention kernel
             # 用错误的 seq_lens 访问 KV cache 越界 → NaN）。
             if seg_c_graph and not forward_context.capturing:
-                logger.info("[DEBUG-HANG] _edge_cloud_forward_cloud update graph params start")
                 self._update_full_graph_params_if_needed(
                     forward_context, num_tokens_padded, positions,
                     layer_indices=cloud_layer_indices,
                     graph_wrapper=seg_c,
                 )
-                logger.info("[DEBUG-HANG] _edge_cloud_forward_cloud update graph params done")
-            logger.info(
-                "[DEBUG-HANG] _edge_cloud_forward_cloud segment_c start: "
-                "seg_c_graph_params_id=%s seg_c_draft_graph_params_id=%s",
-                id(seg_c.graph_params) if isinstance(seg_c, EdgeCloudACLGraphWrapper) else None,
-                id(seg_c.draft_graph_params) if isinstance(seg_c, EdgeCloudACLGraphWrapper) else None,
-            )
             hidden_states = seg_c(
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 **model_kwargs,
-            )
-            logger.info(
-                "[DEBUG-HANG] _edge_cloud_forward_cloud segment_c done: "
-                "seg_c_graph_params_id=%s",
-                id(seg_c.graph_params) if isinstance(seg_c, EdgeCloudACLGraphWrapper) else None,
             )
         finally:
             if old_layer_idx is not None:
@@ -4439,9 +4220,6 @@ class NPUModelRunner(GPUModelRunner):
             self._eagle3_cloud_aux_hidden_states = hidden_states.tensors[
                 "aux_hidden_states"
             ]
-            logger.info(
-                "[DEBUG-HANG] _edge_cloud_forward_cloud end: has_aux_hidden_states=True"
-            )
             return IntermediateTensors(
                 {
                     k: v
@@ -4450,9 +4228,6 @@ class NPUModelRunner(GPUModelRunner):
                 }
             )
         self._eagle3_cloud_aux_hidden_states = None
-        logger.info(
-            "[DEBUG-HANG] _edge_cloud_forward_cloud end: has_aux_hidden_states=False"
-        )
         return hidden_states
 
     def _pad_for_sequence_parallelism(
@@ -4849,14 +4624,6 @@ class NPUModelRunner(GPUModelRunner):
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
         )
-        logger.info(
-            "[DEBUG-ATTNSTATE] _build_attention_metadata: cm_base.attn_state=%s "
-            "num_actual_tokens=%d num_reqs=%d use_async_spec=%s",
-            cm_base.attn_state.name if cm_base.attn_state is not None else None,
-            cm_base.num_actual_tokens,
-            cm_base.num_reqs,
-            self.use_async_spec_decode,
-        )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)
@@ -5157,14 +4924,6 @@ class NPUModelRunner(GPUModelRunner):
                     self.attn_state = AscendAttentionState.SpecDecoding
                 else:
                     self.attn_state = AscendAttentionState.ChunkedPrefill
-            logger.info(
-                "[DEBUG-ATTNSTATE] _dummy_run capture attn_state: %s "
-                "method=%s use_mla=%s num_tokens=%d",
-                self.attn_state.name if self.attn_state is not None else None,
-                self.speculative_config.method if self.speculative_config else None,
-                self.vllm_config.model_config.use_mla,
-                num_tokens,
-            )
             # The reason why we use a fixed seq_len rather than max_query_len is that
             # _npu_paged_attention_get_workspace only returns max workspace with specific
             # seq_lens. We use this seq_len only when capturing graph, and still use max_query_len

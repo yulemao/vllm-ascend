@@ -113,15 +113,6 @@ class ACLGraphWrapper:
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
         aclgraph_runtime_mode = forward_context.cudagraph_runtime_mode
-        entry_existed = batch_descriptor in self.concrete_aclgraph_entries
-        logger.info(
-            "[DEBUG-HANG] ACLGraphWrapper.__call__ enter: "
-            "batch_descriptor=%s runtime_mode=%s wrapper_mode=%s entry_existed=%s",
-            batch_descriptor,
-            aclgraph_runtime_mode,
-            self.runtime_mode,
-            entry_existed,
-        )
 
         if aclgraph_runtime_mode == CUDAGraphMode.NONE or aclgraph_runtime_mode != self.runtime_mode:
             # CUDAGraphMode.NONE could mean the profile run, a warmup run, or
@@ -130,7 +121,6 @@ class ACLGraphWrapper:
             # matches. This enables properly dispatching to the correct
             # CUDAGraphWrapper when nesting multiple instances with different
             # runtime modes.
-            logger.info("[DEBUG-HANG] ACLGraphWrapper.__call__ direct runnable")
             return self.runnable(*args, **kwargs)
 
         if batch_descriptor not in self.concrete_aclgraph_entries:
@@ -140,12 +130,6 @@ class ACLGraphWrapper:
         entry = self.concrete_aclgraph_entries[batch_descriptor]
 
         if entry.aclgraph is None:
-            logger.info(
-                "[DEBUG-HANG] ACLGraphWrapper.__call__ capture path: "
-                "batch_descriptor=%s entry_existed=%s",
-                batch_descriptor,
-                entry_existed,
-            )
             if self.aclgraph_options.debug_log_enable:
                 # Since we capture aclgraph for many different shapes and
                 # capturing is fast, we don't need to log it for every
@@ -155,15 +139,8 @@ class ACLGraphWrapper:
             # validate that aclgraph capturing is legal at this point.
             validate_cudagraph_capturing_enabled()
 
-            input_addresses = _extract_tensor_addresses(args) + _extract_tensor_addresses(kwargs)
+            input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
             entry.input_addresses = input_addresses
-            logger.info(
-                "[DEBUG-HANG] ACLGraphWrapper capture input addresses: "
-                "batch_descriptor=%s num_tensors=%s addresses=%s",
-                batch_descriptor,
-                len(input_addresses),
-                input_addresses,
-            )
             aclgraph = torch.npu.NPUGraph()
 
             with ExitStack() as stack:
@@ -212,24 +189,9 @@ class ACLGraphWrapper:
             # manage the memory during acl graph capture
             return output
 
-        logger.info(
-            "[DEBUG-HANG] ACLGraphWrapper.__call__ replay path: "
-            "batch_descriptor=%s entry_existed=%s",
-            batch_descriptor,
-            entry_existed,
-        )
-        # check if the input addresses are the same
-        new_input_addresses = _extract_tensor_addresses(args) + _extract_tensor_addresses(kwargs)
-        logger.info(
-            "[DEBUG-HANG] ACLGraphWrapper replay input addresses: "
-            "batch_descriptor=%s entry_existed=%s expected=%s got=%s match=%s",
-            entry.batch_descriptor,
-            entry_existed,
-            entry.input_addresses,
-            new_input_addresses,
-            new_input_addresses == entry.input_addresses,
-        )
         if self.is_debugging_mode:
+            # check if the input addresses are the same
+            new_input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
             assert new_input_addresses == entry.input_addresses, (
                 f"Input addresses for aclgraphs are different "
                 f"during replay. Expected {entry.input_addresses}, "
@@ -249,35 +211,8 @@ class ACLGraphWrapper:
         is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
         if not self.enable_enpu and need_sync:
-            import time
-            sync_start = time.monotonic()
-            logger.info(
-                "[DEBUG-HANG] ACLGraphWrapper synchronize before replay: "
-                "batch_descriptor=%s runtime_mode=%s sync_start=%f",
-                entry.batch_descriptor,
-                self.runtime_mode,
-                sync_start,
-            )
             torch.npu.current_stream().synchronize()
-            sync_end = time.monotonic()
-            logger.info(
-                "[DEBUG-HANG] ACLGraphWrapper synchronize done: "
-                "batch_descriptor=%s elapsed_ms=%f",
-                entry.batch_descriptor,
-                (sync_end - sync_start) * 1000,
-            )
-        logger.info(
-            "[DEBUG-HANG] ACLGraphWrapper replay start: batch_descriptor=%s "
-            "runtime_mode=%s is_draft_eagle=%s",
-            entry.batch_descriptor,
-            self.runtime_mode,
-            is_draft_eagle,
-        )
         entry.aclgraph.replay()
-        logger.info(
-            "[DEBUG-HANG] ACLGraphWrapper replay done: batch_descriptor=%s",
-            entry.batch_descriptor,
-        )
         return entry.output
 
 
@@ -288,29 +223,6 @@ def weak_ref_workspaces(params):
         if params.workspaces[num_tokens] is None:
             continue
         params.workspaces[num_tokens] = weak_ref_tensors(params.workspaces[num_tokens])
-
-
-def _extract_tensor_addresses(obj: Any) -> list[int]:
-    """递归从 args/kwargs/IntermediateTensors 等结构中抽取 Tensor 的 data_ptr。
-
-    ACLGraphWrapper 原实现只检查 positional args 中的 tensor 地址，
-    但 segment_c/segment_e 通过 kwargs 传入 positions 和 intermediate_tensors，
-    导致地址检查失效。这里递归遍历 tuple/list/dict/IntermediateTensors，
-    把捕获和回放时的所有 tensor 地址都记录下来做对比。
-    """
-    addresses: list[int] = []
-    if isinstance(obj, torch.Tensor):
-        addresses.append(obj.data_ptr())
-    elif isinstance(obj, (list, tuple)):
-        for item in obj:
-            addresses.extend(_extract_tensor_addresses(item))
-    elif isinstance(obj, dict):
-        for item in obj.values():
-            addresses.extend(_extract_tensor_addresses(item))
-    elif hasattr(obj, "tensors") and isinstance(obj.tensors, dict):
-        # IntermediateTensors
-        addresses.extend(_extract_tensor_addresses(obj.tensors))
-    return addresses
 
 
 def update_full_graph_params(
@@ -346,19 +258,6 @@ def update_full_graph_params(
     with graph_params_scope(graph_params, draft_graph_params), set_current_vllm_config(vllm_config):
         impl_cls = attn_backend.get_impl_cls()
 
-        gp = get_graph_params() if not _EXTRA_CTX.is_draft_model else get_draft_graph_params()
-        logger.info(
-            "[DEBUG-HANG] update_full_graph_params graph_params: "
-            "id=%s num_tokens=%d attn=%d handles=%d events=%d conv1d=%d workspaces=%s",
-            id(gp) if gp is not None else None,
-            num_tokens,
-            len(gp.attn_params.get(num_tokens, [])) if gp is not None else -1,
-            len(gp.handles.get(num_tokens, [])) if gp is not None else -1,
-            len(gp.events.get(num_tokens, [])) if gp is not None else -1,
-            len(gp.conv1d_params.get(num_tokens, [])) if gp is not None else -1,
-            list(gp.workspaces.keys()) if gp is not None else None,
-        )
-
         # Use the caller-supplied unfiltered metadata if available;
         # otherwise fall back to forward_context.attn_metadata (non-edge-cloud path).
         unfiltered_metadata = unfiltered_attn_metadata or forward_context.attn_metadata
@@ -371,21 +270,8 @@ def update_full_graph_params(
                 "layer_indices must be in ascending natural order to align with "
                 "graph_params.attn_params append order."
             )
-            logger.info(
-                "[DEBUG-HANG] update_full_graph_params filter: "
-                "num_tokens=%d layer_indices=%s unfiltered_keys=%s",
-                num_tokens,
-                layer_indices,
-                list(forward_context.attn_metadata.keys()) if forward_context.attn_metadata else None,
-            )
             filtered_metadata = _filter_attn_metadata_for_layers(
                 forward_context.attn_metadata, layer_indices
-            )
-            logger.info(
-                "[DEBUG-HANG] update_full_graph_params filtered: "
-                "num_tokens=%d filtered_keys=%s",
-                num_tokens,
-                list(filtered_metadata.keys()),
             )
             forward_context.attn_metadata = filtered_metadata
 
@@ -448,18 +334,9 @@ def _filter_attn_metadata_for_layers(
     """
     result: dict = {}
     skipped_no_key_layers: list[int] = []
-    logger.info(
-        "[DEBUG-HANG] _filter_attn_metadata_for_layers start: "
-        "layer_indices=%s attn_metadata_keys=%s",
-        layer_indices,
-        list(attn_metadata.keys()) if attn_metadata else None,
-    )
     for idx in layer_indices:
         needle = f".layers.{idx}."
         matched_keys = [k for k in attn_metadata if needle in k]
-        logger.info(
-            "[DEBUG-HANG] _filter layer=%d matched_keys=%s", idx, matched_keys
-        )
         if not matched_keys:
             skipped_no_key_layers.append(idx)
             continue
@@ -492,15 +369,6 @@ def _filter_attn_metadata_for_layers(
             f"This breaks the 1:1 alignment between attn_metadata and attn_params."
         )
 
-    if skipped_no_key_layers:
-        logger.info(
-            "[DEBUG-HANG] _filter_attn_metadata_for_layers skipped layers: %s",
-            skipped_no_key_layers,
-        )
-    logger.info(
-        "[DEBUG-HANG] _filter_attn_metadata_for_layers result keys: %s",
-        list(result.keys()),
-    )
     return result
 
 

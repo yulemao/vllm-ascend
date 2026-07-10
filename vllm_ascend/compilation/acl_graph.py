@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import dataclasses
-import os
-import sys
 from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -26,12 +24,6 @@ from vllm.platforms import current_platform
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
 from ..utils import weak_ref_tensors
-
-
-# Set VLLM_ASCEND_ACLGRAPH_DEBUG=1 to enable detailed per-replay dumps.
-# Useful for comparing inputs/graph-params between edge-cloud and non-edge-cloud.
-_ACLGRAPH_DEBUG_ENABLED = os.environ.get("VLLM_ASCEND_ACLGRAPH_DEBUG", "") in (
-    "1", "true", "True", "yes")
 
 
 @dataclasses.dataclass
@@ -220,8 +212,6 @@ class ACLGraphWrapper:
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
         if not self.enable_enpu and need_sync:
             torch.npu.current_stream().synchronize()
-        _dump_aclgraph_state(
-            "BEFORE_REPLAY", self, args, kwargs, entry=entry)
         entry.aclgraph.replay()
         return entry.output
 
@@ -260,21 +250,6 @@ def update_full_graph_params(
             提前过滤掉了 skip_graph_params_update=True 的 key 时，需要传入此参数
             以保证 GDN 的 update_conv1d_graph_params 仍能按 layer_prefix 查找。
     """
-    _dump_aclgraph_state(
-        "BEFORE_UPDATE_GRAPH_PARAMS", None, (), {
-            "attn_backend": attn_backend,
-            "update_stream": update_stream,
-            "forward_context": forward_context,
-            "num_tokens": num_tokens,
-            "vllm_config": vllm_config,
-            "speculative_config": speculative_config,
-            "num_dcp_pcp_tokens": num_dcp_pcp_tokens,
-            "draft_attn_metadatas": draft_attn_metadatas,
-            "layer_indices": layer_indices,
-            "graph_params": graph_params,
-            "draft_graph_params": draft_graph_params,
-            "unfiltered_attn_metadata": unfiltered_attn_metadata,
-        }, graph_params=graph_params, draft_graph_params=draft_graph_params)
     # Lazy import to avoid circular dependency:
     # acl_graph_edge_cloud.py imports ACLGraphWrapper / GraphParams from this module,
     # so we import graph_params_scope inside the function body.
@@ -426,152 +401,6 @@ class GraphParams:
     conv1d_params: dict[int, list[tuple]]  # for causal conv1d params
     conv1d_handles: dict[int, list[torch_npu._C._NPUTaskGroupHandle]]  # for causal conv1d params handles
     conv1d_events: dict[int, list[torch.npu.ExternalEvent]]  # for causal conv1d params events
-
-
-def _summarize_tensor(t: torch.Tensor, name: str = "") -> str:
-    """Return a one-line summary of a tensor for aclgraph debugging."""
-    if not isinstance(t, torch.Tensor):
-        return f"{name}: not a tensor ({type(t).__name__})"
-    info = [
-        f"shape={list(t.shape)}",
-        f"dtype={t.dtype}",
-        f"device={t.device}",
-        f"ptr={t.data_ptr()}",
-        f"stride={list(t.stride())}",
-        f"layout={t.layout}",
-    ]
-    try:
-        if t.numel() > 0 and t.device.type == "npu":
-            info.append(f"min={t.min().item():.6f}")
-            info.append(f"max={t.max().item():.6f}")
-            info.append(f"mean={t.float().mean().item():.6f}")
-            info.append(f"has_nan={torch.isnan(t).any().item()}")
-            info.append(f"has_inf={torch.isinf(t).any().item()}")
-    except Exception as e:
-        info.append(f"stats_error={e}")
-    return f"{name}: " + " ".join(info)
-
-
-def _summarize_obj(obj: Any, name: str = "", depth: int = 0,
-                   max_depth: int = 3) -> list[str]:
-    """Recursively summarize an object, expanding tensors/dataclasses/dicts."""
-    if depth > max_depth:
-        return [f"{'  ' * depth}{name}: ... (max depth)"]
-    lines: list[str] = []
-    if isinstance(obj, torch.Tensor):
-        lines.append(f"{'  ' * depth}{_summarize_tensor(obj, name)}")
-    elif isinstance(obj, (list, tuple)):
-        lines.append(f"{'  ' * depth}{name}: {type(obj).__name__}[len={len(obj)}]")
-        for i, item in enumerate(obj):
-            lines.extend(_summarize_obj(item, f"[{i}]", depth + 1, max_depth))
-    elif isinstance(obj, dict):
-        lines.append(f"{'  ' * depth}{name}: dict[len={len(obj)}]")
-        for k, v in obj.items():
-            lines.extend(_summarize_obj(v, str(k), depth + 1, max_depth))
-    elif dataclasses.is_dataclass(obj):
-        lines.append(f"{'  ' * depth}{name}: {type(obj).__name__}")
-        try:
-            for field in dataclasses.fields(obj):
-                lines.extend(
-                    _summarize_obj(getattr(obj, field.name), field.name,
-                                   depth + 1, max_depth))
-        except Exception as e:
-            lines.append(f"{'  ' * depth}  <dataclass error {e}>")
-    else:
-        s = repr(obj)
-        if len(s) > 200:
-            s = s[:200] + "..."
-        lines.append(f"{'  ' * depth}{name}: {s}")
-    return lines
-
-
-def _dump_aclgraph_state(
-    phase: str,
-    wrapper: "ACLGraphWrapper | None",
-    args: tuple,
-    kwargs: dict[str, Any],
-    entry: "ACLGraphEntry | None" = None,
-    graph_params: GraphParams | None = None,
-    draft_graph_params: GraphParams | None = None,
-) -> None:
-    """Dump aclgraph inputs/params right before replay/update.
-
-    Writes to stderr so it is independent of vLLM log configuration and is
-    flushed immediately, which is important when debugging hangs.
-    """
-    if not _ACLGRAPH_DEBUG_ENABLED:
-        return
-    try:
-        lines: list[str] = []
-        lines.append("=" * 80)
-        lines.append(f"ACLGRAPH DEBUG [{phase}]")
-        if wrapper is not None:
-            lines.append(f"  wrapper.runtime_mode={wrapper.runtime_mode}")
-            lines.append(f"  wrapper.use_eagle={wrapper.use_eagle}")
-            lines.append(f"  wrapper.enable_enpu={wrapper.enable_enpu}")
-        if entry is not None:
-            lines.append(f"  entry.batch_descriptor={entry.batch_descriptor}")
-        forward_context = get_forward_context()
-        if forward_context is not None:
-            lines.append("  forward_context:")
-            lines.append(
-                "    cudagraph_runtime_mode="
-                f"{getattr(forward_context, 'cudagraph_runtime_mode', None)}")
-            lines.append(
-                "    batch_descriptor="
-                f"{getattr(forward_context, 'batch_descriptor', None)}")
-            lines.append(
-                f"    num_tokens={getattr(forward_context, 'num_tokens', None)}")
-            lines.append(
-                f"    capturing={getattr(forward_context, 'capturing', None)}")
-            lines.append(
-                "    is_draft_model="
-                f"{getattr(forward_context, 'is_draft_model', None)}")
-            lines.append(
-                "    layer_idx="
-                f"{getattr(forward_context, 'layer_idx', None)}")
-            attn_metadata = getattr(forward_context, "attn_metadata", None)
-            if attn_metadata is not None:
-                lines.append(
-                    f"    attn_metadata keys={list(attn_metadata.keys())}")
-                for k, v in attn_metadata.items():
-                    lines.extend(
-                        _summarize_obj(v, f"    attn_metadata[{k}]", 0, 2))
-        lines.append("  args:")
-        for i, a in enumerate(args):
-            lines.extend(_summarize_obj(a, f"    args[{i}]", 0, 2))
-        lines.append("  kwargs:")
-        for k, v in kwargs.items():
-            lines.extend(_summarize_obj(v, f"    kwargs[{k}]", 0, 2))
-        for label, params in (("graph_params", graph_params or _graph_params),
-                              ("draft_graph_params",
-                               draft_graph_params or _draft_graph_params)):
-            if params is None:
-                lines.append(f"  {label}=None")
-                continue
-            lines.append(f"  {label} id={id(params)}")
-            for size in sorted(params.events.keys()):
-                evs = params.events.get(size, [])
-                ws = params.workspaces.get(size)
-                hs = params.handles.get(size, [])
-                ap = params.attn_params.get(size, [])
-                cp = params.conv1d_params.get(size, [])
-                ch = params.conv1d_handles.get(size, [])
-                ce = params.conv1d_events.get(size, [])
-                if ws is None:
-                    ws_str = "None"
-                else:
-                    ws_str = (f"shape={list(ws.shape)} ptr={ws.data_ptr()} "
-                              f"dtype={ws.dtype}")
-                lines.append(
-                    f"    size={size}: events={len(evs)}, handles={len(hs)}, "
-                    f"attn_params={len(ap)}, conv1d_params={len(cp)}, "
-                    f"conv1d_handles={len(ch)}, conv1d_events={len(ce)}, "
-                    f"workspace={ws_str}")
-        lines.append("=" * 80)
-        print("\n".join(lines), file=sys.stderr, flush=True)
-    except Exception as e:
-        print(f"ACLGRAPH DEBUG dump failed: {e}", file=sys.stderr, flush=True)
 
 
 _graph_params: GraphParams | None = None

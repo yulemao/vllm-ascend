@@ -187,6 +187,103 @@ Eagle3LlamaForCausalLM.make_empty_intermediate_tensors = (
 )
 Eagle3LlamaForCausalLM.forward = _eagle3_forward_with_pp
 
+# ----------------------------------------------------------------------------
+# Fix: correct the EAGLE3 draft layer naming offset (start_layer_id) under
+# edge-cloud mode, otherwise the first target-verification decode deadlocks
+# inside ACL graph replay.
+#
+# Upstream Eagle3LlamaForCausalLM.__init__ derives the draft layer naming
+# offset as
+#     target_layer_num = model_config.get_num_layers(parallel_config)
+# and builds ``self.model = LlamaModel(..., start_layer_id=target_layer_num)``,
+# so the (single) draft attention layer is named ``model.layers.{N}`` and is
+# expected to sit *after* every target layer (target layers are 0..N-1).
+#
+# ``get_num_layers`` is PP-aware: in edge-cloud the cloud process is a PP rank,
+# so it returns the PP-divided count (e.g. 31) instead of the full target
+# layer count (e.g. 61). The draft layer is then named ``model.layers.31``,
+# which collides with the real target layer ``language_model.model.layers.31``
+# living in the same ``forward_context.attn_metadata`` dict. That collision is
+# silently swallowed by ``acl_graph._filter_attn_metadata_for_layers`` (the two
+# keys are misclassified as DeepSeek-V4 DSA sub-keys via
+# ``_is_dsa_kv_metadata_keys``), so target layer 31 is dropped from the
+# filtered metadata. ``AscendAttentionBackendImpl.update_graph_params`` then
+# ``zip``s 60 keys against the 61 captured ``attn_params``/``events``, leaving
+# the last layer's event never ``record()``-ed; the captured graph's
+# ``event.wait()`` deadlocks on replay -> hang on the first decode verify.
+#
+# Non-edge-cloud is unaffected because there ``get_num_layers`` returns the
+# full count (PP=1) and the draft layer lands at ``model.layers.61`` (no
+# collision).
+#
+# Fix: under edge-cloud mode, make the draft use the *full* target layer count
+# as ``start_layer_id`` -- identical to the known-good non-edge (PP=1) value --
+# so the draft layer is ``model.layers.{N}`` and never collides. We achieve
+# this by temporarily shadowing ``model_config.get_num_layers`` for the
+# duration of the draft ``__init__`` only, so nothing else is affected.
+_original_eagle3_init = Eagle3LlamaForCausalLM.__init__
+
+
+def _edge_cloud_draft_start_layer_id(vllm_config) -> int | None:
+    """Full target layer count to use as the draft ``start_layer_id``.
+
+    Equals the value non-edge-cloud (PP=1) computes via ``get_num_layers``.
+    Returns ``None`` if it cannot be determined, in which case the caller
+    falls back to the original behaviour unchanged.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is None:
+        return None
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    if hf_text_config is None:
+        return None
+    num_layers = getattr(hf_text_config, "num_hidden_layers", None)
+    if isinstance(num_layers, int) and num_layers > 0:
+        return num_layers
+    return None
+
+
+def _eagle3_init_with_edge_cloud_start_layer(
+    self: Eagle3LlamaForCausalLM, *, vllm_config, prefix: str = ""
+):
+    # Only override the naming offset in edge-cloud mode; non-edge-cloud and
+    # regular PP keep the upstream behaviour verbatim.
+    is_edge_cloud = False
+    try:
+        from vllm.distributed.parallel_state import is_edge_cloud_pp_mode
+
+        is_edge_cloud = bool(is_edge_cloud_pp_mode())
+    except Exception:
+        is_edge_cloud = False
+
+    full_target_layers = (
+        _edge_cloud_draft_start_layer_id(vllm_config) if is_edge_cloud else None
+    )
+    if full_target_layers is None:
+        _original_eagle3_init(self, vllm_config=vllm_config, prefix=prefix)
+        return
+
+    # Shadow get_num_layers on this specific ModelConfig instance for the
+    # duration of __init__ only, so the internally-computed target_layer_num /
+    # start_layer_id / target_layer_count all pick up the full count. Restore
+    # the original (class-level) lookup afterwards.
+    model_config = vllm_config.model_config
+    had_instance_attr = "get_num_layers" in model_config.__dict__
+    prev_get_num_layers = model_config.__dict__.get("get_num_layers", None)
+    model_config.get_num_layers = lambda _parallel_config: full_target_layers
+    try:
+        _original_eagle3_init(self, vllm_config=vllm_config, prefix=prefix)
+    finally:
+        if had_instance_attr:
+            model_config.get_num_layers = prev_get_num_layers
+        else:
+            # Remove the instance attribute so attribute lookup falls back to
+            # the unmodified class method.
+            model_config.__dict__.pop("get_num_layers", None)
+
+
+Eagle3LlamaForCausalLM.__init__ = _eagle3_init_with_edge_cloud_start_layer
+
 # Clear stale _ModelInfo caches so that inspect_model_cls re-computes
 # supports_pp with the patched class instead of loading the old cached value.
 from pathlib import Path  # noqa: E402

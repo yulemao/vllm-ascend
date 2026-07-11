@@ -829,6 +829,46 @@ class NPUModelRunner(GPUModelRunner):
                 segment = segment.unwrap()
         return segment._edge_model
 
+    def _prepare_eagle3_cloud_hidden_states(
+        self,
+        segment: Any,
+        intermediate_tensors: IntermediateTensors,
+        aux_hidden_states: torch.Tensor | None,
+        num_tokens: int,
+        is_first_step: bool,
+    ) -> None:
+        """Prepare the draft input outside the captured cloud segment.
+
+        ``spec_step_idx`` selects this preparation at the caller.  The segment
+        itself must have one static execution path so that ACL graph replay does
+        not reuse the first-step fusion branch for later speculative steps.
+        """
+        if aux_hidden_states is None:
+            if is_first_step:
+                raise RuntimeError(
+                    "EAGLE3 cloud segment received empty aux_hidden_states "
+                    "on the first speculative step."
+                )
+            return
+
+        draft_model = self._get_edge_cloud_segment_model(segment)
+        if not draft_model.model.use_aux_hidden_state:
+            return
+        if aux_hidden_states.shape[0] != num_tokens:
+            assert aux_hidden_states.shape[0] > num_tokens, (
+                f"aux_hidden_states batch size {aux_hidden_states.shape[0]} "
+                f"is smaller than draft num_tokens {num_tokens}"
+            )
+            aux_hidden_states = aux_hidden_states[:num_tokens]
+
+        hidden_states = intermediate_tensors["hidden_states"]
+        fused_hidden_states = draft_model.combine_hidden_states(aux_hidden_states)
+        assert hidden_states.shape == fused_hidden_states.shape, (
+            "EAGLE3 cloud hidden_states buffer shape does not match the "
+            f"fusion result: {hidden_states.shape} vs {fused_hidden_states.shape}"
+        )
+        hidden_states.copy_(fused_hidden_states)
+
     def _load_model_edge_cloud(self) -> None:
         """边云场景的模型加载流程（复用 vLLM 标准 PP 初始化，直接加载到 NPU）。
 
@@ -3419,71 +3459,26 @@ class NPUModelRunner(GPUModelRunner):
             spec_step_idx = 0
             if "spec_step_idx" in tensor_dict:
                 spec_step_idx = tensor_dict["spec_step_idx"].item()
-                model_kwargs["spec_step_idx"] = spec_step_idx
 
-            # Only the first speculative step fuses the target model's auxiliary
-            # hidden states. Subsequent steps consume the previous draft step's
-            # hidden states sent by the edge side. Always include the key in
-            # model_kwargs so that torch.compile sees a stable kwargs signature
-            # across spec_step_idx values; otherwise Dynamo may raise KeyError
-            # when the compiled graph was captured with the key present but
-            # replayed without it.
+            # Prepare the input before the ACLGraph-wrapped segment.  The
+            # segment must not branch on spec_step_idx: graph capture would
+            # otherwise freeze the first captured branch.
             if (
                 self.speculative_config is not None
                 and self.speculative_config.method == "eagle3"
             ):
-                if spec_step_idx == 0:
-                    aux_hidden_states = getattr(
-                        self, "_eagle3_cloud_aux_hidden_states", None
-                    )
-                    # The target-model cloud segment may carry cudagraph/SP
-                    # padding in aux_hidden_states (e.g. 64 tokens) while the
-                    # draft cloud segment receives unpadded edge tensors (e.g.
-                    # 60 tokens). Slice to the actual draft num_tokens so that
-                    # Eagle3 layer-0 cat([embeds, hidden_states]) sees matching
-                    # batch dimensions.
-                    if (
-                        aux_hidden_states is not None
-                        and aux_hidden_states.shape[0] != num_tokens
-                    ):
-                        assert aux_hidden_states.shape[0] > num_tokens, (
-                            f"aux_hidden_states batch size "
-                            f"{aux_hidden_states.shape[0]} is smaller than "
-                            f"draft num_tokens {num_tokens}"
-                        )
-                        aux_hidden_states = aux_hidden_states[:num_tokens]
-                else:
-                    # For speculative steps beyond the first, the cloud segment
-                    # consumes the previous draft step's hidden states (carried
-                    # in intermediate_tensors["hidden_states"]) and must NOT fuse
-                    # the target model's aux hidden states. The segment forward
-                    # ignores aux_hidden_states in this branch (see
-                    # eagle3_edge_cloud.py _forward_edge_cloud_segment_eagle3).
-                    aux_hidden_states = None
-
-                if aux_hidden_states is None:
-                    # The cloud segment is wrapped by EdgeCloudCompiledSegment
-                    # (torch.compile) when acl_graph is enabled. Dynamo traces it
-                    # with aux_hidden_states as a tensor and installs size-guards
-                    # that call call_size(aux, dim). Feeding None on a later
-                    # draft step makes that guard evaluate call_size(None, ...)
-                    # -> 'NoneType' object has no attribute 'size', crashing graph
-                    # capture/replay. Always feed a real zero tensor of the fusion
-                    # shape so the compiled graph's input contract stays stable;
-                    # it is ignored by the forward when spec_step_idx > 0.
-                    draft_model = self._get_edge_cloud_segment_model(segment)
-                    fc = getattr(draft_model.model, "fc", None)
-                    if fc is not None and hasattr(fc, "input_size"):
-                        fc_input_size = fc.input_size
-                    else:
-                        fc_input_size = draft_model.model.config.hidden_size * 3
-                    aux_hidden_states = torch.zeros(
-                        num_tokens,
-                        fc_input_size,
-                        dtype=self.dtype,
-                        device=self.device,
-                    )
-                model_kwargs["aux_hidden_states"] = aux_hidden_states
+                aux_hidden_states = (
+                    getattr(self, "_eagle3_cloud_aux_hidden_states", None)
+                    if spec_step_idx == 0
+                    else None
+                )
+                self._prepare_eagle3_cloud_hidden_states(
+                    segment,
+                    intermediate,
+                    aux_hidden_states,
+                    num_tokens,
+                    is_first_step=spec_step_idx == 0,
+                )
 
             # Build attention metadata for the draft decoder layers.
             # Without this, the Ascend attention backend silently

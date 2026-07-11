@@ -643,9 +643,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if self.method in ("eagle3", "dflash"):
             assert isinstance(self.get_model(), (Eagle3LlamaForCausalLM, DFlashQwen3ForCausalLM))
             # In edge-cloud EAGLE3 mode the fc projection runs on the cloud
-            # using the target model's cached aux hidden states. The proposer
-            # should pass the raw aux hidden states (or the placeholder) and
-            # let the draft model's cloud segment perform combine_hidden_states.
+            # using the target model's cached aux hidden states. The cloud-side
+            # caller prepares the fused hidden states before invoking its
+            # ACLGraph-wrapped draft segment.
             is_edge_cloud_eagle3 = (
                 self.method == "eagle3"
                 and self.runner is not None
@@ -2173,67 +2173,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             spec_step_idx = 0
             if "spec_step_idx" in tensor_dict:
                 spec_step_idx = tensor_dict["spec_step_idx"].item()
-                model_kwargs["spec_step_idx"] = spec_step_idx
 
-            # Only the first speculative step fuses the target model's auxiliary
-            # hidden states. Subsequent steps consume the previous draft step's
-            # hidden states sent by the edge side. Always include the key in
-            # model_kwargs so that torch.compile sees a stable kwargs signature
-            # across spec_step_idx values; otherwise Dynamo may raise KeyError
-            # when the compiled graph was captured with the key present but
-            # replayed without it.
+            # Prepare the input before the ACLGraph-wrapped segment.  The
+            # segment itself has no spec_step_idx branch, so replay cannot
+            # accidentally reuse the first-step fusion path.
             if self.method == "eagle3":
-                if spec_step_idx == 0:
-                    aux_hidden_states = getattr(
-                        self.runner, "_eagle3_cloud_aux_hidden_states", None
-                    )
-                    # The target-model cloud segment may carry cudagraph/SP
-                    # padding in aux_hidden_states (e.g. 64 tokens) while the
-                    # draft cloud segment receives unpadded edge tensors (e.g.
-                    # 60 tokens). Slice to the actual draft num_tokens so that
-                    # Eagle3 layer-0 cat([embeds, hidden_states]) sees matching
-                    # batch dimensions.
-                    if (
-                        aux_hidden_states is not None
-                        and aux_hidden_states.shape[0] != num_tokens
-                    ):
-                        assert aux_hidden_states.shape[0] > num_tokens, (
-                            f"aux_hidden_states batch size "
-                            f"{aux_hidden_states.shape[0]} is smaller than "
-                            f"draft num_tokens {num_tokens}"
-                        )
-                        aux_hidden_states = aux_hidden_states[:num_tokens]
-                else:
-                    # For speculative steps beyond the first, the cloud segment
-                    # consumes the previous draft step's hidden states (carried
-                    # in intermediate_tensors["hidden_states"]) and must NOT fuse
-                    # the target model's aux hidden states. The segment forward
-                    # ignores aux_hidden_states in this branch (see
-                    # eagle3_edge_cloud.py _forward_edge_cloud_segment_eagle3).
-                    aux_hidden_states = None
-
-                if aux_hidden_states is None:
-                    # The cloud segment is wrapped by EdgeCloudCompiledSegment
-                    # (torch.compile) when acl_graph is enabled. Dynamo traces it
-                    # with aux_hidden_states as a tensor and installs size-guards
-                    # that call call_size(aux, dim). Feeding None on a later
-                    # draft step makes that guard evaluate call_size(None, ...)
-                    # -> 'NoneType' object has no attribute 'size', crashing graph
-                    # capture/replay. Always feed a real zero tensor of the fusion
-                    # shape so the compiled graph's input contract stays stable;
-                    # it is ignored by the forward when spec_step_idx > 0.
-                    fc = getattr(self.model.model, "fc", None)
-                    if fc is not None and hasattr(fc, "input_size"):
-                        fc_input_size = fc.input_size
-                    else:
-                        fc_input_size = self.model.model.config.hidden_size * 3
-                    aux_hidden_states = torch.zeros(
-                        num_tokens,
-                        fc_input_size,
-                        dtype=self.dtype,
-                        device=self.device,
-                    )
-                model_kwargs["aux_hidden_states"] = aux_hidden_states
+                aux_hidden_states = (
+                    getattr(self.runner, "_eagle3_cloud_aux_hidden_states", None)
+                    if spec_step_idx == 0
+                    else None
+                )
+                self.runner._prepare_eagle3_cloud_hidden_states(
+                    segments["c"],
+                    intermediate,
+                    aux_hidden_states,
+                    num_tokens,
+                    is_first_step=spec_step_idx == 0,
+                )
             if positions is not None:
                 model_kwargs["positions"] = positions
             positions = model_kwargs.get("positions", None)

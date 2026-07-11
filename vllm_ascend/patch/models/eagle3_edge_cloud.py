@@ -80,36 +80,21 @@ def _forward_edge_cloud_segment_eagle3(
         # next draft step, matching the tuple return of Eagle3LlamaForCausalLM.forward.
         return intermediate_tensors["hidden_states"], intermediate_tensors["residual"]
 
-    # Cloud segment: needs input_embeds from the edge side. Fuse target aux
-    # hidden states on the first draft step, or consume the previous-step draft
-    # hidden states on later steps.
+    # Cloud segment: the caller prepares ``hidden_states`` before invoking this
+    # segment.  On the first draft step it writes the result of
+    # ``combine_hidden_states`` into the stable intermediate buffer; later
+    # steps write the previous draft step's hidden states there.  Keep this
+    # forward free of a ``spec_step_idx`` branch: ACL graph capture/replay (and
+    # the no-guard torch.compile wrapper) would otherwise freeze whichever
+    # Python branch happened to be captured first.
     input_embeds = intermediate_tensors["input_embeds"]
+    hidden_states = intermediate_tensors["hidden_states"]
     residual = intermediate_tensors.tensors.get("residual", None)
-
-    # ``aux_hidden_states`` and ``spec_step_idx`` are promoted to explicit
-    # named parameters so that torch.compile/Dynamo sees a stable call
-    # signature instead of a varying ``**extra_layer_kwargs`` dict that can
-    # trigger KeyError when keys appear/disappear across calls.
-    if spec_step_idx == 0:
-        if aux_hidden_states is not None and self.model.use_aux_hidden_state:
-            hidden_states = self.combine_hidden_states(aux_hidden_states)
-        else:
-            # Fallback for warmup / missing aux: use the placeholder hidden
-            # states sent by the edge. This should not happen in normal runtime.
-            hidden_states = intermediate_tensors["hidden_states"]
-            if hidden_states.numel() == 0:
-                raise RuntimeError(
-                    "EAGLE3 cloud segment received empty aux_hidden_states "
-                    "and an empty placeholder hidden_states tensor."
-                )
-    else:
-        hidden_states = intermediate_tensors["hidden_states"]
-        if hidden_states.numel() == 0:
-            raise RuntimeError(
-                "EAGLE3 cloud segment received empty hidden_states tensor "
-                f"for spec_step_idx={spec_step_idx}; the edge side must "
-                "send the previous draft step's hidden states."
-            )
+    if hidden_states.numel() == 0:
+        raise RuntimeError(
+            "EAGLE3 cloud segment received an empty hidden_states tensor; "
+            "the caller must prepare it before running the cloud segment."
+        )
     for layer in self.model.layers:
         hidden_states, residual = layer(
             positions=positions,

@@ -2086,13 +2086,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 output["positions"] = positions
             else:
                 output["positions"] = None
+            send_work = []
+            send_tensors = None
             if get_pp_group().world_size == 2:
+                send_tensors = {
+                    k: v.contiguous() if isinstance(v, torch.Tensor) else v
+                    for k, v in output.items()
+                    if v is not None
+                }
                 send_work = get_pp_group().isend_tensor_dict(
-                    {k: v.contiguous() if isinstance(v, torch.Tensor) else v
-                     for k, v in output.items() if v is not None}
+                    send_tensors
                 )
-                for handle in send_work:
-                    handle.wait()
 
             # Receive cloud segment result (all decoder layers run on cloud)
             tensor_dict, comm_handles, comm_postprocess = (
@@ -2100,6 +2104,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
             for handle in comm_handles:
                 handle.wait()
+            # The cloud can only produce this response after consuming the
+            # request above. Delay the send wait until now so posting the
+            # response receive can overlap with the request transfer, while
+            # retaining send_tensors until the P2P operation is complete.
+            for handle in send_work:
+                handle.wait()
+            send_tensors = None
             for postprocess in comm_postprocess:
                 postprocess()
             intermediate = IntermediateTensors(tensor_dict)

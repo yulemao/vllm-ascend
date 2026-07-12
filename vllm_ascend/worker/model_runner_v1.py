@@ -367,6 +367,14 @@ class NPUModelRunner(GPUModelRunner):
         # because the drafter setup needs to know whether edge-cloud is enabled.
         self.edge_cloud_cfg = self.ascend_config.edge_cloud_config
         self._edge_cloud_enabled = self.edge_cloud_cfg.enabled
+        # Keep the acceptance-count P2P send alive across execute_model calls.
+        # Waiting immediately after isend serializes the edge critical path on
+        # the edge-cloud RTT.  The next send drains this one before posting a
+        # new message, which preserves P2P ordering and bounds the number of
+        # in-flight sends to one.
+        self._pending_acceptance_send: (
+            tuple[list[Any], dict[str, torch.Tensor]] | None
+        ) = None
         # This flag is set per-step in execute_model; initialize it here so
         # that code paths reaching _prepare_inputs before the first execute_model
         # call (e.g. profile_run or unit tests) do not hit AttributeError.
@@ -2968,9 +2976,24 @@ class NPUModelRunner(GPUModelRunner):
                         self.valid_sampled_token_count_gpu.cpu()
                     )
                 if get_pp_group().world_size == 2:
+                    # The cloud consumes these values in its next model step.
+                    # Drain the previous step only now, after it has had a full
+                    # iteration to complete, instead of exposing the network
+                    # RTT in the current step's critical path.
+                    if self._pending_acceptance_send is not None:
+                        pending_work, _ = self._pending_acceptance_send
+                        for handle in pending_work:
+                            handle.wait()
+                        self._pending_acceptance_send = None
+
                     send_work = get_pp_group().isend_tensor_dict(tensor_dict_to_send)
-                    for handle in send_work:
-                        handle.wait()
+                    # Retain both Work objects and their source tensors until
+                    # completion; distributed isend requires the buffers not
+                    # to be modified or released while the operation is live.
+                    self._pending_acceptance_send = (
+                        send_work,
+                        tensor_dict_to_send,
+                    )
 
             # vLLM v0.18 defers KV connector finalization during target-model
             # forward when speculative decoding is enabled. Finalize here after
@@ -3233,6 +3256,8 @@ class NPUModelRunner(GPUModelRunner):
         # Cache the step1 positions on the cloud side; steps >= 2 are simply
         # step1 + (spec_step_idx - 1).
         mtp_base_positions: torch.Tensor | None = None
+        pending_send_work: list[Any] = []
+        pending_send_tensors: dict[str, torch.Tensor | Any] | None = None
 
         for spec_step_idx in range(num_steps):
             # Receive intermediate from edge.  Positions are omitted for
@@ -3243,6 +3268,14 @@ class NPUModelRunner(GPUModelRunner):
             )
             for handle in comm_handles:
                 handle.wait()
+            # The edge cannot send this step's request until it has received
+            # the previous response. Thus the previous response send is safe
+            # to retire here, after its transfer overlapped with the edge's
+            # remaining work and this request's transfer.
+            for handle in pending_send_work:
+                handle.wait()
+            pending_send_work = []
+            pending_send_tensors = None
             for postprocess in comm_postprocess:
                 postprocess()
             intermediate = IntermediateTensors(tensor_dict)
@@ -3328,12 +3361,20 @@ class NPUModelRunner(GPUModelRunner):
 
             # Send back to edge
             if get_pp_group().world_size == 2:
-                send_work = get_pp_group().isend_tensor_dict(
-                    {k: v.contiguous() if isinstance(v, torch.Tensor) else v
-                     for k, v in output.items() if v is not None}
+                pending_send_tensors = {
+                    k: v.contiguous() if isinstance(v, torch.Tensor) else v
+                    for k, v in output.items()
+                    if v is not None
+                }
+                pending_send_work = get_pp_group().isend_tensor_dict(
+                    pending_send_tensors
                 )
-                for handle in send_work:
-                    handle.wait()
+
+        # There is no following request to prove completion of the final
+        # response. Keep its source tensors alive and wait before returning.
+        for handle in pending_send_work:
+            handle.wait()
+        pending_send_tensors = None
 
     def _clamp_mtp_positions(
         self,

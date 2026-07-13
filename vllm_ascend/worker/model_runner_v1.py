@@ -863,11 +863,17 @@ class NPUModelRunner(GPUModelRunner):
 
         hidden_states = intermediate_tensors["hidden_states"]
         fused_hidden_states = draft_model.combine_hidden_states(aux_hidden_states)
-        assert hidden_states.shape == fused_hidden_states.shape, (
-            "EAGLE3 cloud hidden_states buffer shape does not match the "
-            f"fusion result: {hidden_states.shape} vs {fused_hidden_states.shape}"
-        )
-        hidden_states.copy_(fused_hidden_states)
+        if hidden_states.numel() == 0:
+            # Warmup or edge-cloud broadcast may send an empty placeholder
+            # hidden_states tensor (shape [0] or [0, hidden_size]). Replace it
+            # with the fused result so the cloud segment sees valid input.
+            intermediate_tensors["hidden_states"] = fused_hidden_states
+        else:
+            assert hidden_states.shape == fused_hidden_states.shape, (
+                "EAGLE3 cloud hidden_states buffer shape does not match the "
+                f"fusion result: {hidden_states.shape} vs {fused_hidden_states.shape}"
+            )
+            hidden_states.copy_(fused_hidden_states)
 
     def _load_model_edge_cloud(self) -> None:
         """边云场景的模型加载流程（复用 vLLM 标准 PP 初始化，直接加载到 NPU）。
@@ -1192,17 +1198,22 @@ class NPUModelRunner(GPUModelRunner):
         # crashes such as ACL error 507011.
         if hasattr(self, "_edge_cloud_draft_intermediate_buffers"):
             delattr(self, "_edge_cloud_draft_intermediate_buffers")
-        if hasattr(predictor, "make_empty_intermediate_tensors"):
+        # Eagle3LlamaForCausalLM patches make_empty_intermediate_tensors on the
+        # model class, but predictor here is draft_model.model (LlamaModel).
+        # Fall back to draft_model so the cloud side can allocate persistent
+        # intermediate buffers for the draft segment.
+        make_empty_fn = getattr(
+            predictor, "make_empty_intermediate_tensors", None
+        ) or getattr(draft_model, "make_empty_intermediate_tensors", None)
+        if make_empty_fn is not None:
             max_draft_tokens = self.max_num_tokens
             if enable_sp():
                 tp_size = self.vllm_config.parallel_config.tensor_parallel_size
                 max_draft_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
-            self._edge_cloud_draft_intermediate_buffers = (
-                predictor.make_empty_intermediate_tensors(
-                    batch_size=max_draft_tokens,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
+            self._edge_cloud_draft_intermediate_buffers = make_empty_fn(
+                batch_size=max_draft_tokens,
+                dtype=self.dtype,
+                device=self.device,
             )
         else:
             self._edge_cloud_draft_intermediate_buffers = None

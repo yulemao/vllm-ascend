@@ -5428,9 +5428,29 @@ class NPUModelRunner(GPUModelRunner):
             self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model()
         ):
             assert isinstance(self.drafter, AscendEagleProposer | AscendDflashProposer | AscendDraftModelProposer)
-            block_size = (self.kernel_block_sizes[0] if isinstance(
-            self.kernel_block_sizes, list) else self.kernel_block_sizes)
-            self.drafter.initialize_attn_backend(kv_cache_config, block_size)
+            skip_edge_drafter_attn_init = (
+                self._edge_cloud_enabled
+                and self.edge_cloud_cfg.role == "edge"
+                and self.speculative_config.method in ("mtp", "eagle3")
+            )
+            if skip_edge_drafter_attn_init:
+                # All draft decoder layers run on the cloud. Their stale
+                # static-forward-context entries have already been removed on
+                # the edge, so the edge KV cache config intentionally contains
+                # no draft attention layers.
+                self.drafter.draft_attn_groups = []
+                logger.info(
+                    "[EdgeCloud] Edge skipped %s drafter attention backend "
+                    "initialization.",
+                    self.speculative_config.method,
+                )
+            else:
+                block_size = (
+                    self.kernel_block_sizes[0]
+                    if isinstance(self.kernel_block_sizes, list)
+                    else self.kernel_block_sizes
+                )
+                self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)

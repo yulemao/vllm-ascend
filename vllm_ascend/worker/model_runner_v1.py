@@ -2622,47 +2622,15 @@ class NPUModelRunner(GPUModelRunner):
                             "it when the requests need prompt logprobs"
                         )
 
-                    # Apply deferred state corrections, then mamba preprocess
-                    # (must run after _update_states, before input preparation).
+                    # Apply deferred state corrections, then move aligned
+                    # Mamba states before attention metadata is built.
                     if deferred_state_corrections_fn:
                         deferred_state_corrections_fn()
                         deferred_state_corrections_fn = None
-                    if self.cache_config.mamba_cache_mode == "align":
-                        if vllm_version_is("0.20.2"):
-                            mamba_bufs = self._get_mamba_copy_bufs()
-                            preprocess_bufs = mamba_bufs
-                        else:
-                            mamba_bufs = self._get_mamba_bufs()
-                            preprocess_bufs = mamba_bufs.preprocess
-                        mamba_utils.preprocess_mamba(
-                            scheduler_output,
-                            self.kv_cache_config,
-                            self.cache_config,
-                            self.mamba_state_idx,
-                            self.input_batch,
-                            self.requests,
-                            self.compilation_config.static_forward_context,
-                            self.model.get_mamba_state_copy_func(),
-                            preprocess_bufs,
-                        )
-                        # preprocess_mamba resets num_accepted_tokens_cpu to 1
-                        # for requests whose state was copied to a new block.
-                        # Re-sync to GPU so the mamba kernel reads from the
-                        # correct initial state slot (init_token_idx = 0).
-                        self.num_accepted_tokens.np[:num_reqs] = (
-                            self.input_batch.num_accepted_tokens_cpu[:num_reqs]
-                        )
-                        self.num_accepted_tokens.copy_to_gpu(num_reqs)
-
-                        if not vllm_version_is("0.20.2") and mamba_bufs.postprocess_align is not None:
-                            mamba_utils.stage_postprocess_inputs_to_gpu(
-                                mamba_bufs.postprocess_align,
-                                scheduler_output,
-                                self.input_batch.req_ids,
-                                num_reqs,
-                                self.requests,
-                                self.mamba_state_idx,
-                            )
+                    self._preprocess_mamba_state(
+                        scheduler_output,
+                        num_reqs,
+                    )
                     if self.use_compress:
                         if deferred_state_corrections_fn:
                             deferred_state_corrections_fn()
@@ -3836,10 +3804,9 @@ class NPUModelRunner(GPUModelRunner):
         previous-step index permutation, so calling it twice corrupts the
         per-request accepted-token counts (leading to wrong positions and a
         drop in MTP acceptance rate). When the caller (execute_model slow
-        path) has already run ``_prepare_inputs`` inline, it passes the
-        results via ``precomputed`` so we reuse them instead of re-running.
-        ``cloud_prepare_early`` has no prior inline call and passes
-        ``precomputed=None`` so we run it here exactly once.
+        path or ``cloud_prepare_early``) has already run ``_prepare_inputs``
+        inline, it passes the results via ``precomputed`` so we reuse them
+        instead of re-running.
         """
         num_reqs = self.input_batch.num_reqs
         # Guard against empty batch after _update_states
@@ -3974,6 +3941,62 @@ class NPUModelRunner(GPUModelRunner):
             "num_scheduled_tokens_compressed_list": num_scheduled_tokens_compressed_list,
         }
 
+    def _preprocess_mamba_state(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+    ) -> None:
+        """Move aligned Mamba states before attention metadata is built.
+
+        Both the regular execute path and the edge-cloud cloud-prepare path
+        must run this after ``_prepare_inputs`` (and any deferred request-state
+        correction), but before ``_build_attention_metadata``. Keeping the
+        implementation shared prevents the overlapped cloud path from using
+        stale recurrent-state blocks when requests are added or reordered.
+        """
+        if self.cache_config.mamba_cache_mode != "align":
+            return
+
+        if vllm_version_is("0.20.2"):
+            mamba_bufs = self._get_mamba_copy_bufs()
+            preprocess_bufs = mamba_bufs
+        else:
+            mamba_bufs = self._get_mamba_bufs()
+            preprocess_bufs = mamba_bufs.preprocess
+
+        mamba_utils.preprocess_mamba(
+            scheduler_output,
+            self.kv_cache_config,
+            self.cache_config,
+            self.mamba_state_idx,
+            self.input_batch,
+            self.requests,
+            self.compilation_config.static_forward_context,
+            self.model.get_mamba_state_copy_func(),
+            preprocess_bufs,
+        )
+
+        # preprocess_mamba resets num_accepted_tokens_cpu to 1 for requests
+        # whose state was copied to a new block. Re-sync to the device so the
+        # Mamba kernel reads from the correct initial-state slot.
+        self.num_accepted_tokens.np[:num_reqs] = (
+            self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+        )
+        self.num_accepted_tokens.copy_to_gpu(num_reqs)
+
+        if (
+            not vllm_version_is("0.20.2")
+            and mamba_bufs.postprocess_align is not None
+        ):
+            mamba_utils.stage_postprocess_inputs_to_gpu(
+                mamba_bufs.postprocess_align,
+                scheduler_output,
+                self.input_batch.req_ids,
+                num_reqs,
+                self.requests,
+                self.mamba_state_idx,
+            )
+
     def cloud_prepare_early(self, scheduler_output: "SchedulerOutput") -> None:
         """Pre-compute input preparation on cloud while edge runs segment_a.
 
@@ -4041,16 +4064,40 @@ class NPUModelRunner(GPUModelRunner):
                     req_state.prev_num_draft_len = 0
 
         # --- _update_states ---
-        self._update_states(scheduler_output)
+        deferred_state_corrections_fn = self._update_states(scheduler_output)
+
+        num_reqs = self.input_batch.num_reqs
+        if num_reqs == 0:
+            self._cloud_prepare_cache = None
+            return
+
+        req_ids = self.input_batch.req_ids
+        num_scheduled_tokens_np = np.array(
+            [scheduler_output.num_scheduled_tokens[req_id] for req_id in req_ids],
+            dtype=np.int32,
+        )
 
         # --- Run core input preparation ---
         # cloud_prepare_early runs BEFORE the forward pass (outside
         # torch.inference_mode), but GDN attention builder does in-place
-        # tensor copies that require inference mode.  Wrap the whole
-        # preparation inside inference_mode to stay compatible with
-        # PyTorch >= 2.0 inference tensor protection.
+        # tensor copies that require inference mode. Mirror execute_model's
+        # ordering exactly: prepare inputs once, apply deferred corrections,
+        # move aligned Mamba states, then build padding/attention metadata.
         with torch.inference_mode():
-            cache = self._run_input_preparation(scheduler_output)
+            precomputed = self._prepare_inputs(
+                scheduler_output,
+                num_scheduled_tokens_np,
+            )
+            if deferred_state_corrections_fn:
+                deferred_state_corrections_fn()
+            self._preprocess_mamba_state(
+                scheduler_output,
+                num_reqs,
+            )
+            cache = self._run_input_preparation(
+                scheduler_output,
+                precomputed=precomputed,
+            )
 
         # If the batch became empty after _update_states (num_reqs == 0),
         # _run_input_preparation returns a zeroed placeholder.  Don't cache

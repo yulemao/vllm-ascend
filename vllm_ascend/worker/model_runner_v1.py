@@ -4779,6 +4779,19 @@ class NPUModelRunner(GPUModelRunner):
                 if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
+                    elif (
+                        self._edge_cloud_enabled
+                        and self.edge_cloud_cfg.role == "edge"
+                    ):
+                        # In edge-cloud head_tail mode, the edge side does not
+                        # host the draft model's attention layers (they run on
+                        # the cloud), so the draft attention layer is not
+                        # present in any local kv_cache_group.  The edge still
+                        # needs a common attention metadata to prepare draft
+                        # inputs (positions, seq_lens, block_table) for the
+                        # edge-cloud draft round-trip.  Fall back to the target
+                        # model's metadata.
+                        spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
             if self.enable_hamming_sparse is True:

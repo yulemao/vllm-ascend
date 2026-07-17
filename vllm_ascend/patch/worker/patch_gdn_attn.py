@@ -581,13 +581,7 @@ def _copy_to_pinned_cpu(
         cpu_tensor = pinned_buffer[:num_elements]
     cpu_tensor.copy_(
         tensor.reshape(-1),
-        # The returned CPU tensor is consumed immediately by the GDN host
-        # argument builders via ``tolist()``.  An asynchronous D2H copy does
-        # not establish a dependency for that CPU read, so it can observe
-        # stale or partially-copied cache indices/accepted-token counts.
-        # Keep this copy blocking until the host metadata path carries an
-        # explicit completion event.
-        non_blocking=False,
+        non_blocking=True,
     )
     return cpu_tensor
 

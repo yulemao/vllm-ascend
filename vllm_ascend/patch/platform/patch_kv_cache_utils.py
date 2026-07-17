@@ -21,41 +21,6 @@ from vllm.v1.kv_cache_interface import (
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 
 
-def _ascend_project_kv_cache_groups_to_worker(
-    global_kv_cache_groups: list[KVCacheGroupSpec],
-    worker_spec: dict[str, KVCacheSpec],
-) -> list[KVCacheGroupSpec]:
-    """Project groups without changing their scheduler-visible indices.
-
-    Edge-cloud workers can own non-contiguous groups, for example Qwen's first
-    GDN group and last full-attention group. Keep empty placeholders for groups
-    not present on this worker so local block tables consume the corresponding
-    global ``block_ids`` entry instead of compacting the group indices.
-    """
-    projected_groups: list[KVCacheGroupSpec] = []
-    for group in global_kv_cache_groups:
-        worker_layer_names = [
-            layer_name for layer_name in group.layer_names if layer_name in worker_spec
-        ]
-        group_spec = group.kv_cache_spec
-        if worker_layer_names and isinstance(group_spec, UniformTypeKVCacheSpecs):
-            group_spec = UniformTypeKVCacheSpecs(
-                block_size=group_spec.block_size,
-                kv_cache_specs={
-                    layer_name: group_spec.kv_cache_specs[layer_name]
-                    for layer_name in worker_layer_names
-                },
-            )
-        projected_groups.append(
-            KVCacheGroupSpec(
-                worker_layer_names,
-                group_spec,
-                is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
-            )
-        )
-    return projected_groups
-
-
 def _ascend_resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
     vllm_config: VllmConfig,
@@ -281,9 +246,6 @@ def _get_kv_cache_config_deepseek_v4(
 
 
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
-vllm.v1.core.kv_cache_utils._project_kv_cache_groups_to_worker = (
-    _ascend_project_kv_cache_groups_to_worker
-)
 vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
 vllm.v1.core.kv_cache_utils._get_kv_cache_config_deepseek_v4 = _get_kv_cache_config_deepseek_v4
 vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups

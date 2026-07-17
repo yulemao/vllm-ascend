@@ -39,35 +39,63 @@ def verify_and_update_config(cls, vllm_config) -> None:
         model_config=model_config,
     )
 
-    # get mamba block size
-    mamba_shapes = model_cls.get_mamba_state_shape_from_config(vllm_config)
-    mamba_dtypes = model_cls.get_mamba_state_dtype_from_config(vllm_config)
-    mamba_sizes = []
-    for shape, dtype in zip(mamba_shapes, mamba_dtypes):
-        mamba_sizes.append(math.prod(shape) * get_dtype_size(dtype))
-    ssm_block_page_size, conv_block_page_size = max(mamba_sizes), min(mamba_sizes)
+    # In edge-cloud mode the edge and cloud sides shard the model with
+    # different TP sizes, so TP-dependent cache page sizes (attention KV
+    # and mamba states, both ∝ 1/TP) would differ between the two sides.
+    # The engine merges both sides' kv cache specs and
+    # unify_kv_cache_spec_page_size() would then silently scale the
+    # smaller-page side's block_size to unify page sizes. The scheduler
+    # allocates blocks with the scaled granularity while that side's
+    # workers index blocks with their own unscaled block_size, causing
+    # cross-request KV / mamba state corruption under concurrency.
+    # Derive all TP-dependent page sizes from a canonical TP (the smaller
+    # of the two sides, i.e. the side with the larger page) so both sides
+    # produce identical page sizes and block_size stays uniform across
+    # workers. Physical sharding still uses each side's local TP; the
+    # resulting padded page only over-provisions the accounting page on
+    # the larger-TP side.
+    orig_tp = None
+    if parallel_config.enable_edge_cloud:
+        canonical_tp = min(
+            parallel_config.edge_npu_count,
+            parallel_config.cloud_npu_count,
+        )
+        if canonical_tp != parallel_config.tensor_parallel_size:
+            orig_tp = parallel_config.tensor_parallel_size
+            parallel_config.tensor_parallel_size = canonical_tp
+    try:
+        # get mamba block size
+        mamba_shapes = model_cls.get_mamba_state_shape_from_config(vllm_config)
+        mamba_dtypes = model_cls.get_mamba_state_dtype_from_config(vllm_config)
+        mamba_sizes = []
+        for shape, dtype in zip(mamba_shapes, mamba_dtypes):
+            mamba_sizes.append(math.prod(shape) * get_dtype_size(dtype))
+        ssm_block_page_size, conv_block_page_size = max(mamba_sizes), min(mamba_sizes)
 
-    # Pure linear attention models (e.g. bailing 2.5) have only SSM state,
-    # no conv block. Detected by a single 3-D mamba shape (ssm only, no conv).
-    # Example shape: MambaSpec(shapes=((8, 128, 128),), mamba_type='linear_attention')
-    if len(mamba_shapes) == 1 and len(mamba_shapes[0]) == 3:
-        conv_block_page_size = 0
+        # Pure linear attention models (e.g. bailing 2.5) have only SSM state,
+        # no conv block. Detected by a single 3-D mamba shape (ssm only, no conv).
+        # Example shape: MambaSpec(shapes=((8, 128, 128),), mamba_type='linear_attention')
+        if len(mamba_shapes) == 1 and len(mamba_shapes[0]) == 3:
+            conv_block_page_size = 0
 
-    # NOTE(zxr): because of the limit of Ascend Hardware, we need to keep
-    # all cache tensors contiguous, so we align the page size of ssm_block
-    # and single attn_block
-    if model_config.use_mla:
-        attn_num_kv_heads = model_config.get_num_kv_heads(parallel_config)
-        kv_lora_rank = model_config.hf_text_config.kv_lora_rank
-        qk_rope_head_dim = model_config.hf_text_config.qk_rope_head_dim
-        attn_single_token_k_page_size = kv_lora_rank * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
-        attn_rope_token_page_size = qk_rope_head_dim * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
-        attn_token_page_size = attn_single_token_k_page_size + attn_rope_token_page_size
-    else:
-        attn_num_kv_heads = model_config.get_num_kv_heads(parallel_config)
-        attn_head_size = model_config.get_head_size()
-        attn_single_token_k_page_size = attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
-        attn_token_page_size = 2 * attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
+        # NOTE(zxr): because of the limit of Ascend Hardware, we need to keep
+        # all cache tensors contiguous, so we align the page size of ssm_block
+        # and single attn_block
+        if model_config.use_mla:
+            attn_num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+            kv_lora_rank = model_config.hf_text_config.kv_lora_rank
+            qk_rope_head_dim = model_config.hf_text_config.qk_rope_head_dim
+            attn_single_token_k_page_size = kv_lora_rank * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
+            attn_rope_token_page_size = qk_rope_head_dim * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
+            attn_token_page_size = attn_single_token_k_page_size + attn_rope_token_page_size
+        else:
+            attn_num_kv_heads = model_config.get_num_kv_heads(parallel_config)
+            attn_head_size = model_config.get_head_size()
+            attn_single_token_k_page_size = attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
+            attn_token_page_size = 2 * attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
+    finally:
+        if orig_tp is not None:
+            parallel_config.tensor_parallel_size = orig_tp
 
     attn_block_size = kernel_block_size * cdiv(ssm_block_page_size, kernel_block_size * attn_single_token_k_page_size)
     assert attn_single_token_k_page_size * attn_block_size == ssm_block_page_size, (

@@ -381,10 +381,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             else:
                 logger.warning("Target model has no accessible lm_head for sharing.")
 
-        if self.method == "mtp" and self.vllm_config.model_config.is_deepseek_mla:
+        target_lm_head = getattr(model, "lm_head", None)
+        if (
+            self.method == "mtp"
+            and self.vllm_config.model_config.is_deepseek_mla
+            and target_lm_head is not None
+            and not isinstance(target_lm_head, PPMissingLayer)
+        ):
             for _, layer_module in self.model.model.layers.items():
-                if torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight):
-                    layer_module.shared_head.head = model.lm_head
+                if torch.equal(
+                    layer_module.shared_head.head.weight,
+                    target_lm_head.weight,
+                ):
+                    layer_module.shared_head.head = target_lm_head
 
         # Edge-cloud draft (MTP/Eagle3) splits the draft model into segments
         # that are wrapped individually by the model runner. Wrapping the whole

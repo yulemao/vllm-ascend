@@ -213,6 +213,8 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
                 continue
             assert isinstance(layer, DeepSeekMultiTokenPredictorLayer)
             layer = layer.mtp_block
+            if isinstance(layer, PPMissingLayer):
+                continue
             assert isinstance(layer, DeepseekV2DecoderLayer)
             if isinstance(layer.mlp, DeepseekV4MoE):
                 # Pick last one layer since the first ones may be dense layers.

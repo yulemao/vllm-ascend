@@ -453,11 +453,25 @@ def _clear_pending_mtp_draft_for_finished_requests(self) -> None:
 
 def _uses_split_qwen_mtp_draft(self) -> bool:
     speculative_config = getattr(self.vllm_config, "speculative_config", None)
-    return bool(
-        getattr(self, "_pp_pd_channel", None) is not None
-        and speculative_config is not None
-        and getattr(speculative_config, "method", None) == "mtp"
-    )
+    if (
+        getattr(self, "_pp_pd_channel", None) is None
+        or speculative_config is None
+    ):
+        return False
+    # Keep in sync with
+    # NPUModelRunner._is_qwen_mtp_spec_decode: accept the Qwen-specific
+    # method names, and treat plain "mtp" as Qwen-MTP only when the model
+    # type matches. Otherwise the model runner would stash pending drafts
+    # that EngineCore never picks up.
+    method = getattr(speculative_config, "method", None)
+    if method in ("qwen3_5_mtp", "qwen_mtp"):
+        return True
+    if method != "mtp":
+        return False
+    model_config = getattr(self.vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    model_type = str(getattr(hf_config, "model_type", "")).lower()
+    return "qwen" in model_type and "mtp" in model_type
 
 
 # =======================================================================#

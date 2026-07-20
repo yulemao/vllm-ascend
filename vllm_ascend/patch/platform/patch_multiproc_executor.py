@@ -22,6 +22,7 @@ from vllm.tracing import maybe_init_worker_tracer
 from vllm.utils import numa_utils
 from vllm.utils.network_utils import get_distributed_init_method, get_loopback_ip, get_open_port
 from vllm.utils.system_utils import get_mp_context
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.executor.abstract import FailureCallback
 from vllm.v1.executor.multiproc_executor import (
     FutureWrapper,
@@ -30,6 +31,7 @@ from vllm.v1.executor.multiproc_executor import (
     WorkerProc,
     set_multiprocessing_worker_envs,
 )
+from vllm.v1.outputs import DraftTokenIds
 from vllm_ascend.passive_engine_core_state import (
     is_ascend_non_leader_passive_engine_core,
 )
@@ -239,6 +241,50 @@ class AscendMultiprocExecutor(MultiprocExecutor):
         if self.parallel_config.enable_edge_cloud:
             return 0
         return super()._get_output_rank()
+
+    def _edge_local_only(self) -> bool:
+        # Mirror execute_model: on the edge node these control RPCs must stay
+        # off the cross-node wire. The cloud receives work solely via ZMQ
+        # (PassiveEngineCore -> cloud local rpc_broadcast_mq); remote readers
+        # of rpc_broadcast_mq must not see them.
+        pc = self.parallel_config
+        return bool(
+            getattr(pc, "enable_edge_cloud", False)
+            and getattr(pc, "is_edge_node", False)
+        )
+
+    def take_pending_mtp_draft_scheduler_output(self) -> SchedulerOutput | None:
+        # Edge-cloud Qwen-MTP: fetch the next pending draft task stashed by
+        # the driver worker's model runner so EngineCore can hand it to the
+        # scheduler's mtp_drafts_first_ready queue.
+        return self.collective_rpc(
+            "take_pending_mtp_draft_scheduler_output",
+            unique_reply_rank=self.output_rank,
+            local_only=self._edge_local_only(),
+        )
+
+    def take_completed_mtp_draft_result(
+        self,
+    ) -> tuple[DraftTokenIds, SchedulerOutput] | None:
+        # Edge-cloud Qwen-MTP: fetch a finished draft chain (all draft steps)
+        # plus its parent SchedulerOutput so EngineCore can write the draft
+        # tokens back via update_draft_token_ids_in_output.
+        return self.collective_rpc(
+            "take_completed_mtp_draft_result",
+            unique_reply_rank=self.output_rank,
+            local_only=self._edge_local_only(),
+        )
+
+    def clear_pending_mtp_draft_for_req_ids(
+        self, req_ids: set[str] | list[str]
+    ) -> None:
+        # Edge-cloud Qwen-MTP: drop pending draft contexts of finished
+        # requests on every local worker.
+        self.collective_rpc(
+            "clear_pending_mtp_draft_for_req_ids",
+            args=(req_ids,),
+            local_only=self._edge_local_only(),
+        )
 
 
 class AscendWorkerProc(WorkerProc):

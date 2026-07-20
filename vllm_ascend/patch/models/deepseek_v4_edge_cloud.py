@@ -36,7 +36,10 @@ Key differences from standard Llama-style models:
     avoids transmitting the large residual tensor between edge and cloud,
     which was causing the cloud-side KV-cache allocation to OOM.
   - Embedding needs ``unsqueeze(-2).repeat(1, hc_mult, 1)``.
-  - Tail segment needs ``hc_head()`` + ``norm()``.
+  - Tail segment needs ``hc_head()`` + ``norm()``, and additionally stashes
+    the pre-``hc_head`` residual stream into ``_mtp_hidden_buffer`` so the
+    MTP draft model receives valid target hidden states (mirrors
+    ``DeepseekV4Model.forward``).
   - Only ``hidden_states`` is transmitted across the edge-cloud network;
     ``input_ids`` is kept locally on the edge side.
 """
@@ -131,6 +134,29 @@ def _forward_edge_cloud_segment_v4(
         return IntermediateTensors({
             "hidden_states": hidden_states,
         })
+
+    # Last segment: stash the pre-hc_head residual stream into
+    # ``_mtp_hidden_buffer`` (mirrors DeepseekV4Model.forward), so that
+    # ``get_mtp_target_hidden_states()`` feeds valid hidden states to the
+    # MTP draft in edge-cloud mode.  Without this the buffer stays
+    # uninitialized and the drafter consumes garbage.
+    from vllm.distributed import tensor_model_parallel_all_gather
+
+    from vllm_ascend.ascend_forward_context import get_forward_context
+
+    forward_ctx = get_forward_context()
+    if forward_ctx is not None and forward_ctx.flash_comm_v1_enabled:
+        h_states_flat = tensor_model_parallel_all_gather(
+            hidden_states.flatten(1), dim=0
+        )
+        pad_size = forward_ctx.pad_size
+        if pad_size > 0:
+            h_states_flat = h_states_flat[:-pad_size]
+        num_tokens = h_states_flat.shape[0]
+        self._mtp_hidden_buffer[:num_tokens].copy_(h_states_flat)
+    else:
+        num_tokens = hidden_states.shape[0]
+        self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
     # Last segment: hc_head + norm
     hidden_states = self.hc_head(

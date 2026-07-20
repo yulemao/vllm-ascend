@@ -1009,6 +1009,11 @@ class NPUModelRunner(GPUModelRunner):
                 set_edge_cloud_layer_range(0, 0)
                 if self.speculative_config.method == "eagle3":
                     import vllm_ascend.patch.models.eagle3_edge_cloud  # noqa: F401
+                if (
+                    self.speculative_config.method == "mtp"
+                    and self._is_deepseek_v4
+                ):
+                    import vllm_ascend.patch.models.deepseek_v4_mtp_edge_cloud  # noqa: F401
 
             with get_tp_context(self.drafter):
                 self.drafter.load_model(self.model)
@@ -1102,23 +1107,42 @@ class NPUModelRunner(GPUModelRunner):
     ) -> None:
         """Shard the draft model into edge/cloud segments for edge-cloud mode.
 
-        Supports both MTP (``Qwen3_5MTP``/``DeepSeekMTP`` style) and Eagle3
-        (``Eagle3LlamaForCausalLM`` style) draft models.  The embedding/preprocessing
-        and the output head live on the edge; all decoder layers + final norm live
-        on the cloud.
+        Supports MTP (``Qwen3_5MTP``/``DeepSeekMTP`` style, and
+        ``DeepSeekV4MTP`` which is sharded at submodule granularity: edge
+        keeps embed + per-layer e_proj/h_proj/enorm/hnorm/shared_head, cloud
+        keeps only each layer's ``mtp_block``) and Eagle3
+        (``Eagle3LlamaForCausalLM`` style) draft models.  The
+        embedding/preprocessing and the output head live on the edge; all
+        decoder layers + final norm live on the cloud.
         """
         if method == "mtp":
             predictor = self._get_mtp_predictor(draft_model)
             if predictor is None:
                 logger.warning("[EdgeCloud] Cannot find MTP predictor for sharding")
                 return
-            edge_only_modules = (
-                "embed_tokens",
-                "fc",
-                "norm",
-                "pre_fc_norm_hidden",
-                "pre_fc_norm_embedding",
+            # DeepSeek V4 MTP keeps the per-layer projection/norm submodules
+            # (e_proj/h_proj/enorm/hnorm) and the shared head on the edge and
+            # runs only the decoder block (mtp_block) on the cloud, so it is
+            # sharded at submodule granularity instead of whole layers.
+            layer_iter = (
+                predictor.layers.values()
+                if isinstance(predictor.layers, nn.ModuleDict)
+                else predictor.layers
             )
+            is_v4_mtp = any(hasattr(layer, "mtp_block") for layer in layer_iter)
+            if is_v4_mtp:
+                edge_only_modules = (
+                    "embed_tokens",
+                    "logits_processor",
+                )
+            else:
+                edge_only_modules = (
+                    "embed_tokens",
+                    "fc",
+                    "norm",
+                    "pre_fc_norm_hidden",
+                    "pre_fc_norm_embedding",
+                )
         elif method == "eagle3":
             # Eagle3 draft: draft_model.model is the LlamaModel (embed/layers/norm).
             if not hasattr(draft_model, "model"):
@@ -1170,7 +1194,13 @@ class NPUModelRunner(GPUModelRunner):
             if idx not in local_layers and not isinstance(
                 predictor.layers[key], PPMissingLayer
             ):
-                predictor.layers[key] = PPMissingLayer()
+                if method == "mtp" and is_v4_mtp:
+                    # DeepSeek V4 MTP: only the decoder block runs on the
+                    # cloud; the edge keeps the projection/norm/head
+                    # submodules of each MTP layer.
+                    predictor.layers[key].mtp_block = PPMissingLayer()
+                else:
+                    predictor.layers[key] = PPMissingLayer()
 
         # Cloud side does not need embedding/preprocessing/output modules;
         # edge keeps them.
@@ -1179,6 +1209,26 @@ class NPUModelRunner(GPUModelRunner):
                 module = getattr(predictor, module_name, None)
                 if module is not None and not isinstance(module, PPMissingLayer):
                     setattr(predictor, module_name, PPMissingLayer())
+            if method == "mtp" and is_v4_mtp:
+                # DeepSeek V4 MTP: the cloud keeps only the decoder block of
+                # each MTP layer; the projection/norm/head submodules live
+                # on the edge.
+                for key in layer_keys:
+                    layer = predictor.layers[key]
+                    if isinstance(layer, PPMissingLayer):
+                        continue
+                    for submodule_name in (
+                        "e_proj",
+                        "h_proj",
+                        "enorm",
+                        "hnorm",
+                        "shared_head",
+                    ):
+                        submodule = getattr(layer, submodule_name, None)
+                        if submodule is not None and not isinstance(
+                            submodule, PPMissingLayer
+                        ):
+                            setattr(layer, submodule_name, PPMissingLayer())
             if (
                 hasattr(draft_model, "lm_head")
                 and not isinstance(draft_model.lm_head, PPMissingLayer)

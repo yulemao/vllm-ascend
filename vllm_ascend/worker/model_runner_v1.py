@@ -714,6 +714,15 @@ class NPUModelRunner(GPUModelRunner):
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: Any | None = None
         self._mamba_copy_bufs: Any | None = None
+
+        # Saved in execute_model() so sample_tokens() can access scheduler_output
+        # for edge-cloud mamba state sync (especially on the cloud side).
+        self._last_scheduler_output: "SchedulerOutput | None" = None
+
+        # Saved on the cloud side during execute_model() for use by
+        # _run_mtp_cloud_segment() which runs later in sample_tokens().
+        self._cloud_spec_decode_common_attn_metadata: AscendCommonAttentionMetadata | None = None
+        self._cloud_spec_decode_num_reqs: int = 0
         self.enable_hamming_sparse = (self.ascend_config.enable_hamming_sparse is True)
         self.enable_hamming_sparse = self.enable_hamming_sparse and not vllm_config.speculative_config
         if self.enable_hamming_sparse is True:
@@ -724,6 +733,10 @@ class NPUModelRunner(GPUModelRunner):
 
         self.edge_cloud_cfg = self.ascend_config.edge_cloud_config
         self._edge_cloud_enabled = self.edge_cloud_cfg.enabled
+        # This flag is set per-step in execute_model; initialize it here so
+        # that code paths reaching _prepare_inputs before the first execute_model
+        # call (e.g. profile_run or unit tests) do not hit AttributeError.
+        self._is_edge_cloud_embed_only_tail = False
         if self._edge_cloud_enabled:
             if not self.parallel_config.enable_edge_cloud:
                 raise ValueError(
@@ -1859,29 +1872,34 @@ class NPUModelRunner(GPUModelRunner):
         # CPU values are optimistic (all drafts accepted). The kernel
         # corrects on GPU using the previous step's
         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
-        if (
-            self.use_async_spec_decode
-            and self.valid_sampled_token_count_gpu is not None
-            and prev_req_id_to_index
-        ):
-            self.prev_positions.copy_to_gpu(num_reqs)
-            self.prev_num_draft_tokens.copy_to_gpu()
-            cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
-                device=self.device, non_blocking=True
-            )
-            update_num_computed_tokens_for_batch_change(
-                self.num_computed_tokens,
-                self.num_accepted_tokens.gpu[:num_reqs],
-                self.prev_positions.gpu[:num_reqs],
-                self.valid_sampled_token_count_gpu,
-                self.prev_num_draft_tokens.gpu,
-                cpu_values,
-            )
-        else:
-            self.num_computed_tokens[:num_reqs].copy_(
-                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
-                non_blocking=True,
-            )
+        # In edge-cloud embedding_only mode, the tail segment reuses the
+        # num_computed_tokens already corrected by the head segment, so skip
+        # both the kernel and the CPU fallback copy to avoid re-introducing
+        # the scheduler's optimistic value.
+        if not self._is_edge_cloud_embed_only_tail:
+            if (
+                self.use_async_spec_decode
+                and self.valid_sampled_token_count_gpu is not None
+                and prev_req_id_to_index
+            ):
+                self.prev_positions.copy_to_gpu(num_reqs)
+                self.prev_num_draft_tokens.copy_to_gpu()
+                cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
+                    device=self.device, non_blocking=True
+                )
+                update_num_computed_tokens_for_batch_change(
+                    self.num_computed_tokens,
+                    self.num_accepted_tokens.gpu[:num_reqs],
+                    self.prev_positions.gpu[:num_reqs],
+                    self.valid_sampled_token_count_gpu,
+                    self.prev_num_draft_tokens.gpu,
+                    cpu_values,
+                )
+            else:
+                self.num_computed_tokens[:num_reqs].copy_(
+                    self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+                    non_blocking=True,
+                )
 
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
         self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
@@ -2992,6 +3010,22 @@ class NPUModelRunner(GPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
+        # Save scheduler_output for edge-cloud mamba state sync in sample_tokens().
+        self._last_scheduler_output = scheduler_output
+
+        # In edge-cloud embedding_only mode, execute_model is called twice for the
+        # same scheduler_output: head segment (intermediate_tensors is None) and
+        # tail segment (intermediate_tensors is not None). The tail segment should
+        # reuse the num_computed_tokens corrected by the head segment, instead of
+        # re-running update_num_computed_tokens_for_batch_change or copying the
+        # potentially optimistic CPU value back to GPU.
+        self._is_edge_cloud_embed_only_tail = (
+            self._edge_cloud_enabled
+            and self.edge_cloud_cfg.mode == "embedding_only"
+            and self.edge_cloud_cfg.role == "edge"
+            and intermediate_tensors is not None
+        )
+
         # --- Layer slice: non-first slice fast path ---
         # For slices 1..N-1, the batch state (requests, attention metadata,
         # positions, etc.) was already set up by slice 0.  We only need to
@@ -3136,11 +3170,17 @@ class NPUModelRunner(GPUModelRunner):
             cudagraph_stats = cache["cudagraph_stats"]
             # Re-sync num_computed_tokens from CPU: segment_a forward or
             # async state update may have modified the GPU buffer.
+            # NOTE: In async speculative decoding, segment_a has already
+            # corrected the GPU num_computed_tokens using the actual accepted
+            # token count. Do not overwrite it with the scheduler's optimistic
+            # CPU mirror, otherwise the next segment_a will use stale values
+            # and positions_np can exceed max_model_len.
             num_reqs = self.input_batch.num_reqs
-            self.num_computed_tokens[:num_reqs].copy_(
-                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
-                non_blocking=True,
-            )
+            if not self.use_async_spec_decode:
+                self.num_computed_tokens[:num_reqs].copy_(
+                    self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+                    non_blocking=True,
+                )
             # Fast path skips _update_states, so no deferred corrections.
             deferred_state_corrections_fn = None
         elif _cloud_fast_path:
@@ -3304,7 +3344,19 @@ class NPUModelRunner(GPUModelRunner):
                         )
 
                     # Run core input preparation.
-                    cache = self._run_input_preparation(scheduler_output)
+                    # NOTE: _prepare_inputs was already called inline above; it
+                    # is NOT idempotent (rewrites num_accepted_tokens_cpu in
+                    # place under async spec decode), so reuse its results here
+                    # instead of letting _run_input_preparation call it again.
+                    cache = self._run_input_preparation(
+                        scheduler_output,
+                        precomputed=(
+                            logits_indices,
+                            spec_decode_metadata,
+                            total_num_scheduled_tokens,
+                            num_scheduled_tokens_compressed_list,
+                        ),
+                    )
                     total_num_scheduled_tokens = cache["total_num_scheduled_tokens"]
                     num_tokens_padded = cache["num_tokens_padded"]
                     num_tokens_across_dp = cache["num_tokens_across_dp"]
@@ -3324,6 +3376,18 @@ class NPUModelRunner(GPUModelRunner):
                         num_tokens_across_dp,
                     )
 
+            # Save spec_decode_common_attn_metadata for cloud-side
+            # MTP draft proposal.  On the cloud side,
+            # execute_model_state is None (cloud is not the last PP
+            # rank), so the metadata would otherwise be lost.
+            num_reqs = self.input_batch.num_reqs
+            if (
+                self._edge_cloud_enabled
+                and self.edge_cloud_cfg.role == "cloud"
+                and spec_decode_common_attn_metadata is not None
+            ):
+                self._cloud_spec_decode_common_attn_metadata = spec_decode_common_attn_metadata
+                self._cloud_spec_decode_num_reqs = num_reqs
 
             (
                 input_ids,
@@ -3577,6 +3641,92 @@ class NPUModelRunner(GPUModelRunner):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        # Edge-cloud sync: receive num_accepted_tokens (and optionally
+        # valid_sampled_token_count) from edge so that cloud can update
+        # num_computed_tokens for the main model in embed_only MTP mode,
+        # or run _update_states_after_model_execute() for hybrid models.
+        # NOTE: this must run on every cloud-side sample_tokens invocation
+        # (they are collectively driven by the edge EngineCore, one per edge
+        # sampling step), so it lives before the cloud no-op early return.
+        if (
+            self._edge_cloud_enabled
+            and self.edge_cloud_cfg.role == "cloud"
+            and self.speculative_config
+            and (
+                self.model_config.is_hybrid
+                or (
+                    self.edge_cloud_cfg.mode == "embedding_only"
+                    and self.speculative_config.method == "mtp"
+                )
+            )
+            and self._last_scheduler_output is not None
+        ):
+            pp_group = get_pp_group()
+            if pp_group.world_size == 2:
+                tensor_dict, recv_handles, recv_postprocess = (
+                    pp_group.irecv_tensor_dict()
+                )
+                for handle in recv_handles:
+                    handle.wait()
+                for postprocess in recv_postprocess:
+                    postprocess()
+            else:
+                tensor_dict = None
+
+            tensor_dict = get_tp_group().broadcast_object(
+                tensor_dict, src=0
+            )
+            assert tensor_dict is not None
+            num_accepted = tensor_dict["num_accepted_tokens"].to(self.device)
+            num_reqs = num_accepted.size(0)
+            self.num_accepted_tokens.gpu[:num_reqs] = num_accepted
+
+            # For embed_only MTP, the cloud also needs the rejection-
+            # corrected valid_sampled_token_count and the prev-batch
+            # request mapping so that _prepare_inputs can run the async
+            # spec-decode correction kernel.
+            if (
+                self.edge_cloud_cfg.mode == "embedding_only"
+                and self.speculative_config.method == "mtp"
+                and "valid_sampled_token_count" in tensor_dict
+            ):
+                self.valid_sampled_token_count_gpu = tensor_dict[
+                    "valid_sampled_token_count"
+                ].to(self.device)
+                # _bookkeeping_sync is not run on the cloud, so the
+                # prev-batch mapping must be reconstructed here.
+                self.input_batch.prev_req_id_to_index = {
+                    req_id: i
+                    for i, req_id in enumerate(self.input_batch.req_ids)
+                }
+
+            if self.model_config.is_hybrid:
+                if self.cache_config.mamba_cache_mode == "align":
+                    for i, num_tokens in enumerate(
+                        self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
+                    ):
+                        self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
+                    mamba_utils.postprocess_mamba(
+                        self._last_scheduler_output,
+                        self.kv_cache_config,
+                        self.input_batch,
+                        self.requests,
+                        self.mamba_state_idx,
+                        self.compilation_config.static_forward_context,
+                        self.model.get_mamba_state_copy_func(),
+                        self._get_mamba_copy_bufs(),
+                    )
+                else:
+                    self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                        self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+                    )
+            else:
+                # For non-hybrid embed_only MTP, keep CPU mirror in sync
+                # so _prepare_inputs sees corrected num_accepted_tokens.
+                self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                    self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+                )
+
         if self._edge_cloud_enabled and not self.parallel_config.is_edge_node:
             # Cloud workers do not own segment_e / LM head / sampler in the
             # edge-cloud PD-separation topology. When the edge EngineCore
@@ -3738,6 +3888,37 @@ class NPUModelRunner(GPUModelRunner):
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
+
+            # Edge-cloud sync: send num_accepted_tokens (and optionally
+            # valid_sampled_token_count) to cloud so that cloud can run
+            # _update_states_after_model_execute() for hybrid models, or correct
+            # num_computed_tokens for embed_only MTP speculative decoding.
+            if (
+                self._edge_cloud_enabled
+                and self.edge_cloud_cfg.role != "cloud"
+                and self.speculative_config
+                and (
+                    self.model_config.is_hybrid
+                    or (
+                        self.edge_cloud_cfg.mode == "embedding_only"
+                        and self.speculative_config.method == "mtp"
+                    )
+                )
+            ):
+                num_accepted = (sampler_output.sampled_token_ids != -1).sum(dim=1).cpu()
+                tensor_dict_to_send = {"num_accepted_tokens": num_accepted}
+                if (
+                    self.edge_cloud_cfg.mode == "embedding_only"
+                    and self.speculative_config.method == "mtp"
+                    and self.valid_sampled_token_count_gpu is not None
+                ):
+                    tensor_dict_to_send["valid_sampled_token_count"] = (
+                        self.valid_sampled_token_count_gpu.cpu()
+                    )
+                if get_pp_group().world_size == 2:
+                    send_work = get_pp_group().isend_tensor_dict(tensor_dict_to_send)
+                    for handle in send_work:
+                        handle.wait()
 
             # vLLM v0.18 defers KV connector finalization during target-model
             # forward when speculative decoding is enabled. Finalize here after
@@ -4112,12 +4293,23 @@ class NPUModelRunner(GPUModelRunner):
     def _run_input_preparation(
         self,
         scheduler_output: "SchedulerOutput",
+        precomputed: tuple | None = None,
     ) -> dict[str, Any]:
         """Run input preparation pipeline after _update_states.
 
         Executes _prepare_inputs, _determine_batch_execution_and_padding,
         and _build_attention_metadata. Returns all results as a dict that
         can be passed to the forward pass or cached for fast-path reuse.
+
+        ``_prepare_inputs`` is NOT idempotent: under async spec decode it
+        rewrites ``num_accepted_tokens_cpu`` in place by applying the
+        previous-step index permutation, so calling it twice corrupts the
+        per-request accepted-token counts (leading to wrong positions and a
+        drop in MTP acceptance rate). When the caller (execute_model slow
+        path) has already run ``_prepare_inputs`` inline, it passes the
+        results via ``precomputed`` so we reuse them instead of re-running.
+        ``cloud_prepare_early`` has no prior inline call and passes
+        ``precomputed=None`` so we run it here exactly once.
         """
         num_reqs = self.input_batch.num_reqs
         # Guard against empty batch after _update_states
@@ -4141,15 +4333,23 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
         max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
 
-        (
-            logits_indices,
-            spec_decode_metadata,
-            total_num_scheduled_tokens,
-            num_scheduled_tokens_compressed_list,
-        ) = self._prepare_inputs(
-            scheduler_output,
-            num_scheduled_tokens_np,
-        )
+        if precomputed is not None:
+            (
+                logits_indices,
+                spec_decode_metadata,
+                total_num_scheduled_tokens,
+                num_scheduled_tokens_compressed_list,
+            ) = precomputed
+        else:
+            (
+                logits_indices,
+                spec_decode_metadata,
+                total_num_scheduled_tokens,
+                num_scheduled_tokens_compressed_list,
+            ) = self._prepare_inputs(
+                scheduler_output,
+                num_scheduled_tokens_np,
+            )
 
         num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
         if self.pcp_size > 1:
@@ -6020,6 +6220,12 @@ class NPUModelRunner(GPUModelRunner):
             self.need_accepted_tokens = False
             self.may_reinitialize_input_batch(kv_cache_config)
             self.kv_cache = {}
+            # Still initialize cudagraph dispatcher keys and ACL graph params,
+            # otherwise edge segments (and edge-cloud MTP segments) have no
+            # graph params and ACL graph capture/replay can hang.
+            self._check_and_update_cudagraph_mode(
+                [], kv_cache_config.kv_cache_groups
+            )
             logger.info(
                 "[EdgeCloud] embedding_only edge skipped KV cache tensor "
                 "allocation and attention backend initialization."
@@ -6971,6 +7177,18 @@ class NPUModelRunner(GPUModelRunner):
                         if self.speculative_config:
                             wrapper.draft_graph_params = make_graph_params(self.cudagraph_batch_sizes)
 
+                # Also initialize graph params for edge-cloud MTP drafter segments.
+                if (
+                    self.speculative_config
+                    and self.speculative_config.method == "mtp"
+                    and hasattr(self, "_edge_cloud_mtp_segments")
+                ):
+                    for wrapper in self._edge_cloud_mtp_segments.values():
+                        if isinstance(wrapper, ACLGraphWrapper):
+                            wrapper.graph_params = make_graph_params(self.cudagraph_batch_sizes)
+                            if self.speculative_config:
+                                wrapper.draft_graph_params = make_graph_params(self.cudagraph_batch_sizes)
+
     def _get_aclgraph_wrappers(self) -> list[ACLGraphWrapper]:
         """返回所有可能残留 profile 阶段图捕获结果的 ACLGraphWrapper。"""
         wrappers: list[ACLGraphWrapper] = []
@@ -6980,6 +7198,12 @@ class NPUModelRunner(GPUModelRunner):
             wrapper = getattr(self, attr, None)
             if isinstance(wrapper, ACLGraphWrapper):
                 wrappers.append(wrapper)
+        # Include edge-cloud MTP drafter segment wrappers so that
+        # capture_model() can clear any stale entries from them.
+        if hasattr(self, "_edge_cloud_mtp_segments"):
+            for wrapper in self._edge_cloud_mtp_segments.values():
+                if isinstance(wrapper, ACLGraphWrapper):
+                    wrappers.append(wrapper)
         return wrappers
 
     def capture_model(self) -> int:

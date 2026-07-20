@@ -268,7 +268,7 @@ class AscendMultiprocExecutor(MultiprocExecutor):
     ) -> tuple[DraftTokenIds, SchedulerOutput] | None:
         # Edge-cloud Qwen-MTP: fetch a finished draft chain (all draft steps)
         # plus its parent SchedulerOutput so EngineCore can write the draft
-        # tokens back via update_draft_token_ids_in_output.
+        # tokens back into request.spec_token_ids via update_draft_token_ids.
         return self.collective_rpc(
             "take_completed_mtp_draft_result",
             unique_reply_rank=self.output_rank,

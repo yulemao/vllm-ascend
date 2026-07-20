@@ -2614,6 +2614,33 @@ class NPUModelRunner(GPUModelRunner):
         }
         self._pending_mtp_draft_contexts[task_id] = context
         self._queue_pending_mtp_draft_task(task_id)
+        if torch.is_tensor(sampled_token_ids):
+            assert self.drafter is not None
+            # Mirror the inline propose path: refresh prev_sampled_token_ids
+            # (used by the next batch's _prepare_input_ids scatter) and
+            # valid_sampled_token_count_gpu (used by the next batch's async
+            # num_computed_tokens correction kernel). The deferred path
+            # skips propose_draft_token_ids, so without this the next decode
+            # batch would read stale input ids and optimistic positions.
+            next_token_ids, valid_sampled_tokens_count = (
+                self.drafter.prepare_next_token_ids_padded(
+                    sampled_token_ids,
+                    self.requests,
+                    self.input_batch,
+                    self.discard_request_indices.gpu,
+                    self.num_discarded_requests,
+                )
+            )
+            self._copy_valid_sampled_token_count(
+                next_token_ids, valid_sampled_tokens_count
+            )
+            context["next_token_ids"] = next_token_ids
+        else:
+            logger.warning(
+                "Deferred Qwen-MTP draft without padded sampled tokens; "
+                "prev_sampled_token_ids / valid_sampled_token_count will "
+                "not be refreshed for the next decode batch."
+            )
         self._draft_token_ids = None
         logger.debug(
             "Deferred Qwen-MTP draft after %s, task_id=%s, req_ids=%s",
@@ -2780,13 +2807,19 @@ class NPUModelRunner(GPUModelRunner):
         num_reqs = len(context["req_ids"])
         if torch.is_tensor(sampled_token_ids):
             assert self.drafter is not None
-            input_ids, _ = self.drafter.prepare_next_token_ids_padded(
-                sampled_token_ids,
-                self.requests,
-                self.input_batch,
-                self.discard_request_indices.gpu,
-                self.num_discarded_requests,
-            )
+            # Reuse the next_token_ids computed at stash time (against the
+            # parent batch's input_batch state). Recomputing here would read
+            # the live input_batch, which may have moved on to other batches.
+            next_token_ids = context.get("next_token_ids")
+            if next_token_ids is None:
+                next_token_ids, _ = self.drafter.prepare_next_token_ids_padded(
+                    sampled_token_ids,
+                    self.requests,
+                    self.input_batch,
+                    self.discard_request_indices.gpu,
+                    self.num_discarded_requests,
+                )
+            input_ids = next_token_ids
         else:
             input_ids_list: list[int] = []
             for req_idx, req_id in enumerate(context["req_ids"]):
@@ -2945,6 +2978,12 @@ class NPUModelRunner(GPUModelRunner):
                 self._queue_pending_mtp_draft_task(task_id)
         else:
             context["draft_complete"] = True
+            # Hand the finished draft chain to the device-side channel: the
+            # next decode batch's _prepare_input_ids scatters these real
+            # draft token ids into the verify forward's input_ids. Row order
+            # matches context["req_ids"], i.e. the parent batch's input_batch
+            # order that the next batch's prev_positions mapping refers to.
+            self._draft_token_ids = torch.stack(draft_steps, dim=1)
 
         req_ids = list(context["req_ids"])
         return ModelRunnerOutput(

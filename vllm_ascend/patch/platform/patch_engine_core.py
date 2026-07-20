@@ -400,11 +400,13 @@ def _enqueue_pending_mtp_draft_if_ready(self) -> None:
     if take_completed is not None:
         completed = take_completed()
         if completed is not None:
-            draft_token_ids, parent_scheduler_output = completed
-            self.scheduler.update_draft_token_ids_in_output(
-                draft_token_ids,
-                parent_scheduler_output,
-            )
+            draft_token_ids, _parent_scheduler_output = completed
+            # Write the real draft tokens into request.spec_token_ids so
+            # that the NEXT decode round's schedule() picks them up into
+            # scheduled_spec_decode_tokens. Writing them into the parent
+            # SchedulerOutput is useless: that output was already consumed
+            # by update_from_output in the step that stashed the draft.
+            self.scheduler.update_draft_token_ids(draft_token_ids)
             logger.debug(
                 "Updated scheduler with completed Qwen-MTP draft tokens, "
                 "req_ids=%s",

@@ -48,6 +48,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
 from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
+from vllm_ascend.ops.triton.reject_sample import pad_cu_for_kernel, pad_tail_to
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
@@ -365,15 +366,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight):
                     layer_module.shared_head.head = model.lm_head
 
+        # Edge-cloud MTP splits the draft model into segments that are wrapped
+        # individually by the model runner. Wrapping the whole _run_merged_draft
+        # here would try to capture cross-process communication inside the graph,
+        # which is not supported, so skip it for that case.
+        is_edge_cloud_mtp = (
+            self.method == "mtp"
+            and self.runner is not None
+            and getattr(self.runner, "_edge_cloud_enabled", False)
+        )
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
             self.update_stream = torch.npu.Stream()
-            self._runnable = ACLGraphWrapper(
-                self._run_merged_draft,
-                self.vllm_config,
-                runtime_mode=CUDAGraphMode.FULL,
-                use_eagle=self.use_eagle,
-                enable_enpu=self.enable_enpu,
-            )
+            if not is_edge_cloud_mtp:
+                self._runnable = ACLGraphWrapper(
+                    self._run_merged_draft,
+                    self.vllm_config,
+                    runtime_mode=CUDAGraphMode.FULL,
+                    use_eagle=self.use_eagle,
+                    enable_enpu=self.enable_enpu,
+                )
 
     def _maybe_share_topk_indices(self, target_language_model: nn.Module) -> None:
         if hasattr(target_language_model.model, "topk_indices_buffer"):
@@ -443,7 +454,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 pin_memory=self.runner.pin_memory,
             )
 
-        if aclgraph_runtime_mode == CUDAGraphMode.FULL and len(self.runner.attn_groups) > 0:
+        # Edge-cloud MTP: the edge side owns no draft attention layers (they
+        # run on the cloud as PPMissingLayer locally), so draft_attn_groups is
+        # empty there and no draft attention metadata can be built.
+        is_edge_cloud = getattr(self.runner, "_edge_cloud_enabled", False)
+        if (
+            aclgraph_runtime_mode == CUDAGraphMode.FULL
+            and len(self.runner.attn_groups) > 0
+            and (not is_edge_cloud or len(self.draft_attn_groups) > 0)
+        ):
             num_computed_tokens_cpu = self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
 
             # num_reqs is already the padded version
@@ -1777,22 +1796,42 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_reqs = common_attn_metadata.num_reqs
             device = valid_sampled_tokens_count.device
 
-            token_indices_to_sample = torch.empty((num_reqs,), dtype=torch.int32, device=device)
-            num_rejected_tokens_gpu = torch.empty((num_reqs,), dtype=torch.int32, device=device)
+            # Pad offset-indexed inputs/outputs so the kernel's BLOCK-wide tile
+            # accesses stay in mapped memory. On Ascend the MTE reads/writes the
+            # full BLOCK tile and applies the lane mask only afterward, so the
+            # masked tail lanes (offsets reach num_reqs+BLOCK-2) still touch DDR;
+            # with tight per-step buffers that overrun faults ("MTE address out
+            # of range" / 507035). num_reqs passed to the kernel stays the real
+            # value so the padded lanes are inert; the real rows are sliced back
+            # out below. (The non-edge-cloud path is immune only because its
+            # batch is already graph-padded; this makes edge-cloud match.)
+            _pad_n = num_reqs + _PREPARE_INPUTS_BLOCK_SIZE
+            token_indices_to_sample_k = torch.empty((_pad_n,), dtype=torch.int32, device=device)
+            num_rejected_tokens_gpu_k = torch.empty((_pad_n,), dtype=torch.int32, device=device)
+            cu_num_draft_tokens_k = pad_cu_for_kernel(
+                spec_decode_metadata.cu_num_draft_tokens, _pad_n
+            )
+            valid_sampled_tokens_count_k = pad_tail_to(valid_sampled_tokens_count, _pad_n)
+            query_start_loc_k = pad_tail_to(
+                common_attn_metadata.query_start_loc, _pad_n + 1, repeat_last=True
+            )
             num_blocks_needed = triton.cdiv(num_reqs, _PREPARE_INPUTS_BLOCK_SIZE)
             num_vector_core = get_vectorcore_num()
             grid_size = min(num_blocks_needed, num_vector_core)
             grid = (grid_size,)
 
             prepare_inputs_padded_kernel[grid](
-                spec_decode_metadata.cu_num_draft_tokens,
-                valid_sampled_tokens_count,
-                common_attn_metadata.query_start_loc,
-                token_indices_to_sample,
-                num_rejected_tokens_gpu,
+                cu_num_draft_tokens_k,
+                valid_sampled_tokens_count_k,
+                query_start_loc_k,
+                token_indices_to_sample_k,
+                num_rejected_tokens_gpu_k,
                 num_reqs,
                 BLOCK_SIZE=_PREPARE_INPUTS_BLOCK_SIZE,
             )
+            # Slice the real rows back out of the padded output buffers.
+            token_indices_to_sample = token_indices_to_sample_k[:num_reqs]
+            num_rejected_tokens_gpu = num_rejected_tokens_gpu_k[:num_reqs]
         else:
             num_draft_tokens_gpu = torch.cat(
                 [
@@ -1915,6 +1954,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
     # update full-graph params for one spec token
     def _update_full_graph_params(self, forward_context, num_tokens, draft_attn_metadatas=None):
+        # Edge-cloud MTP: the edge side owns no draft attention layers (they
+        # run on the cloud), so there is nothing to update.
+        if not self.draft_attn_groups:
+            return
         assert len(self.draft_attn_groups) > 0
         attn_backend = self.draft_attn_groups[0].backend
         update_full_graph_params(

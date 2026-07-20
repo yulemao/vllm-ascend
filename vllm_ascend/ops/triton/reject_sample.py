@@ -17,6 +17,8 @@
 
 from vllm.triton_utils import tl, triton
 
+import torch
+
 from vllm_ascend.ops.triton.triton_utils import get_element, get_vectorcore_num
 
 
@@ -29,6 +31,61 @@ def cal_grid_and_block_size(batch_size: int):
         grid = vectorcore_num
         block_size = triton.next_power_of_2(triton.cdiv(batch_size, grid))
     return grid, block_size
+
+
+def pad_tail_to(t, length: int, repeat_last: bool = False, fill: int = 0):
+    """Right-pad a tensor along dim 0 so Ascend Triton kernels never touch DDR
+    past its end.
+
+    These kernels read/write a full ``BLOCK_SIZE``-wide contiguous tile per
+    block. The vllm-ascend sampling kernels are launched with
+    ``vec_len = grid * block_size`` (no masked lanes) so that every lane is a
+    valid, in-bounds access -- a masked-off lane would otherwise still issue the
+    DDR access (and a masked cu load even returns garbage that drives an
+    out-of-bounds inner loop). Tight per-step buffers are therefore padded up to
+    ``grid * block_size`` here; the extra lanes are made inert by the data
+    (``cu_num_draft_tokens`` repeats its last value so a padded lane sees
+    ``num_draft_tokens == 0``) and any bonus token they write lands in padded
+    output rows that are sliced off by the caller.
+
+    ``repeat_last`` repeats the final row; otherwise the tail is filled with
+    ``fill``. Works for 1-D and 2-D (e.g. ``bonus_token_ids`` [B, 1]) tensors.
+    """
+    n = t.shape[0]
+    if n >= length:
+        return t
+    pad_shape = (length - n,) + tuple(t.shape[1:])
+    if repeat_last and n > 0:
+        pad = t[-1:].expand(pad_shape)
+    else:
+        pad = t.new_full(pad_shape, fill)
+    return torch.cat([t, pad], dim=0)
+
+
+def pad_cu_for_kernel(cu, length: int):
+    """Pad an inclusive-cumsum tensor (``cu_num_draft_tokens``) for kernels that
+    read it at BOTH ``offset`` and ``offset - 1``.
+
+    The real Ascend fault is the ``cu_ptr + offset - 1`` load at block 0: with
+    ``block_size >= 2`` the MTE reads a contiguous tile that includes the
+    ``offset - 1 == -1`` lane, touching the element *before* the buffer base. A
+    freshly allocated ``cu`` is page-aligned, so ``base - 1`` is in the previous
+    (often unmapped) page -> "MTE address out of range" / vector core exception.
+    Tail padding cannot help a *head* underrun.
+
+    Fix: prepend a one-element guard and return a length-``length`` VIEW that
+    starts at index 1 of the larger buffer, so the kernel's ``view_ptr - 1``
+    lands on the guard (mapped) instead of before the allocation. A tail that
+    repeats the last value is also added so padded lanes see
+    ``num_draft_tokens == 0``. The guard value is irrelevant (the kernel's
+    ``tl.where(offset == 0, 0, ...)`` discards the offset-0 result).
+    """
+    n = cu.shape[0]
+    parts = [cu[:1], cu]
+    if length > n:
+        parts.append(cu[-1:].expand(length - n))
+    full = torch.cat(parts)  # len == 1 + max(n, length)
+    return full[1 : 1 + length]
 
 
 @triton.jit(do_not_specialize=["max_spec_len"])
@@ -107,7 +164,16 @@ def rejection_greedy_sample_triton(
         is_greedy = tl.load(is_greedy_ptr + offset, mask=mask, other=0)
         is_greedy_mask = mask & (is_greedy != 0)
 
-    start_idx = tl.where(offset == 0, 0, tl.load(cu_num_draft_tokens_ptr + offset - 1, is_greedy_mask))
+    # NOTE: mask off the offset == 0 lane so we never issue a load at
+    # cu_num_draft_tokens_ptr - 1 (out of bounds). `tl.where` evaluates both
+    # branches, so without this the first lane reads one element before the
+    # buffer; for a tiny batch=1 allocation that address is unmapped and trips
+    # an NPU "MTE out of range" / vector core exception.
+    cu_prev_mask = is_greedy_mask & (offset != 0)
+    start_idx = tl.where(
+        offset == 0, 0,
+        tl.load(cu_num_draft_tokens_ptr + offset - 1, cu_prev_mask, other=0),
+    )
     end_idx = tl.load(cu_num_draft_tokens_ptr + offset, is_greedy_mask)
     num_draft_tokens = end_idx - start_idx
 
@@ -165,7 +231,13 @@ def rejection_random_sample_kernel(
     mask = offsets < vec_len
     is_greedy = tl.load(is_greedy_ptr + offsets, mask, other=1)
     not_greedy_mask = is_greedy == 0
-    start_idxs = tl.where(offsets == 0, 0, tl.load(cu_num_draft_tokens_ptr + offsets - 1, not_greedy_mask))
+    # NOTE: same cu_num_draft_tokens_ptr - 1 fix as the greedy kernel; mask
+    # off the offsets == 0 lane to avoid an out-of-bounds load on batch=1.
+    cu_prev_mask = not_greedy_mask & (offsets != 0)
+    start_idxs = tl.where(
+        offsets == 0, 0,
+        tl.load(cu_num_draft_tokens_ptr + offsets - 1, cu_prev_mask, other=0),
+    )
     end_idxs = tl.load(cu_num_draft_tokens_ptr + offsets, not_greedy_mask)
     n_num_draft_tokens = end_idxs - start_idxs
 
@@ -427,9 +499,16 @@ def rejection_greedy_sample_with_triton(
     grid,
     block_size,
 ):
+    # output_token_ids has grid*block_size rows (padded by the caller), so
+    # vec_len == grid*block_size and the kernel runs with no masked lanes; every
+    # offset-indexed buffer passed in is padded to match.
     vec_len = output_token_ids.shape[0]
 
     if min(num_draft_tokens) == 1 and max(num_draft_tokens) == 1 and is_greedy is None:
+        # This kernel indexes draft_token_ids / target_argmax directly by
+        # `offset`, so they must also reach vec_len (output is already padded).
+        draft_token_ids = pad_tail_to(draft_token_ids, vec_len)
+        target_argmax = pad_tail_to(target_argmax, vec_len)
         rejection_greedy_sample_spec_len_1_triton[(grid,)](
             output_token_ids,
             draft_token_ids,
@@ -453,16 +532,24 @@ def rejection_greedy_sample_with_triton(
 
 
 def expand_triton(batch_size, expanded_x, x, cu_num_tokens, replace_from, replace_to, max_num_tokens):
-    vec_len = batch_size
     grid, block_size = cal_grid_and_block_size(batch_size)
+    pad_len = grid * block_size
+
+    # Launch with no masked lanes (vec_len == grid*block_size). cu uses the
+    # front-guard view (avoids the offset-1 == -1 underrun at block 0) and a
+    # repeated-last tail (padded lanes see num_tokens == 0, so the inner store
+    # loop is a no-op; the caller over-allocates `expanded_x` so even that no-op
+    # tile stays mapped). The input is tail-padded (read at offset only).
+    cu_k = pad_cu_for_kernel(cu_num_tokens, pad_len)
+    x_k = pad_tail_to(x, pad_len)
 
     expand_kernel[(grid,)](
         expanded_x,
-        x,
-        cu_num_tokens,
+        x_k,
+        cu_k,
         replace_from,
         replace_to,
-        vec_len,
+        pad_len,
         MAX_NUM_TOKENS=max_num_tokens,  # To avoid recompilation.
         BLOCK_SIZE=block_size,
     )

@@ -48,7 +48,7 @@ from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
 )
-from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
+from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context, is_forward_context_available
 from vllm.distributed.parallel_state import is_edge_device, is_edge_cloud_pp_mode
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -813,7 +813,19 @@ class NPUModelRunner(GPUModelRunner):
             spec_token_num = self.speculative_config.num_speculative_tokens
             assert spec_token_num > 0
             self.decode_token_per_req = 1 + spec_token_num
-            if get_pp_group().is_last_rank:
+            # Edge-cloud MTP splits the draft model across both roles (edge
+            # owns embed+fc/norm+lm_head, cloud owns the decoder layers), so
+            # both sides need a drafter instance even though only the PP last
+            # rank owns the target model's lm_head. Use the same predicate as
+            # _should_defer_qwen_mtp_draft so the two stay consistent (covers
+            # method "mtp" on qwen-mtp models as well as "qwen3_5_mtp" /
+            # "qwen_mtp"). Note: edge_cloud_cfg / _edge_cloud_enabled are
+            # initialized later in __init__, so read the config directly here.
+            edge_cloud_mtp = (
+                self.ascend_config.edge_cloud_config.enabled
+                and self._is_qwen_mtp_spec_decode()
+            )
+            if get_pp_group().is_last_rank or edge_cloud_mtp:
                 self.drafter = self._get_drafter()
                 if self.speculative_config.method == "eagle3":
                     assert isinstance(self.drafter, AscendEagleProposer)
@@ -1410,14 +1422,33 @@ class NPUModelRunner(GPUModelRunner):
             positions, spec_step_idx
         )
         segment = self._edge_cloud_mtp_segments["c"]
-        batch_descriptor = BatchDescriptor(num_tokens)
-        cudagraph_runtime_mode = CUDAGraphMode.NONE
+
+        # Preserve the outer forward context's cudagraph mode/batch descriptor
+        # so that the cloud MTP segment can be captured/replayed together with
+        # the edge segments during warmup. Reverting to NONE here would leave
+        # the cloud segment uncaptured and force a runtime capture, which can
+        # deadlock after graph capturing is disabled. Draft tasks may also run
+        # without any outer forward context, so probe availability first
+        # (get_forward_context() asserts when unset).
+        if is_forward_context_available():
+            forward_context = get_forward_context()
+            cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
+            if hasattr(cudagraph_runtime_mode, "decode_mode"):
+                cudagraph_runtime_mode = cudagraph_runtime_mode.decode_mode()
+            batch_descriptor = forward_context.batch_descriptor
+            num_actual_tokens = getattr(
+                forward_context, "num_actual_tokens", num_tokens
+            )
+        else:
+            cudagraph_runtime_mode = CUDAGraphMode.NONE
+            batch_descriptor = BatchDescriptor(num_tokens)
+            num_actual_tokens = num_tokens
 
         with set_ascend_forward_context(
             attn_metadata=draft_attn_metadata,
             vllm_config=self.vllm_config,
             num_tokens=num_tokens,
-            num_actual_tokens=num_tokens,
+            num_actual_tokens=num_actual_tokens,
             batch_descriptor=batch_descriptor,
             aclgraph_runtime_mode=cudagraph_runtime_mode,
             is_draft_model=True,

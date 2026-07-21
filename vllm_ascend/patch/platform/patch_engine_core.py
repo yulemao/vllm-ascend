@@ -171,6 +171,7 @@ def _drain_pd_channel_inbox(self) -> None:
     if not (
         hasattr(self.scheduler, "prefills_last_ready")
         and hasattr(self.scheduler, "decodes_last_ready")
+        and hasattr(self.scheduler, "mtp_drafts_last_ready")
     ):
         return
     new_outputs = self._pp_pd_channel.consume_new_outputs()
@@ -181,10 +182,13 @@ def _drain_pd_channel_inbox(self) -> None:
             self.scheduler.prefills_last_ready.append(so)
         elif bt == BatchType.DECODE_LAST:
             self.scheduler.decodes_last_ready.append(so)
+        elif bt == BatchType.MTP_DRAFT_LAST:
+            self.scheduler.mtp_drafts_last_ready.append(so)
         else:
             logger.error(
                 "PD-separation POST_OUT received unexpected batch_type=%s; "
-                "expected PREFILL_LAST or DECODE_LAST. Dropping.",
+                "expected PREFILL_LAST, DECODE_LAST, or MTP_DRAFT_LAST. "
+                "Dropping.",
                 bt.value if bt is not None else "<none>",
             )
 
@@ -206,13 +210,14 @@ def _maybe_publish_pre_out(
     if getattr(self, "_pp_pd_channel", None) is None:
         return
     bt = scheduler_output.batch_type
-    if bt == BatchType.DECODE_FIRST:
+    if bt in (BatchType.DECODE_FIRST, BatchType.MTP_DRAFT_FIRST):
         self._pp_pd_channel.publish(scheduler_output)
     elif bt in (
         BatchType.EMPTY,
         BatchType.PREFILL_FIRST,
         BatchType.PREFILL_LAST,
         BatchType.DECODE_LAST,
+        BatchType.MTP_DRAFT_LAST,
     ):
         return
     else:
@@ -220,6 +225,19 @@ def _maybe_publish_pre_out(
             "PD-separation PRE_OUT skipping non-separated batch_type=%s",
             bt.value if bt is not None else "<none>",
         )
+
+
+def _ensure_pd_head_token(self, scheduler_output: SchedulerOutput) -> None:
+    if getattr(self, "_pp_pd_channel", None) is None:
+        return
+    if scheduler_output.batch_type not in (
+        BatchType.PREFILL_FIRST,
+        BatchType.DECODE_FIRST,
+        BatchType.MTP_DRAFT_FIRST,
+    ):
+        return
+    if not scheduler_output.head_token:
+        scheduler_output.head_token = uuid4().hex
 
 
 def _publish_pre_out_when_ready(self) -> None:
@@ -240,7 +258,10 @@ def _publish_pre_out_when_ready(self) -> None:
         return
 
     _, oldest_so, _ = batch_queue[-1]
-    if oldest_so.batch_type != BatchType.PREFILL_FIRST:
+    if oldest_so.batch_type not in (
+        BatchType.PREFILL_FIRST,
+        BatchType.MTP_DRAFT_FIRST,
+    ):
         return
 
     head_token = getattr(oldest_so, "head_token", None)
@@ -257,8 +278,9 @@ def _publish_pre_out_when_ready(self) -> None:
     ch.publish(oldest_so)
     published.add(head_token)
     logger.info(
-        "[PRE_OUT] Published PREFILL_FIRST (head_token=%s) when it became next to execute, "
+        "[PRE_OUT] Published %s (head_token=%s) when it became next to execute, "
         "queue_len=%d",
+        oldest_so.batch_type.value,
         head_token, len(batch_queue),
     )
 
@@ -332,6 +354,7 @@ def _finish_empty_batch(self, scheduler_output: SchedulerOutput):
     """Complete an EMPTY SchedulerOutput without broadcasting to workers."""
     self._stash_empty_worker_cleanup(scheduler_output)
     self._process_aborts_queue()
+    self._clear_pending_mtp_draft_for_finished_requests()
     with (
         self.log_error_detail(scheduler_output),
         self.log_iteration_details(scheduler_output),
@@ -339,6 +362,7 @@ def _finish_empty_batch(self, scheduler_output: SchedulerOutput):
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, EMPTY_MODEL_RUNNER_OUTPUT
         )
+    self._clear_pending_mtp_draft_for_finished_requests()
     return engine_core_outputs, False
 
 
@@ -356,6 +380,90 @@ def _pop_deferred_empty_batch(self) -> SchedulerOutput | None:
     if not deferred:
         return None
     return deferred.pop(0)
+
+
+def _enqueue_pending_mtp_draft_if_ready(self) -> None:
+    """Move completed/new Qwen-MTP derived work across the executor boundary."""
+    if not getattr(self, "use_spec_decode", False):
+        return
+    ready_queue = getattr(self.scheduler, "mtp_drafts_first_ready", None)
+    if ready_queue is None:
+        return
+
+    take_completed = getattr(
+        self.model_executor, "take_completed_mtp_draft_result", None
+    )
+    if take_completed is not None:
+        completed = take_completed()
+        if completed is not None:
+            draft_token_ids, _parent_scheduler_output = completed
+            self.scheduler.update_draft_token_ids(draft_token_ids)
+
+    take_pending = getattr(
+        self.model_executor,
+        "take_pending_mtp_draft_scheduler_output",
+        None,
+    )
+    if take_pending is None:
+        return
+    scheduler_output = take_pending()
+    if scheduler_output is None:
+        return
+    if scheduler_output.batch_type != BatchType.MTP_DRAFT_FIRST:
+        raise RuntimeError(
+            "Pending MTP draft must be MTP_DRAFT_FIRST, got "
+            f"{scheduler_output.batch_type}"
+        )
+    ready_queue.append(scheduler_output)
+
+
+def _clear_pending_mtp_draft_for_finished_requests(self) -> None:
+    if not getattr(self, "use_spec_decode", False):
+        return
+    finished_req_ids = set(
+        getattr(self.scheduler, "finished_req_ids", set()) or ()
+    )
+    if not finished_req_ids:
+        return
+    clear_pending = getattr(
+        self.model_executor, "clear_pending_mtp_draft_for_req_ids", None
+    )
+    if clear_pending is not None:
+        clear_pending(finished_req_ids)
+
+
+def _uses_split_qwen_mtp_draft(self) -> bool:
+    speculative_config = self.vllm_config.speculative_config
+    if (
+        getattr(self, "_pp_pd_channel", None) is None
+        or speculative_config is None
+    ):
+        return False
+    method = getattr(speculative_config, "method", None)
+    if method in ("qwen3_5_mtp", "qwen_mtp"):
+        return True
+    if method != "mtp":
+        return False
+    hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
+    return "qwen" in str(getattr(hf_config, "model_type", "")).lower()
+
+
+def _has_unresolved_qwen_mtp_parent(self) -> bool:
+    """Keep async scheduling behind a tail that still has to create draft work."""
+    if not self._uses_split_qwen_mtp_draft():
+        return False
+    batch_queue = getattr(self, "batch_queue", None)
+    if not batch_queue:
+        return False
+    for _future, scheduler_output, _exec_future in batch_queue:
+        if scheduler_output.batch_type == BatchType.DECODE_LAST:
+            return True
+        if (
+            scheduler_output.batch_type == BatchType.PREFILL_LAST
+            and getattr(scheduler_output, "is_last_prefill_chunk", True)
+        ):
+            return True
+    return False
 
 
 # =======================================================================#
@@ -377,6 +485,7 @@ def _patched_step(self):
     self._drain_pd_channel_inbox()
 
     scheduler_output = self.scheduler.schedule()
+    self._ensure_pd_head_token(scheduler_output)
 
     # [ascend insert] Forward head-segment batches on the PRE_OUT
     # (edge → cloud) channel.
@@ -402,9 +511,12 @@ def _patched_step(self):
     # Before processing the model output, process any aborts that happened
     # during the model execution.
     self._process_aborts_queue()
+    self._clear_pending_mtp_draft_for_finished_requests()
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output
     )
+    self._clear_pending_mtp_draft_for_finished_requests()
+    self._enqueue_pending_mtp_draft_if_ready()
 
     return (
         engine_core_outputs,
@@ -425,7 +537,10 @@ def _patched_step_with_batch_queue(self):
 
     model_executed = False
     deferred_scheduler_output = None
-    if self.scheduler.has_requests():
+    if (
+        self.scheduler.has_requests()
+        and not self._has_unresolved_qwen_mtp_parent()
+    ):
         # [ascend insert] Pull cloud-returned tail-segment batches into
         # the scheduler ready queues before picking the next batch.
         self._drain_pd_channel_inbox()
@@ -435,14 +550,7 @@ def _patched_step_with_batch_queue(self):
         # [ascend insert] Assign head-token for edge-cloud head-segment
         # batches so the tail-segment can be matched to the suspended
         # state.
-        if (
-            getattr(self, "_pp_pd_channel", None) is not None
-            and scheduler_output.batch_type in (
-                BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST
-            )
-            and not getattr(scheduler_output, "head_token", None)
-        ):
-            scheduler_output.head_token = uuid4().hex
+        self._ensure_pd_head_token(scheduler_output)
 
         # [ascend insert] DECODE_FIRST is published immediately to keep the
         # decode pipeline full; PREFILL_FIRST is delayed via
@@ -530,9 +638,12 @@ def _patched_step_with_batch_queue(self):
             raise RuntimeError("unexpected error")
 
     self._process_aborts_queue()
+    self._clear_pending_mtp_draft_for_finished_requests()
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output
     )
+    self._clear_pending_mtp_draft_for_finished_requests()
+    self._enqueue_pending_mtp_draft_if_ready()
 
     if deferred_empty_batch := self._pop_deferred_empty_batch():
         empty_outputs, _ = self._finish_empty_batch(deferred_empty_batch)
@@ -551,12 +662,12 @@ def _patched_step_with_batch_queue(self):
                 engine_core_outputs = empty_outputs
 
     if deferred_scheduler_output:
-        if self.use_spec_decode:
+        if self.use_spec_decode and not self._uses_split_qwen_mtp_draft():
             draft_token_ids = self.model_executor.take_draft_token_ids()
-            assert draft_token_ids is not None
-            self.scheduler.update_draft_token_ids_in_output(
-                draft_token_ids, deferred_scheduler_output
-            )
+            if draft_token_ids is not None:
+                self.scheduler.update_draft_token_ids_in_output(
+                    draft_token_ids, deferred_scheduler_output
+                )
         grammar_output = self.scheduler.get_grammar_bitmask(
             deferred_scheduler_output
         )
@@ -674,6 +785,7 @@ def install() -> None:
     EngineCore.__init__ = _patched_engine_core_init
     EngineCore._drain_pd_channel_inbox = _drain_pd_channel_inbox
     EngineCore._maybe_publish_pre_out = _maybe_publish_pre_out
+    EngineCore._ensure_pd_head_token = _ensure_pd_head_token
     EngineCore._publish_pre_out_when_ready = _publish_pre_out_when_ready
     EngineCore._clear_published_pre_out_token = _clear_published_pre_out_token
     EngineCore._needs_sample_tokens = _needs_sample_tokens
@@ -682,6 +794,16 @@ def install() -> None:
     EngineCore._finish_empty_batch = _finish_empty_batch
     EngineCore._defer_empty_batch = _defer_empty_batch
     EngineCore._pop_deferred_empty_batch = _pop_deferred_empty_batch
+    EngineCore._enqueue_pending_mtp_draft_if_ready = (
+        _enqueue_pending_mtp_draft_if_ready
+    )
+    EngineCore._clear_pending_mtp_draft_for_finished_requests = (
+        _clear_pending_mtp_draft_for_finished_requests
+    )
+    EngineCore._uses_split_qwen_mtp_draft = _uses_split_qwen_mtp_draft
+    EngineCore._has_unresolved_qwen_mtp_parent = (
+        _has_unresolved_qwen_mtp_parent
+    )
     EngineCore.step = _patched_step
     EngineCore.step_with_batch_queue = _patched_step_with_batch_queue
     EngineCore.shutdown = _patched_engine_core_shutdown

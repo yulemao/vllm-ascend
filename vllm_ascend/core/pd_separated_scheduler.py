@@ -165,6 +165,8 @@ class PDSeparatedScheduler(Scheduler):
         # Populated by EngineCore.step() before calling self.schedule().
         self.prefills_last_ready: deque[SchedulerOutput] = deque()
         self.decodes_last_ready: deque[SchedulerOutput] = deque()
+        self.mtp_drafts_first_ready: deque[SchedulerOutput] = deque()
+        self.mtp_drafts_last_ready: deque[SchedulerOutput] = deque()
 
         self._step_counter: int = 0
 
@@ -175,6 +177,9 @@ class PDSeparatedScheduler(Scheduler):
         self.prefill_inflight_count: int = 0
         self.decode_inflight_limit: int = 1
         self.decode_inflight_count: int = 0
+        self.mtp_draft_inflight_limit: int = 1
+        self.mtp_draft_inflight_count: int = 0
+        self.mtp_draft_remote_pending_count: int = 0
 
         # Phase6 data-plane channel manager.  Two prefill hidden channels are
         # available for 2P1D; decode uses a dedicated fixed channel.
@@ -458,6 +463,7 @@ class PDSeparatedScheduler(Scheduler):
         is_tail = scheduler_output.batch_type in (
             BatchType.PREFILL_LAST,
             BatchType.DECODE_LAST,
+            BatchType.MTP_DRAFT_LAST,
         )
         if has_work or is_tail:
             self._log_scheduler_state(state, scheduler_output.batch_type)
@@ -480,6 +486,8 @@ class PDSeparatedScheduler(Scheduler):
         self._decode_first_only_start_ts = None
 
     def _pick_decode_first_only_or_empty(self) -> SchedulerOutput | None:
+        if self._has_mtp_draft_work():
+            return None
         if not self._decode_first_only_active():
             return None
         if self._can_schedule_decode_first():
@@ -509,6 +517,12 @@ class PDSeparatedScheduler(Scheduler):
                     "requests. Prefill work will be deferred until resources are freed."
                 )
                 self.finished_req_ids.update(so.finished_req_ids)
+            if self.prefills_last_ready:
+                return self._pick_prefill_last_batch()
+            if self._can_schedule_mtp_draft_first():
+                return self._pick_mtp_draft_first_batch()
+            if self.mtp_drafts_last_ready:
+                return self._pick_mtp_draft_last_batch()
             if self.decodes_last_ready and self._can_schedule_decode_last():
                 return self._pick_decode_last_batch()
             if self._can_schedule_decode_first():
@@ -529,19 +543,27 @@ class PDSeparatedScheduler(Scheduler):
                 self.finished_req_ids.update(so.finished_req_ids)
             if self.decodes_last_ready and self._can_schedule_decode_last():
                 return self._pick_decode_last_batch()
-            if self._can_schedule_decode_first():
-                return self._pick_decode_first_batch()
             if self.prefills_last_ready:
                 return self._pick_prefill_last_batch()
+            if self._can_schedule_mtp_draft_first():
+                return self._pick_mtp_draft_first_batch()
+            if self.mtp_drafts_last_ready:
+                return self._pick_mtp_draft_last_batch()
+            if self._can_schedule_decode_first():
+                return self._pick_decode_first_batch()
             return self._make_empty_batch()
 
         # HIGH: D尾 > D首 > P尾 > Empty. New P首 is forbidden.
         if self.decodes_last_ready and self._can_schedule_decode_last():
             return self._pick_decode_last_batch()
-        if self._can_schedule_decode_first():
-            return self._pick_decode_first_batch()
         if self.prefills_last_ready:
             return self._pick_prefill_last_batch()
+        if self._can_schedule_mtp_draft_first():
+            return self._pick_mtp_draft_first_batch()
+        if self.mtp_drafts_last_ready:
+            return self._pick_mtp_draft_last_batch()
+        if self._can_schedule_decode_first():
+            return self._pick_decode_first_batch()
         return self._make_empty_batch()
 
     def is_waiting_for_remote_tail(self) -> bool:
@@ -552,10 +574,17 @@ class PDSeparatedScheduler(Scheduler):
         instead of tight-loop scheduling EMPTY batches.
         """
         return bool(
-            (self.prefill_inflight_count > 0 or self.decode_inflight_count > 0)
+            (
+                self.prefill_inflight_count > 0
+                or self.decode_inflight_count > 0
+                or self.mtp_draft_inflight_count > 0
+                or self.mtp_draft_remote_pending_count > 0
+            )
             and not self.prefills_last_ready
             and not self.decodes_last_ready
+            and not self.mtp_drafts_last_ready
             and not self._can_schedule_prefill_first()
+            and not self._can_schedule_mtp_draft_first()
             and not self._can_schedule_decode_first()
         )
 
@@ -589,6 +618,18 @@ class PDSeparatedScheduler(Scheduler):
         return bool(
             self.running
             and self.decode_inflight_count < self.decode_inflight_limit
+            and self.mtp_draft_inflight_count == 0
+            and self.mtp_draft_remote_pending_count == 0
+            and not self.mtp_drafts_first_ready
+            and not self.mtp_drafts_last_ready
+            and not self._force_decode_last
+        )
+
+    def _can_schedule_mtp_draft_first(self) -> bool:
+        return bool(
+            self.mtp_drafts_first_ready
+            and self.mtp_draft_inflight_count < self.mtp_draft_inflight_limit
+            and self.decode_inflight_count == 0
             and not self._force_decode_last
         )
 
@@ -602,8 +643,12 @@ class PDSeparatedScheduler(Scheduler):
                 f"prefill_last_pending[]: {len(self.prefill_last_pending)}, "
                 f"running[]: {len(self.running)}, "
                 f"prefills_last_ready[]: {len(self.prefills_last_ready)}, "
+                f"mtp_drafts_first_ready[]: {len(self.mtp_drafts_first_ready)}, "
+                f"mtp_drafts_last_ready[]: {len(self.mtp_drafts_last_ready)}, "
                 f"decodes_last_ready[]: {len(self.decodes_last_ready)}, "
                 f"prefill_inflight: {self.prefill_inflight_count}/{self.prefill_inflight_limit}, "
+                f"mtp_draft_inflight: {self.mtp_draft_inflight_count}/{self.mtp_draft_inflight_limit}, "
+                f"mtp_draft_remote_pending: {self.mtp_draft_remote_pending_count}, "
                 f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}, "
                 f"chunk_flights: {len(self._prefill_flight_by_token)}, "
                 f"pending_tails: {self._total_pending_tails()}, "
@@ -617,8 +662,12 @@ class PDSeparatedScheduler(Scheduler):
                 f"prefill_last_pending[]: {len(self.prefill_last_pending)}, "
                 f"running[]: {len(self.running)}, "
                 f"prefills_last_ready[]: {len(self.prefills_last_ready)}, "
+                f"mtp_drafts_first_ready[]: {len(self.mtp_drafts_first_ready)}, "
+                f"mtp_drafts_last_ready[]: {len(self.mtp_drafts_last_ready)}, "
                 f"decodes_last_ready[]: {len(self.decodes_last_ready)}, "
                 f"prefill_inflight: {self.prefill_inflight_count}/{self.prefill_inflight_limit}, "
+                f"mtp_draft_inflight: {self.mtp_draft_inflight_count}/{self.mtp_draft_inflight_limit}, "
+                f"mtp_draft_remote_pending: {self.mtp_draft_remote_pending_count}, "
                 f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}",
             )
 
@@ -1026,6 +1075,96 @@ class PDSeparatedScheduler(Scheduler):
                 f"{scheduler_output.hidden_channel}"
             )
 
+    def _validate_mtp_draft_tail_channel(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        if not scheduler_output.head_token:
+            raise RuntimeError("MTP_DRAFT_LAST missing head_token")
+        if not scheduler_output.mtp_draft_task_id:
+            raise RuntimeError("MTP_DRAFT_LAST missing mtp_draft_task_id")
+        if scheduler_output.draft_step_idx is None:
+            raise RuntimeError("MTP_DRAFT_LAST missing draft_step_idx")
+        if scheduler_output.hidden_channel != HiddenChannelType.DECODE:
+            raise RuntimeError(
+                "MTP_DRAFT_LAST expects decode hidden channel, got "
+                f"{scheduler_output.hidden_channel}"
+            )
+
+    def _pick_mtp_draft_first_batch(self) -> SchedulerOutput:
+        if not self.mtp_drafts_first_ready:
+            return self._make_empty_batch()
+        scheduler_output = self.mtp_drafts_first_ready.popleft()
+        scheduler_output.batch_type = BatchType.MTP_DRAFT_FIRST
+        if scheduler_output.head_token is None:
+            scheduler_output.head_token = uuid4().hex
+        scheduler_output.hidden_channel = HiddenChannelType.DECODE
+        self.mtp_draft_inflight_count += 1
+        self.mtp_draft_remote_pending_count += 1
+        return scheduler_output
+
+    def _pick_mtp_draft_last_batch(self) -> SchedulerOutput:
+        while self.mtp_drafts_last_ready:
+            scheduler_output = self.mtp_drafts_last_ready.popleft()
+            if scheduler_output.batch_type != BatchType.MTP_DRAFT_LAST:
+                raise RuntimeError(
+                    "mtp_drafts_last_ready expects MTP_DRAFT_LAST, got "
+                    f"{scheduler_output.batch_type}"
+                )
+            self._validate_mtp_draft_tail_channel(scheduler_output)
+            if self._is_stale_mtp_draft_output(scheduler_output):
+                self.mtp_draft_remote_pending_count = max(
+                    0, self.mtp_draft_remote_pending_count - 1
+                )
+                logger.info(
+                    "[PD] drop stale MTP_DRAFT_LAST task_id=%s step=%s",
+                    scheduler_output.mtp_draft_task_id,
+                    scheduler_output.draft_step_idx,
+                )
+                continue
+            return scheduler_output
+        return self._make_empty_batch()
+
+    @staticmethod
+    def _scheduler_output_intersects_req_ids(
+        scheduler_output: SchedulerOutput, req_ids: set[str]
+    ) -> bool:
+        if scheduler_output.parent_req_id in req_ids:
+            return True
+        return any(
+            req_id in req_ids
+            for req_id in scheduler_output.num_scheduled_tokens
+        )
+
+    def _drop_stale_mtp_drafts_for_req_ids(self, req_ids: set[str]) -> None:
+        if not req_ids:
+            return
+        self.mtp_drafts_first_ready = deque(
+            output
+            for output in self.mtp_drafts_first_ready
+            if not self._scheduler_output_intersects_req_ids(output, req_ids)
+        )
+        kept_last: deque[SchedulerOutput] = deque()
+        dropped_last = 0
+        for output in self.mtp_drafts_last_ready:
+            if self._scheduler_output_intersects_req_ids(output, req_ids):
+                dropped_last += 1
+            else:
+                kept_last.append(output)
+        self.mtp_drafts_last_ready = kept_last
+        self.mtp_draft_remote_pending_count = max(
+            0, self.mtp_draft_remote_pending_count - dropped_last
+        )
+
+    def _is_stale_mtp_draft_output(
+        self, scheduler_output: SchedulerOutput
+    ) -> bool:
+        req_ids = set(scheduler_output.num_scheduled_tokens)
+        if scheduler_output.parent_req_id:
+            req_ids.add(scheduler_output.parent_req_id)
+        return bool(req_ids) and all(
+            req_id not in self.requests for req_id in req_ids
+        )
+
     def _pick_decode_last_batch(self) -> SchedulerOutput:
         if not self.decodes_last_ready:
             return self._make_empty_batch()
@@ -1357,6 +1496,25 @@ class PDSeparatedScheduler(Scheduler):
                 f"[PD] update_from_output DECODE_FIRST done, "
                 f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}",
             )
+        if scheduler_output.batch_type == BatchType.MTP_DRAFT_FIRST:
+            self.mtp_draft_inflight_count = max(
+                0, self.mtp_draft_inflight_count - 1
+            )
+            logger.info(
+                "[PD] update_from_output MTP_DRAFT_FIRST done, "
+                "mtp_draft_inflight: %d/%d",
+                self.mtp_draft_inflight_count,
+                self.mtp_draft_inflight_limit,
+            )
+        if scheduler_output.batch_type == BatchType.MTP_DRAFT_LAST:
+            self.mtp_draft_remote_pending_count = max(
+                0, self.mtp_draft_remote_pending_count - 1
+            )
+            logger.info(
+                "[PD] update_from_output MTP_DRAFT_LAST done, "
+                "mtp_draft_remote_pending: %d",
+                self.mtp_draft_remote_pending_count,
+            )
         if scheduler_output.batch_type == BatchType.DECODE_LAST:
             # decode_inflight_count 已在 DECODE_FIRST 的 update_from_output
             # 中释放，此处不再重复减 1。
@@ -1415,10 +1573,23 @@ class PDSeparatedScheduler(Scheduler):
             + len(self.prefill_last_pending)
         )
 
+    def _has_mtp_draft_work(self) -> bool:
+        return bool(
+            self.mtp_drafts_first_ready
+            or self.mtp_drafts_last_ready
+            or self.mtp_draft_inflight_count > 0
+            or self.mtp_draft_remote_pending_count > 0
+        )
+
+    def has_requests(self) -> bool:
+        return super().has_requests() or self._has_mtp_draft_work()
+
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
     ) -> list[tuple[str, int]]:
         result = super().finish_requests(request_ids, finished_status)
+        finished_req_ids = {req_id for req_id, _client_index in result}
+        self._drop_stale_mtp_drafts_for_req_ids(finished_req_ids)
         if isinstance(request_ids, str):
             request_ids = (request_ids,)
         elif request_ids is not None:

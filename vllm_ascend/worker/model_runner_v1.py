@@ -21,13 +21,14 @@ import math
 import os
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
 from multiprocessing import Manager
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -51,7 +52,12 @@ from vllm.distributed.parallel_state import (
     is_edge_device,
     set_edge_cloud_layer_range,
 )
-from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    ForwardContext,
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -67,7 +73,11 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
-from vllm.v1.core.sched.output import BatchType, SchedulerOutput
+from vllm.v1.core.sched.output import (
+    BatchType,
+    HiddenChannelType,
+    SchedulerOutput,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -82,6 +92,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
+    DraftTokenIds,
     ECConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
@@ -481,6 +492,8 @@ class NPUModelRunner(GPUModelRunner):
         # head_token.  Each entry holds the minimal context needed to verify
         # that a later tail-segment batch matches its head segment.
         self._pending_head_states: dict[str, "HeadState"] = {}
+        self._pending_mtp_draft_contexts: dict[str, dict[str, Any]] = {}
+        self._pending_mtp_draft_task_ids: deque[str] = deque()
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -1292,6 +1305,24 @@ class NPUModelRunner(GPUModelRunner):
             return
 
         num_draft_layers = len(predictor.layers)
+        if method == "mtp":
+            num_spec_tokens = int(self.num_spec_tokens or 0)
+            if num_spec_tokens <= 0:
+                raise ValueError(
+                    "Qwen-MTP edge-cloud scheduling requires a positive "
+                    "num_speculative_tokens"
+                )
+            if num_draft_layers <= 0:
+                raise ValueError(
+                    "Qwen-MTP edge-cloud scheduling requires at least one "
+                    "MTP layer"
+                )
+            logger.info(
+                "[EdgeCloud] Qwen-MTP scheduling: draft_steps=%d, "
+                "mtp_layers=%d",
+                num_spec_tokens,
+                num_draft_layers,
+            )
 
         # Capture module ids before sharding so we can clean stale
         # static_forward_context entries that point to removed layers.
@@ -2538,6 +2569,376 @@ class NPUModelRunner(GPUModelRunner):
 
         return draft_token_ids
 
+    def _is_qwen_mtp_spec_decode(self) -> bool:
+        speculative_config = self.speculative_config
+        if speculative_config is None:
+            return False
+        method = getattr(speculative_config, "method", None)
+        if method in ("qwen3_5_mtp", "qwen_mtp"):
+            return True
+        if method != "mtp":
+            return False
+        hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
+        return "qwen" in str(getattr(hf_config, "model_type", "")).lower()
+
+    def _should_defer_qwen_mtp_draft(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> bool:
+        return bool(
+            self._is_qwen_mtp_spec_decode()
+            and self._edge_cloud_enabled
+            and is_edge_device()
+            and self.drafter is not None
+            and scheduler_output.batch_type in (
+                BatchType.PREFILL_LAST,
+                BatchType.DECODE_LAST,
+            )
+        )
+
+    def _queue_pending_mtp_draft_task(self, task_id: str) -> None:
+        if task_id not in self._pending_mtp_draft_task_ids:
+            self._pending_mtp_draft_task_ids.append(task_id)
+
+    def _stash_pending_mtp_draft_context(
+        self,
+        scheduler_output: "SchedulerOutput",
+        sampled_token_ids: torch.Tensor | list[list[int]],
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        spec_decode_common_attn_metadata: AscendCommonAttentionMetadata | None,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: torch.Tensor | None,
+        sample_hidden_states: torch.Tensor | None,
+        batch_desc: BatchDescriptor | None,
+        use_padded_batch: bool,
+    ) -> None:
+        task_id = uuid4().hex
+        context: dict[str, Any] = {
+            "scheduler_output": scheduler_output,
+            "sampled_token_ids": sampled_token_ids,
+            "sampling_metadata": self.input_batch.sampling_metadata,
+            "spec_decode_metadata": spec_decode_metadata,
+            "spec_decode_common_attn_metadata": spec_decode_common_attn_metadata,
+            "positions": positions,
+            "num_scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
+            "hidden_states": hidden_states,
+            "aux_hidden_states": aux_hidden_states,
+            "sample_hidden_states": sample_hidden_states,
+            "target_model_batch_desc": batch_desc,
+            "use_padded_batch": use_padded_batch,
+            "req_ids": tuple(self.input_batch.req_ids),
+            "mtp_draft_task_id": task_id,
+            "draft_step_idx": 0,
+        }
+        self._pending_mtp_draft_contexts[task_id] = context
+        self._queue_pending_mtp_draft_task(task_id)
+
+        if torch.is_tensor(sampled_token_ids):
+            assert self.drafter is not None
+            next_token_ids, valid_sampled_tokens_count = (
+                self.drafter.prepare_next_token_ids_padded(
+                    sampled_token_ids,
+                    self.requests,
+                    self.input_batch,
+                    self.discard_request_indices.gpu,
+                    self.num_discarded_requests,
+                )
+            )
+            self._copy_valid_sampled_token_count(
+                next_token_ids, valid_sampled_tokens_count
+            )
+            context["next_token_ids"] = next_token_ids
+        self._draft_token_ids = None
+
+    def take_pending_mtp_draft_scheduler_output(
+        self,
+    ) -> "SchedulerOutput | None":
+        context = None
+        task_id = None
+        while self._pending_mtp_draft_task_ids:
+            candidate_task_id = self._pending_mtp_draft_task_ids.popleft()
+            candidate = self._pending_mtp_draft_contexts.get(
+                candidate_task_id
+            )
+            if (
+                candidate is None
+                or candidate.get("enqueued", False)
+                or candidate.get("draft_complete", False)
+            ):
+                continue
+            context = candidate
+            task_id = candidate_task_id
+            break
+        if context is None or task_id is None:
+            return None
+
+        req_ids = tuple(context.get("req_ids") or ())
+        if not req_ids:
+            self._pending_mtp_draft_contexts.pop(task_id, None)
+            return None
+        draft_step_idx = int(context.get("draft_step_idx", 0) or 0)
+        context["enqueued"] = True
+        return replace(
+            context["scheduler_output"],
+            batch_type=BatchType.MTP_DRAFT_FIRST,
+            head_token=None,
+            hidden_channel=HiddenChannelType.DECODE,
+            parent_req_id=req_ids[0],
+            mtp_draft_task_id=task_id,
+            draft_step_idx=draft_step_idx,
+        )
+
+    def take_completed_mtp_draft_result(
+        self,
+    ) -> "tuple[DraftTokenIds, SchedulerOutput] | None":
+        for task_id, context in list(
+            self._pending_mtp_draft_contexts.items()
+        ):
+            if not context.get("draft_complete", False):
+                continue
+            draft_steps = context.get("draft_token_id_steps") or []
+            if len(draft_steps) < self.num_spec_tokens:
+                continue
+            draft_token_tensor = torch.stack(
+                draft_steps[: self.num_spec_tokens], dim=1
+            )
+            result = DraftTokenIds(
+                list(context["req_ids"]),
+                draft_token_tensor.detach().cpu().tolist(),
+            )
+            parent_scheduler_output = context["scheduler_output"]
+            self._pending_mtp_draft_contexts.pop(task_id, None)
+            return result, parent_scheduler_output
+        return None
+
+    def clear_pending_mtp_draft_for_req_ids(
+        self, req_ids: set[str] | list[str]
+    ) -> None:
+        req_id_set = set(req_ids)
+        stale_task_ids = [
+            task_id
+            for task_id, context in self._pending_mtp_draft_contexts.items()
+            if req_id_set.intersection(context.get("req_ids") or ())
+        ]
+        for task_id in stale_task_ids:
+            self._pending_mtp_draft_contexts.pop(task_id, None)
+        if stale_task_ids:
+            stale = set(stale_task_ids)
+            self._pending_mtp_draft_task_ids = deque(
+                task_id
+                for task_id in self._pending_mtp_draft_task_ids
+                if task_id not in stale
+            )
+
+    def _get_pending_mtp_draft_context(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> dict[str, Any]:
+        task_id = scheduler_output.mtp_draft_task_id
+        if task_id is None:
+            raise RuntimeError("MTP_DRAFT batch missing mtp_draft_task_id")
+        context = self._pending_mtp_draft_contexts.get(task_id)
+        if context is None:
+            raise RuntimeError(
+                "MTP_DRAFT batch has no pending draft context: "
+                f"task_id={task_id}"
+            )
+        return context
+
+    @staticmethod
+    def _select_pending_mtp_rows(
+        tensor: torch.Tensor, num_reqs: int
+    ) -> torch.Tensor:
+        if tensor.shape[0] == num_reqs:
+            return tensor
+        return tensor[-num_reqs:]
+
+    def _prepare_mtp_edge_step_inputs(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        context = self._get_pending_mtp_draft_context(scheduler_output)
+        draft_step_idx = int(scheduler_output.draft_step_idx or 0)
+        if draft_step_idx > 0:
+            return (
+                context["last_draft_token_ids"],
+                context["last_draft_positions"] + 1,
+                context["last_draft_hidden_states"],
+                draft_step_idx,
+            )
+
+        sampled_token_ids = context["sampled_token_ids"]
+        num_reqs = len(context["req_ids"])
+        if torch.is_tensor(sampled_token_ids):
+            assert self.drafter is not None
+            input_ids = context.get("next_token_ids")
+            if input_ids is None:
+                input_ids, _ = self.drafter.prepare_next_token_ids_padded(
+                    sampled_token_ids,
+                    self.requests,
+                    self.input_batch,
+                    self.discard_request_indices.gpu,
+                    self.num_discarded_requests,
+                )
+        else:
+            input_ids_list = []
+            for req_idx, req_id in enumerate(context["req_ids"]):
+                sampled_tokens = sampled_token_ids[req_idx]
+                input_ids_list.append(
+                    sampled_tokens[-1]
+                    if sampled_tokens
+                    else self.requests[req_id].get_token_id(
+                        int(self.input_batch.num_tokens_no_spec[req_idx]) - 1
+                    )
+                )
+            input_ids = torch.tensor(
+                input_ids_list, dtype=torch.long, device=self.device
+            )
+
+        positions = context["positions"]
+        positions = (
+            positions[:, -num_reqs:]
+            if self.uses_mrope
+            else self._select_pending_mtp_rows(positions, num_reqs)
+        )
+        hidden_states = context.get("sample_hidden_states")
+        if hidden_states is None:
+            hidden_states = context["hidden_states"]
+        hidden_states = self._select_pending_mtp_rows(
+            hidden_states, num_reqs
+        )
+        return input_ids, positions, hidden_states, draft_step_idx
+
+    def _run_mtp_edge_first_segment(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> IntermediateTensors:
+        context = self._get_pending_mtp_draft_context(scheduler_output)
+        input_ids, positions, hidden_states, draft_step_idx = (
+            self._prepare_mtp_edge_step_inputs(scheduler_output)
+        )
+        segment = self._edge_cloud_draft_segments["a"]
+        output = segment(
+            input_ids=input_ids,
+            positions=positions,
+            hidden_states=hidden_states,
+            spec_step_idx=draft_step_idx,
+        )
+        if not isinstance(output, IntermediateTensors):
+            raise RuntimeError("Qwen-MTP first segment returned no intermediates")
+        output["positions"] = positions
+        output["spec_step_idx"] = torch.tensor(
+            draft_step_idx, dtype=torch.int64, device="cpu"
+        )
+        context["current_mtp_positions"] = positions
+        return output
+
+    def _compute_mtp_draft_token_ids(
+        self, hidden_states: torch.Tensor, draft_step_idx: int
+    ) -> torch.Tensor:
+        assert self.drafter is not None and self.drafter.model is not None
+        mtp_model = self.drafter.model
+        if hasattr(mtp_model, "compute_logits"):
+            try:
+                logits = mtp_model.compute_logits(
+                    hidden_states, draft_step_idx
+                )
+            except TypeError:
+                logits = mtp_model.compute_logits(hidden_states)
+        else:
+            logits = mtp_model.logits_processor(
+                mtp_model.lm_head, hidden_states
+            )
+        if lmhead_tp_enable():
+            logits = logits[: hidden_states.shape[0]]
+        return logits.argmax(dim=-1)
+
+    @staticmethod
+    def _validate_mtp_payload_identity(
+        scheduler_output: "SchedulerOutput", tensor_dict: dict[str, Any]
+    ) -> None:
+        expected_task_id = scheduler_output.mtp_draft_task_id
+        actual_task_id = tensor_dict.get("mtp_draft_task_id")
+        if expected_task_id is not None and actual_task_id != expected_task_id:
+            raise RuntimeError(
+                "MTP_DRAFT payload task mismatch: "
+                f"expected={expected_task_id}, got={actual_task_id}"
+            )
+        expected_step = int(scheduler_output.draft_step_idx or 0)
+        for field in ("draft_step_idx", "spec_step_idx"):
+            actual_step = tensor_dict.get(field)
+            if torch.is_tensor(actual_step):
+                actual_step = int(actual_step.item())
+            if actual_step is not None and int(actual_step) != expected_step:
+                raise RuntimeError(
+                    f"MTP_DRAFT payload {field} mismatch: "
+                    f"expected={expected_step}, got={actual_step}"
+                )
+        actual_head_token = tensor_dict.get("head_token")
+        if (
+            scheduler_output.head_token is not None
+            and actual_head_token != scheduler_output.head_token
+        ):
+            raise RuntimeError(
+                "MTP_DRAFT payload head_token mismatch: "
+                f"expected={scheduler_output.head_token}, "
+                f"got={actual_head_token}"
+            )
+
+    def _run_mtp_edge_last_segment(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors,
+    ) -> ModelRunnerOutput:
+        context = self._get_pending_mtp_draft_context(scheduler_output)
+        draft_step_idx = int(scheduler_output.draft_step_idx or 0)
+        positions = context.get("current_mtp_positions")
+        if positions is None:
+            positions = intermediate_tensors.tensors.get("positions")
+        if positions is None:
+            raise RuntimeError("MTP_DRAFT_LAST missing positions")
+        num_tokens = positions.shape[-1] if self.uses_mrope else positions.shape[0]
+        intermediate_tensors = (
+            self._sync_edge_cloud_draft_intermediate_tensors(
+                num_tokens, intermediate_tensors
+            )
+        )
+        segment = self._edge_cloud_draft_segments["e"]
+        hidden_states = segment(
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            spec_step_idx=draft_step_idx,
+        )
+        if not torch.is_tensor(hidden_states):
+            raise RuntimeError("Qwen-MTP last segment returned no hidden states")
+        draft_token_ids = self._compute_mtp_draft_token_ids(
+            hidden_states, draft_step_idx
+        )
+        context["last_draft_hidden_states"] = hidden_states
+        context["last_draft_positions"] = positions
+        context["last_draft_token_ids"] = draft_token_ids
+        draft_steps = context.setdefault("draft_token_id_steps", [])
+        if len(draft_steps) != draft_step_idx:
+            raise RuntimeError(
+                "MTP_DRAFT step order mismatch: "
+                f"expected={len(draft_steps)}, got={draft_step_idx}"
+            )
+        draft_steps.append(draft_token_ids)
+        next_step_idx = draft_step_idx + 1
+        if next_step_idx < self.num_spec_tokens:
+            context["draft_step_idx"] = next_step_idx
+            context["enqueued"] = False
+            assert scheduler_output.mtp_draft_task_id is not None
+            self._queue_pending_mtp_draft_task(
+                scheduler_output.mtp_draft_task_id
+            )
+        else:
+            context["draft_complete"] = True
+            self._draft_token_ids = torch.stack(draft_steps, dim=1)
+
+        req_ids = list(context["req_ids"])
+        return ModelRunnerOutput(
+            req_ids=req_ids,
+            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+        )
+
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
     ) -> None:
@@ -3260,6 +3661,99 @@ class NPUModelRunner(GPUModelRunner):
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         if self._edge_cloud_enabled and not self.parallel_config.is_edge_node:
+            # Eagle3 still generates its draft synchronously from the parent
+            # verify step. Receive and run that middle segment before the
+            # accepted-token control payload sent later by the edge sampler.
+            if (
+                self.speculative_config
+                and self.speculative_config.method == "eagle3"
+                and hasattr(self, "_edge_cloud_draft_segments")
+                and "c" in self._edge_cloud_draft_segments
+            ):
+                self._run_draft_cloud_segment()
+
+            # Sampling only runs on the edge, but the cloud must retain the
+            # rejection-corrected state for its next target/draft forward.
+            if (
+                self.speculative_config
+                and (
+                    self.model_config.is_hybrid
+                    or self.speculative_config.method in ("mtp", "eagle3")
+                )
+                and self._last_scheduler_output is not None
+            ):
+                pp_group = get_pp_group()
+                if pp_group.world_size == 2:
+                    tensor_dict, recv_handles, recv_postprocess = (
+                        pp_group.irecv_tensor_dict()
+                    )
+                    for handle in recv_handles:
+                        handle.wait()
+                    for postprocess in recv_postprocess:
+                        postprocess()
+                else:
+                    tensor_dict = None
+
+                tensor_dict = get_tp_group().broadcast_object(
+                    tensor_dict, src=0
+                )
+                assert tensor_dict is not None
+                num_accepted = tensor_dict["num_accepted_tokens"].to(
+                    self.device
+                )
+                num_reqs = num_accepted.size(0)
+                self.num_accepted_tokens.gpu[:num_reqs] = num_accepted
+
+                if (
+                    self.speculative_config.method in ("mtp", "eagle3")
+                    and "valid_sampled_token_count" in tensor_dict
+                ):
+                    self.valid_sampled_token_count_gpu = tensor_dict[
+                        "valid_sampled_token_count"
+                    ].to(self.device)
+                    self.input_batch.prev_req_id_to_index = {
+                        req_id: i
+                        for i, req_id in enumerate(self.input_batch.req_ids)
+                    }
+
+                if self.model_config.is_hybrid:
+                    if self.cache_config.mamba_cache_mode == "align":
+                        accepted_counts = (
+                            self.num_accepted_tokens.gpu[:num_reqs]
+                            .cpu()
+                            .numpy()
+                        )
+                        for i, num_tokens in enumerate(accepted_counts):
+                            self.input_batch.num_accepted_tokens_cpu[i] = (
+                                num_tokens
+                            )
+                        mamba_utils.postprocess_mamba(
+                            self._last_scheduler_output,
+                            self.kv_cache_config,
+                            self.cache_config,
+                            self.input_batch,
+                            self.requests,
+                            self.mamba_state_idx,
+                            self.compilation_config.static_forward_context,
+                            self.model.get_mamba_state_copy_func(),
+                            self._get_mamba_copy_bufs(),
+                        )
+                    else:
+                        self.input_batch.num_accepted_tokens_cpu_tensor[
+                            :num_reqs
+                        ].copy_(
+                            self.num_accepted_tokens.gpu[:num_reqs],
+                            non_blocking=True,
+                        )
+                else:
+                    self.input_batch.num_accepted_tokens_cpu_tensor[
+                        :num_reqs
+                    ].copy_(
+                        self.num_accepted_tokens.gpu[:num_reqs],
+                        non_blocking=True,
+                    )
+
+        if self._edge_cloud_enabled and not self.parallel_config.is_edge_node:
             # Cloud workers do not own segment_e / LM head / sampler in the
             # edge-cloud PD-separation topology. When the edge EngineCore
             # issues sample_tokens via collective_rpc, every worker dequeues
@@ -3293,99 +3787,6 @@ class NPUModelRunner(GPUModelRunner):
                 if not self._edge_cloud_enabled:
                     self._pp_receive_prev_sampled_token_ids_to_input_batch()
             if not kv_connector_output:
-                if (
-                    self._edge_cloud_enabled
-                    and self.edge_cloud_cfg.role == "cloud"
-                    and self.speculative_config
-                    and self.speculative_config.method in ("mtp", "eagle3")
-                    and hasattr(self, "_edge_cloud_draft_segments")
-                    and "c" in self._edge_cloud_draft_segments
-                ):
-                    self._run_draft_cloud_segment()
-
-                # Edge-cloud sync: receive num_accepted_tokens (and optionally
-                # valid_sampled_token_count) from edge so that cloud can update
-                # speculative-decoding state. This is needed in both
-                # embedding_only and head_tail modes because sampling only runs
-                # on the edge, while the cloud prepares its next target/draft
-                # forward independently.
-                if (
-                    self._edge_cloud_enabled
-                    and self.edge_cloud_cfg.role == "cloud"
-                    and self.speculative_config
-                    and (
-                        self.model_config.is_hybrid
-                        or self.speculative_config.method in ("mtp", "eagle3")
-                    )
-                    and self._last_scheduler_output is not None
-                ):
-                    pp_group = get_pp_group()
-                    if pp_group.world_size == 2:
-                        tensor_dict, recv_handles, recv_postprocess = (
-                            pp_group.irecv_tensor_dict()
-                        )
-                        for handle in recv_handles:
-                            handle.wait()
-                        for postprocess in recv_postprocess:
-                            postprocess()
-                    else:
-                        tensor_dict = None
-
-                    tensor_dict = get_tp_group().broadcast_object(
-                        tensor_dict, src=0
-                    )
-                    assert tensor_dict is not None
-                    num_accepted = tensor_dict["num_accepted_tokens"].to(self.device)
-                    num_reqs = num_accepted.size(0)
-                    self.num_accepted_tokens.gpu[:num_reqs] = num_accepted
-
-                    # For edge-cloud MTP/EAGLE3, the cloud also needs the
-                    # rejection-corrected valid_sampled_token_count and the
-                    # prev-batch request mapping so that _prepare_inputs can run
-                    # the async spec-decode correction kernel.
-                    if (
-                        self.speculative_config.method in ("mtp", "eagle3")
-                        and "valid_sampled_token_count" in tensor_dict
-                    ):
-                        self.valid_sampled_token_count_gpu = tensor_dict[
-                            "valid_sampled_token_count"
-                        ].to(self.device)
-                        # _bookkeeping_sync is not run on the cloud, so the
-                        # prev-batch mapping must be reconstructed here.
-                        self.input_batch.prev_req_id_to_index = {
-                            req_id: i
-                            for i, req_id in enumerate(self.input_batch.req_ids)
-                        }
-
-                    if self.model_config.is_hybrid:
-                        if self.cache_config.mamba_cache_mode == "align":
-                            for i, num_tokens in enumerate(
-                                self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
-                            ):
-                                self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
-                            mamba_utils.postprocess_mamba(
-                                self._last_scheduler_output,
-                                self.kv_cache_config,
-                                self.cache_config,
-                                self.input_batch,
-                                self.requests,
-                                self.mamba_state_idx,
-                                self.compilation_config.static_forward_context,
-                                self.model.get_mamba_state_copy_func(),
-                                self._get_mamba_copy_bufs(),
-                            )
-                        else:
-                            self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-                                self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
-                            )
-                    else:
-                        # For non-hybrid edge-cloud MTP/EAGLE3, keep CPU mirror
-                        # in sync so _prepare_inputs sees corrected
-                        # num_accepted_tokens.
-                        self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-                            self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
-                        )
-
                 return None  # noqa
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
@@ -3512,11 +3913,32 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     and not self.speculative_config.disable_padded_drafter_batch
                 )
-                if use_padded_batch:
+                defer_qwen_mtp_draft = self._should_defer_qwen_mtp_draft(
+                    scheduler_output
+                )
+                if defer_qwen_mtp_draft:
+                    sampled_token_ids = (
+                        sampler_output.sampled_token_ids
+                        if use_padded_batch
+                        else valid_sampled_token_ids
+                    )
+                    self._stash_pending_mtp_draft_context(
+                        scheduler_output,
+                        sampled_token_ids,
+                        spec_decode_metadata,
+                        spec_decode_common_attn_metadata,
+                        positions,
+                        hidden_states,
+                        aux_hidden_states,
+                        sample_hidden_states,
+                        batch_desc,
+                        use_padded_batch,
+                    )
+                elif use_padded_batch:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
-                if self.speculative_config and not use_padded_batch:
+                if not use_padded_batch and not defer_qwen_mtp_draft:
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
@@ -3793,6 +4215,84 @@ class NPUModelRunner(GPUModelRunner):
                 per_layer_attn_metadata[layer_name] = attn_meta
 
         return per_layer_attn_metadata
+
+    def _run_mtp_cloud_segment(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Run one independently scheduled Qwen-MTP cloud middle step."""
+        from vllm_ascend.distributed.parallel_state import (
+            edge_cloud_broadcast_recv_mtp,
+            edge_cloud_send_tensor_dict_mtp,
+        )
+
+        tensor_dict, comm_handles, comm_postprocess = (
+            edge_cloud_broadcast_recv_mtp()
+        )
+        for handle in comm_handles:
+            handle.wait()
+        for postprocess in comm_postprocess:
+            postprocess()
+        assert tensor_dict is not None
+        self._validate_mtp_payload_identity(scheduler_output, tensor_dict)
+
+        positions = tensor_dict.get("positions")
+        if positions is None:
+            raise RuntimeError("MTP_DRAFT cloud payload missing positions")
+        num_tokens = positions.shape[-1]
+        intermediate = self._sync_edge_cloud_draft_intermediate_tensors(
+            num_tokens, IntermediateTensors(tensor_dict)
+        )
+        spec_step_idx = int(scheduler_output.draft_step_idx or 0)
+        model_kwargs = {
+            "intermediate_tensors": intermediate,
+            "positions": positions,
+            "spec_step_idx": spec_step_idx,
+        }
+        draft_attn_metadata = self._build_mtp_cloud_attn_metadata(
+            positions, spec_step_idx
+        )
+
+        if is_forward_context_available():
+            forward_context = get_forward_context()
+            cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
+            if hasattr(cudagraph_runtime_mode, "decode_mode"):
+                cudagraph_runtime_mode = cudagraph_runtime_mode.decode_mode()
+            batch_descriptor = forward_context.batch_descriptor
+            num_actual_tokens = getattr(
+                forward_context, "num_actual_tokens", num_tokens
+            )
+        else:
+            cudagraph_runtime_mode = CUDAGraphMode.NONE
+            batch_descriptor = BatchDescriptor(num_tokens)
+            num_actual_tokens = num_tokens
+
+        with set_ascend_forward_context(
+            attn_metadata=draft_attn_metadata,
+            vllm_config=self.vllm_config,
+            num_tokens=num_tokens,
+            num_actual_tokens=num_actual_tokens,
+            batch_descriptor=batch_descriptor,
+            aclgraph_runtime_mode=cudagraph_runtime_mode,
+            is_draft_model=True,
+        ):
+            output = self._edge_cloud_draft_segments["c"](**model_kwargs)
+        if not isinstance(output, IntermediateTensors):
+            raise RuntimeError("Qwen-MTP cloud segment returned no intermediates")
+
+        if get_pp_group().world_size == 2:
+            out_tensor_dict = {
+                key: value.contiguous()
+                if isinstance(value, torch.Tensor)
+                else value
+                for key, value in output.items()
+            }
+            out_tensor_dict.update(
+                head_token=scheduler_output.head_token,
+                mtp_draft_task_id=scheduler_output.mtp_draft_task_id,
+                draft_step_idx=spec_step_idx,
+            )
+            for handle in edge_cloud_send_tensor_dict_mtp(out_tensor_dict):
+                handle.wait()
 
     def _run_draft_cloud_segment(self) -> None:
         from vllm_ascend.distributed.parallel_state import (

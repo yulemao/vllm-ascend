@@ -24,7 +24,7 @@ import time
 from collections import defaultdict, deque
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from functools import partial
 from multiprocessing import Manager
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
@@ -343,82 +343,96 @@ class HeadState:
     req_ids: tuple[str, ...]
 
 
-def _clone_gdn_attn_metadata(meta):
-    """Deep-clone device tensors inside GDNAttentionMetadata.
+def _freeze_scheduled_state(value: Any, memo: dict[int, Any] | None = None) -> Any:
+    """Clone mutable state that has to survive a scheduler context switch.
 
-    GDN metadata holds device tensors that are views into shared
-    ``common_attn_metadata`` buffers (e.g. ``query_start_loc``,
-    ``state_indices``).  These buffers are rebuilt on every batch, so a
-    decode batch interleaved between two prefill slices would silently
-    overwrite the data still referenced by the saved
-    ``_layerwise_attn_metadata``.  Cloning at **save time** preserves
-    the correct prefill-length values.
+    Input preparation deliberately reuses large CPU/NPU buffers.  A shallow
+    copy of attention metadata therefore still points at storage that the next
+    PREFILL or DECODE batch rewrites.  This helper preserves object structure
+    (including shared aliases) while cloning tensors, numpy arrays, dataclasses
+    and builtin containers.  Opaque configuration/backend objects are kept by
+    reference because they are immutable for the lifetime of the runner.
     """
-    import copy
-    from dataclasses import fields
+    if memo is None:
+        memo = {}
 
-    # Use dataclass replacement to create a shallow copy first,
-    # then deep-clone the device tensor fields.
-    cloned = copy.copy(meta)
+    value_id = id(value)
+    if value_id in memo:
+        return memo[value_id]
 
-    # Device tensor fields that must be cloned to decouple from
-    # shared common_attn_metadata buffers.
-    _DEVICE_TENSOR_FIELDS = (
-        "has_initial_state",
-        "spec_query_start_loc",
-        "non_spec_query_start_loc",
-        "spec_state_indices_tensor",
-        "non_spec_state_indices_tensor",
-        "spec_sequence_masks",
-        "spec_token_indx",
-        "non_spec_token_indx",
-        "num_accepted_tokens",
-        "chunk_indices",
-        "chunk_offsets",
+    if isinstance(value, torch.Tensor):
+        cloned = value.clone()
+        memo[value_id] = cloned
+        return cloned
+    if isinstance(value, np.ndarray):
+        cloned = value.copy()
+        memo[value_id] = cloned
+        return cloned
+    if is_dataclass(value) and not isinstance(value, type):
+        cloned = copy(value)
+        memo[value_id] = cloned
+        field_names: set[str] = set()
+        for field in fields(value):
+            field_names.add(field.name)
+            if field.name == "_buffer_slot":
+                # The frozen tensors no longer belong to the reusable pool.
+                # Do not recursively clone the whole backing slot first.
+                object.__setattr__(cloned, field.name, None)
+                continue
+            object.__setattr__(
+                cloned,
+                field.name,
+                _freeze_scheduled_state(getattr(value, field.name), memo),
+            )
+        # Some attention metadata attaches pooled buffers dynamically rather
+        # than declaring them as dataclass fields.
+        for name, item in getattr(value, "__dict__", {}).items():
+            if name not in field_names:
+                if name == "_buffer_slot":
+                    object.__setattr__(cloned, name, None)
+                    continue
+                object.__setattr__(
+                    cloned, name, _freeze_scheduled_state(item, memo)
+                )
+        return cloned
+    if isinstance(value, dict):
+        cloned = copy(value)
+        cloned.clear()
+        memo[value_id] = cloned
+        for key, item in value.items():
+            cloned[key] = _freeze_scheduled_state(item, memo)
+        return cloned
+    if isinstance(value, list):
+        cloned: list[Any] = []
+        memo[value_id] = cloned
+        cloned.extend(_freeze_scheduled_state(item, memo) for item in value)
+        return cloned
+    if isinstance(value, deque):
+        cloned = deque(maxlen=value.maxlen)
+        memo[value_id] = cloned
+        cloned.extend(_freeze_scheduled_state(item, memo) for item in value)
+        return cloned
+    if isinstance(value, tuple):
+        items = tuple(_freeze_scheduled_state(item, memo) for item in value)
+        if hasattr(value, "_fields"):
+            cloned = type(value)(*items)
+        else:
+            cloned = items
+        memo[value_id] = cloned
+        return cloned
+    if isinstance(value, set):
+        cloned = {_freeze_scheduled_state(item, memo) for item in value}
+        memo[value_id] = cloned
+        return cloned
+    return value
+
+
+def _freeze_intermediate_tensors(
+    intermediate_tensors: IntermediateTensors,
+) -> IntermediateTensors:
+    return IntermediateTensors(
+        _freeze_scheduled_state(dict(intermediate_tensors.items()))
     )
-    for field_name in _DEVICE_TENSOR_FIELDS:
-        tensor = getattr(cloned, field_name, None)
-        if tensor is not None and isinstance(tensor, torch.Tensor) and tensor.device.type != "cpu":
-            setattr(cloned, field_name, tensor.clone())
-
-    # The non_spec_prefill_fallback_meta contains pooled device tensors
-    # for causal_conv1d host args and chunked prefill metadata.
-    fallback_meta = getattr(cloned, "non_spec_prefill_fallback_meta", None)
-    if fallback_meta is not None:
-        cloned_fallback = copy.copy(fallback_meta)
-
-        # Clone causal_conv1d host metadata (CPU pinned tensors)
-        causal_conv1d = getattr(cloned_fallback, "causal_conv1d", None)
-        if causal_conv1d is not None:
-            cloned_causal = copy.copy(causal_conv1d)
-            for attr in ("query_start_loc_cpu", "cache_indices_cpu", "has_initial_state_cpu"):
-                t = getattr(cloned_causal, attr, None)
-                if t is not None and isinstance(t, torch.Tensor):
-                    setattr(cloned_causal, attr, t.clone())
-            cloned_fallback.causal_conv1d = cloned_causal
-
-        # Clone chunked prefill metadata (device tensors from 2-slot pool)
-        chunk_meta = getattr(cloned_fallback, "chunk", None)
-        if chunk_meta is not None:
-            cloned_chunk = copy.copy(chunk_meta)
-            for attr in (
-                "chunk_indices_chunk64",
-                "chunk_offsets_chunk64",
-                "update_chunk_offsets_chunk64",
-                "final_chunk_indices_chunk64",
-                "chunk_indices_large_block",
-                "block_indices_cumsum",
-            ):
-                t = getattr(cloned_chunk, attr, None)
-                if t is not None and isinstance(t, torch.Tensor) and t.device.type != "cpu":
-                    setattr(cloned_chunk, attr, t.clone())
-            # Decouple from pool so the pool slot can be reused safely
-            cloned_chunk._buffer_slot = None
-            cloned_fallback.chunk = cloned_chunk
-
-        cloned.non_spec_prefill_fallback_meta = cloned_fallback
-
-    return cloned
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -547,8 +561,11 @@ class NPUModelRunner(GPUModelRunner):
             self.segment_a_wrapper: Any = None
             self.segment_e_wrapper: Any = None
             self.segment_c_wrapper: Any = None
-            # Cache segment_a prepare results for segment_e reuse (edge-cloud only)
-            self._edge_prepare_cache: dict | None = None
+            # Cache segment_a prepare results for segment_e reuse.  Entries
+            # are keyed because prefill/decode heads may be in flight at the
+            # same time and must not overwrite one another.
+            self._edge_prepare_cache_by_token: dict[str, dict[str, Any]] = {}
+            self._edge_prepare_cache_max: int = 8
             # Cache cloud-side prepare results to overlap with edge segment_a
             self._cloud_prepare_cache: dict | None = None
         else:
@@ -794,6 +811,14 @@ class NPUModelRunner(GPUModelRunner):
         # _run_draft_cloud_segment() which runs later in sample_tokens().
         self._cloud_spec_decode_common_attn_metadata: AscendCommonAttentionMetadata | None = None
         self._cloud_spec_decode_num_reqs: int = 0
+        # Independently scheduled MTP drafts can run after unrelated prefill
+        # or decode work.  Keep immutable target-step snapshots until the
+        # matching draft task consumes them instead of relying on the latest
+        # global metadata pointer.
+        self._cloud_spec_decode_metadata_by_task: dict[
+            str, tuple[AscendCommonAttentionMetadata, int]
+        ] = {}
+        self._cloud_spec_decode_metadata_cache_max: int = 8
         self.enable_hamming_sparse = (self.ascend_config.enable_hamming_sparse is True)
         self.enable_hamming_sparse = self.enable_hamming_sparse and not vllm_config.speculative_config
         if self.enable_hamming_sparse is True:
@@ -2603,30 +2628,42 @@ class NPUModelRunner(GPUModelRunner):
         self,
         scheduler_output: "SchedulerOutput",
         sampled_token_ids: torch.Tensor | list[list[int]],
-        spec_decode_metadata: SpecDecodeMetadata | None,
-        spec_decode_common_attn_metadata: AscendCommonAttentionMetadata | None,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        aux_hidden_states: torch.Tensor | None,
         sample_hidden_states: torch.Tensor | None,
-        batch_desc: BatchDescriptor | None,
-        use_padded_batch: bool,
     ) -> None:
-        task_id = uuid4().hex
+        if scheduler_output.head_token is None:
+            raise RuntimeError(
+                "Cannot defer MTP draft without the target head_token"
+            )
+        # The target head_token is already globally unique and is present on
+        # both the cloud target step and the edge tail step.  Reusing it as
+        # the draft-chain identity gives the cloud an exact metadata lookup
+        # key even if several equal-shaped prefill/decode batches interleave.
+        task_id = scheduler_output.head_token
+        req_ids = tuple(self.input_batch.req_ids)
+        num_reqs = len(req_ids)
+        draft_positions = (
+            positions[:, -num_reqs:]
+            if self.uses_mrope
+            else self._select_pending_mtp_rows(positions, num_reqs)
+        ).clone()
+        draft_hidden_states = sample_hidden_states
+        if draft_hidden_states is None:
+            draft_hidden_states = hidden_states
+        draft_hidden_states = self._select_pending_mtp_rows(
+            draft_hidden_states, num_reqs
+        ).clone()
+        frozen_sampled_token_ids = _freeze_scheduled_state(
+            sampled_token_ids
+        )
         context: dict[str, Any] = {
-            "scheduler_output": scheduler_output,
-            "sampled_token_ids": sampled_token_ids,
-            "sampling_metadata": self.input_batch.sampling_metadata,
-            "spec_decode_metadata": spec_decode_metadata,
-            "spec_decode_common_attn_metadata": spec_decode_common_attn_metadata,
-            "positions": positions,
-            "num_scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
-            "hidden_states": hidden_states,
-            "aux_hidden_states": aux_hidden_states,
-            "sample_hidden_states": sample_hidden_states,
-            "target_model_batch_desc": batch_desc,
-            "use_padded_batch": use_padded_batch,
-            "req_ids": tuple(self.input_batch.req_ids),
+            "scheduler_output": replace(scheduler_output),
+            "sampled_token_ids": frozen_sampled_token_ids,
+            "positions": draft_positions,
+            "hidden_states": draft_hidden_states,
+            "sample_hidden_states": draft_hidden_states,
+            "req_ids": req_ids,
             "mtp_draft_task_id": task_id,
             "draft_step_idx": 0,
         }
@@ -2637,7 +2674,7 @@ class NPUModelRunner(GPUModelRunner):
             assert self.drafter is not None
             next_token_ids, valid_sampled_tokens_count = (
                 self.drafter.prepare_next_token_ids_padded(
-                    sampled_token_ids,
+                    frozen_sampled_token_ids,
                     self.requests,
                     self.input_batch,
                     self.discard_request_indices.gpu,
@@ -2647,7 +2684,7 @@ class NPUModelRunner(GPUModelRunner):
             self._copy_valid_sampled_token_count(
                 next_token_ids, valid_sampled_tokens_count
             )
-            context["next_token_ids"] = next_token_ids
+            context["next_token_ids"] = next_token_ids.clone()
         self._draft_token_ids = None
 
     def take_pending_mtp_draft_scheduler_output(
@@ -2911,16 +2948,16 @@ class NPUModelRunner(GPUModelRunner):
         draft_token_ids = self._compute_mtp_draft_token_ids(
             hidden_states, draft_step_idx
         )
-        context["last_draft_hidden_states"] = hidden_states
-        context["last_draft_positions"] = positions
-        context["last_draft_token_ids"] = draft_token_ids
+        context["last_draft_hidden_states"] = hidden_states.clone()
+        context["last_draft_positions"] = positions.clone()
+        context["last_draft_token_ids"] = draft_token_ids.clone()
         draft_steps = context.setdefault("draft_token_id_steps", [])
         if len(draft_steps) != draft_step_idx:
             raise RuntimeError(
                 "MTP_DRAFT step order mismatch: "
                 f"expected={len(draft_steps)}, got={draft_step_idx}"
             )
-        draft_steps.append(draft_token_ids)
+        draft_steps.append(draft_token_ids.clone())
         next_step_idx = draft_step_idx + 1
         if next_step_idx < self.num_spec_tokens:
             context["draft_step_idx"] = next_step_idx
@@ -3374,8 +3411,11 @@ class NPUModelRunner(GPUModelRunner):
                     and self.edge_cloud_cfg.role == "cloud"
                     and spec_decode_common_attn_metadata is not None
                 ):
-                    self._cloud_spec_decode_common_attn_metadata = spec_decode_common_attn_metadata
-                    self._cloud_spec_decode_num_reqs = num_reqs
+                    self._cache_cloud_spec_decode_metadata(
+                        scheduler_output,
+                        spec_decode_common_attn_metadata,
+                        num_reqs,
+                    )
 
             (
                 input_ids,
@@ -3391,6 +3431,11 @@ class NPUModelRunner(GPUModelRunner):
                 else total_num_scheduled_tokens,
                 intermediate_tensors,
             )
+            if _fast_path:
+                # _preprocess reads the runner's reusable positions buffer,
+                # which may have been rewritten by an interleaved batch even
+                # though the metadata cache itself is keyed by head_token.
+                positions = cache["positions"]
 
             if not self.edge_cloud_cfg.role == "edge":
                 # update global cos, sin
@@ -3438,7 +3483,7 @@ class NPUModelRunner(GPUModelRunner):
                     stale_token,
                 )
                 self._edge_prepare_cache_by_token.pop(stale_token, None)
-            self._edge_prepare_cache_by_token[scheduler_output.head_token] = {
+            cache_entry = {
                 "num_tokens_padded": num_tokens_padded,
                 "num_tokens_across_dp": num_tokens_across_dp,
                 "attn_metadata": attn_metadata,
@@ -3449,7 +3494,11 @@ class NPUModelRunner(GPUModelRunner):
                 "batch_desc": batch_desc,
                 "cudagraph_stats": cudagraph_stats,
                 "total_num_scheduled_tokens": total_num_scheduled_tokens,
+                "positions": positions,
             }
+            self._edge_prepare_cache_by_token[scheduler_output.head_token] = (
+                _freeze_scheduled_state(cache_entry)
+            )
 
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
@@ -3461,30 +3510,40 @@ class NPUModelRunner(GPUModelRunner):
 
         # Save per-step state for layer slice continuation.
         if layer_slice_info is not None and not layer_slice_info.is_last_slice:
-            self._layerwise_positions = positions
-            # Deep-clone device tensors inside attn_metadata to prevent
-            # corruption by subsequent decode batches.  The metadata's
-            # device tensors (query_start_loc, state_indices, etc.) are
-            # views into shared common_attn_metadata buffers that get
-            # rebuilt on every batch.  If a decode batch runs between
-            # two prefill slices, it overwrites these buffers in-place,
-            # corrupting the saved metadata.  Cloning at save time
-            # preserves the correct prefill values.
-            if isinstance(attn_metadata, dict):
-                self._layerwise_attn_metadata = {
-                    k: _clone_gdn_attn_metadata(v) for k, v in attn_metadata.items()
+            # All of these values can contain views into the reusable input
+            # preparation buffers.  Freeze them as one object graph so shared
+            # per-layer aliases remain shared but an interleaved batch cannot
+            # mutate the continuation state.
+            frozen_layerwise_state = _freeze_scheduled_state(
+                {
+                    "positions": positions,
+                    "attn_metadata": attn_metadata,
+                    "logits_indices": logits_indices,
+                    "spec_decode_metadata": spec_decode_metadata,
+                    "spec_decode_common_attn_metadata": (
+                        spec_decode_common_attn_metadata
+                    ),
                 }
-            elif attn_metadata is not None:
-                self._layerwise_attn_metadata = _clone_gdn_attn_metadata(attn_metadata)
-            else:
-                self._layerwise_attn_metadata = attn_metadata
+            )
+            self._layerwise_positions = frozen_layerwise_state["positions"]
+            self._layerwise_attn_metadata = frozen_layerwise_state[
+                "attn_metadata"
+            ]
             self._layerwise_num_tokens_padded = num_tokens_padded
             self._layerwise_num_tokens_across_dp = num_tokens_across_dp
             self._layerwise_batch_desc = batch_desc
             self._layerwise_scheduler_output = scheduler_output
-            self._layerwise_logits_indices = logits_indices
-            self._layerwise_spec_decode_metadata = spec_decode_metadata
-            self._layerwise_spec_decode_common_attn_metadata = spec_decode_common_attn_metadata
+            self._layerwise_logits_indices = frozen_layerwise_state[
+                "logits_indices"
+            ]
+            self._layerwise_spec_decode_metadata = frozen_layerwise_state[
+                "spec_decode_metadata"
+            ]
+            self._layerwise_spec_decode_common_attn_metadata = (
+                frozen_layerwise_state[
+                    "spec_decode_common_attn_metadata"
+                ]
+            )
             self._layerwise_ec_connector_output = ec_connector_output
             self._layerwise_cudagraph_stats = cudagraph_stats
 
@@ -3554,10 +3613,12 @@ class NPUModelRunner(GPUModelRunner):
                 and not layer_slice_info.is_last_slice
             ):
                 # The model returns IntermediateTensors for non-last PP
-                # ranks.  Detach the hidden/residual so they serve as
-                # fresh inputs for the next slice's forward pass.
+                # ranks. Snapshot hidden/residual because another scheduled
+                # batch may reuse the graph output buffers before next slice.
                 assert isinstance(hidden_states, IntermediateTensors)
-                self._layerwise_intermediate = hidden_states
+                self._layerwise_intermediate = _freeze_intermediate_tensors(
+                    hidden_states
+                )
                 if self.debugger is not None:
                     self.debugger.stop()
                     self.debugger.step()
@@ -3925,14 +3986,9 @@ class NPUModelRunner(GPUModelRunner):
                     self._stash_pending_mtp_draft_context(
                         scheduler_output,
                         sampled_token_ids,
-                        spec_decode_metadata,
-                        spec_decode_common_attn_metadata,
                         positions,
                         hidden_states,
-                        aux_hidden_states,
                         sample_hidden_states,
-                        batch_desc,
-                        use_padded_batch,
                     )
                 elif use_padded_batch:
                     # EAGLE speculative decoding can use the GPU sampled tokens
@@ -4054,10 +4110,76 @@ class NPUModelRunner(GPUModelRunner):
         )
         return async_output
 
+    def _cache_cloud_spec_decode_metadata(
+        self,
+        scheduler_output: "SchedulerOutput",
+        common_attn_metadata: AscendCommonAttentionMetadata,
+        num_reqs: int,
+    ) -> None:
+        if not self._is_qwen_mtp_spec_decode():
+            # Other draft implementations consume the metadata synchronously
+            # and do not cross a scheduler boundary.
+            self._cloud_spec_decode_common_attn_metadata = (
+                common_attn_metadata
+            )
+            self._cloud_spec_decode_num_reqs = num_reqs
+            return
+
+        frozen_metadata = _freeze_scheduled_state(common_attn_metadata)
+
+        # Keep the latest snapshot for the legacy synchronous draft path.
+        self._cloud_spec_decode_common_attn_metadata = frozen_metadata
+        self._cloud_spec_decode_num_reqs = num_reqs
+
+        task_id = scheduler_output.head_token
+        if task_id is None:
+            raise RuntimeError(
+                "Cannot cache cloud MTP metadata without target head_token"
+            )
+        task_cache = self._cloud_spec_decode_metadata_by_task
+        if (
+            task_id not in task_cache
+            and len(task_cache)
+            >= self._cloud_spec_decode_metadata_cache_max
+        ):
+            stale_task_id = next(iter(task_cache))
+            task_cache.pop(stale_task_id)
+            logger.warning(
+                "Cloud MTP metadata cache exceeded bound (%d); evicting "
+                "unconsumed task_id=%s",
+                self._cloud_spec_decode_metadata_cache_max,
+                stale_task_id,
+            )
+        task_cache[task_id] = (frozen_metadata, num_reqs)
+
+    def _resolve_cloud_spec_decode_metadata(
+        self,
+        scheduler_output: "SchedulerOutput | None",
+    ) -> tuple[AscendCommonAttentionMetadata | None, int]:
+        if scheduler_output is None:
+            return (
+                self._cloud_spec_decode_common_attn_metadata,
+                self._cloud_spec_decode_num_reqs,
+            )
+
+        task_id = scheduler_output.mtp_draft_task_id
+        if task_id is None:
+            raise RuntimeError("MTP_DRAFT batch missing mtp_draft_task_id")
+
+        task_cache = self._cloud_spec_decode_metadata_by_task
+        cached = task_cache.get(task_id)
+        if cached is None:
+            raise RuntimeError(
+                "MTP_DRAFT has no matching target attention metadata: "
+                f"task_id={task_id}"
+            )
+        return cached
+
     def _build_mtp_cloud_attn_metadata(
         self,
         positions: torch.Tensor,
         spec_step_idx: int,
+        scheduler_output: "SchedulerOutput | None" = None,
     ) -> dict[str, Any] | None:
         """Build per-layer attention metadata for the draft cloud decoder.
 
@@ -4071,10 +4193,10 @@ class NPUModelRunner(GPUModelRunner):
         execute_model() and the drafter's draft_attn_groups to build
         per-layer metadata for each speculative step.
         """
-        if (
-            not hasattr(self, "_cloud_spec_decode_common_attn_metadata")
-            or self._cloud_spec_decode_common_attn_metadata is None
-        ):
+        common_attn_metadata, num_reqs = (
+            self._resolve_cloud_spec_decode_metadata(scheduler_output)
+        )
+        if common_attn_metadata is None:
             return None
 
         if (
@@ -4083,9 +4205,6 @@ class NPUModelRunner(GPUModelRunner):
             or not self.drafter.draft_attn_groups
         ):
             return None
-
-        common_attn_metadata = self._cloud_spec_decode_common_attn_metadata
-        num_reqs = getattr(self, "_cloud_spec_decode_num_reqs", 0)
 
         # Adapt common_attn_metadata for draft model positions.
         # The positions come from the edge side and reflect the draft
@@ -4249,7 +4368,7 @@ class NPUModelRunner(GPUModelRunner):
             "spec_step_idx": spec_step_idx,
         }
         draft_attn_metadata = self._build_mtp_cloud_attn_metadata(
-            positions, spec_step_idx
+            positions, spec_step_idx, scheduler_output
         )
 
         if is_forward_context_available():
@@ -4293,6 +4412,14 @@ class NPUModelRunner(GPUModelRunner):
             )
             for handle in edge_cloud_send_tensor_dict_mtp(out_tensor_dict):
                 handle.wait()
+
+        if (
+            scheduler_output.mtp_draft_task_id is not None
+            and spec_step_idx + 1 >= self.num_spec_tokens
+        ):
+            self._cloud_spec_decode_metadata_by_task.pop(
+                scheduler_output.mtp_draft_task_id, None
+            )
 
     def _run_draft_cloud_segment(self) -> None:
         from vllm_ascend.distributed.parallel_state import (
@@ -5277,7 +5404,9 @@ class NPUModelRunner(GPUModelRunner):
             # Non-last slice: save intermediate and return None.
             if not layer_slice_info.is_last_slice:
                 assert isinstance(hidden_states, IntermediateTensors)
-                self._layerwise_intermediate = hidden_states
+                self._layerwise_intermediate = _freeze_intermediate_tensors(
+                    hidden_states
+                )
                 return None
 
             # Edge-cloud cloud segment: always returns IntermediateTensors

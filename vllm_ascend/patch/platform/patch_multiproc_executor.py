@@ -169,7 +169,7 @@ class AscendMultiprocExecutor(MultiprocExecutor):
                                 self.parallel_config.node_rank_within_dp,
                                 self.parallel_config.enable_edge_cloud,
                                 self.parallel_config.is_edge_node,
-                                self.parallel_config.is_cloud_node,
+                                not self.parallel_config.is_edge_node,
                                 type(peer_mqs),
                                 (list(peer_mqs.keys()) if hasattr(peer_mqs, "keys")
                                  else None),

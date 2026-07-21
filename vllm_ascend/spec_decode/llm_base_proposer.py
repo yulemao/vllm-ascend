@@ -370,11 +370,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # individually by the model runner. Wrapping the whole _run_merged_draft
         # here would try to capture cross-process communication inside the graph,
         # which is not supported, so skip it for that case.
-        is_edge_cloud_mtp = (
-            self.method == "mtp"
-            and self.runner is not None
-            and getattr(self.runner, "_edge_cloud_enabled", False)
-        )
+        is_edge_cloud_mtp = self._is_edge_cloud_qwen_mtp()
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
             self.update_stream = torch.npu.Stream()
             if not is_edge_cloud_mtp:
@@ -414,6 +410,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 decode_metadata.sas_metadata = decode_metadata.sas_metadata.clone()
         return attn_metadata
 
+    def _is_edge_cloud_qwen_mtp(self) -> bool:
+        # Mirror NPUModelRunner._is_qwen_mtp_spec_decode: accept the
+        # Qwen-specific method names in addition to plain "mtp". In edge-cloud
+        # Qwen-MTP the draft decoder layers run on the cloud and are replaced
+        # by PPMissingLayer locally, so the whole-model draft path
+        # (_run_merged_draft / plain Qwen3_5MTP.forward) can never execute on
+        # either node; drafts run as EngineCore-scheduled MTP_DRAFT tasks via
+        # the model runner's _edge_cloud_mtp_segments instead.
+        if self.method not in ("mtp", "qwen3_5_mtp", "qwen_mtp"):
+            return False
+        return self.runner is not None and getattr(
+            self.runner, "_edge_cloud_enabled", False
+        )
+
     @torch.inference_mode()
     def dummy_run(
         self,
@@ -427,6 +437,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         dummy_compute_logits=lambda hidden_states: None,
         is_profile=False,
     ):
+        if self._is_edge_cloud_qwen_mtp():
+            # Edge-cloud Qwen-MTP: the draft decoder layers run on the cloud
+            # and are replaced by PPMissingLayer locally (edge owns embed/fc/
+            # norm, cloud owns the decoder layers), so the whole-model draft
+            # path can never execute here. MTP segments are warmed up and
+            # captured individually by the model runner instead.
+            return
         (
             num_tokens,
             num_tokens_across_dp,
@@ -531,9 +548,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # need inputs_embeds anyway — it receives intermediate tensors from
         # the edge via broadcast.
         is_cloud_mtp = (
-            self.method == "mtp"
-            and self.runner is not None
-            and getattr(self.runner, "_edge_cloud_enabled", False)
+            self._is_edge_cloud_qwen_mtp()
             and self.runner.edge_cloud_cfg.role == "cloud"
         )
         if self.supports_mm_inputs and not is_cloud_mtp:
@@ -731,9 +746,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # need inputs_embeds anyway — it receives intermediate tensors from
         # the edge via broadcast.
         is_cloud_mtp = (
-            self.method == "mtp"
-            and self.runner is not None
-            and getattr(self.runner, "_edge_cloud_enabled", False)
+            self._is_edge_cloud_qwen_mtp()
             and self.runner.edge_cloud_cfg.role == "cloud"
         )
         if self.supports_mm_inputs and not is_cloud_mtp:

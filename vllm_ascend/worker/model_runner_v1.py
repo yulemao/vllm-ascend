@@ -736,7 +736,7 @@ class NPUModelRunner(GPUModelRunner):
         # This flag is set per-step in execute_model; initialize it here so
         # that code paths reaching _prepare_inputs before the first execute_model
         # call (e.g. profile_run or unit tests) do not hit AttributeError.
-        self._is_edge_cloud_embed_only_tail = False
+        self._is_edge_cloud_tail_segment = False
         if self._edge_cloud_enabled:
             if not self.parallel_config.enable_edge_cloud:
                 raise ValueError(
@@ -1087,8 +1087,10 @@ class NPUModelRunner(GPUModelRunner):
             )
             if is_mtp_drafter:
                 # Qwen-MTP draft layers are split explicitly by
-                # _setup_edge_cloud_mtp(); use 0/0 here so model construction
-                # does not keep main-model head/tail ranges for the drafter.
+                # _setup_edge_cloud_mtp(). In both embedding_only and
+                # head_tail modes all draft decoder layers run on the cloud,
+                # so temporarily use head_k=tail_k=0 while loading the
+                # drafter.
                 from vllm.distributed.parallel_state import set_edge_cloud_layer_range
                 set_edge_cloud_layer_range(0, 0)
 
@@ -1101,6 +1103,11 @@ class NPUModelRunner(GPUModelRunner):
                 and self.drafter.model is not None
             ):
                 self._setup_edge_cloud_mtp(self.drafter.model)
+
+            if is_mtp_drafter:
+                # Do not leak the drafter's cloud-only range into later
+                # main-model initialization or cache setup.
+                set_edge_cloud_layer_range(self.head_k, self.tail_k)
 
     def _get_mtp_predictor(self, mtp_model: nn.Module) -> nn.Module | None:
         """Locate the predictor module inside an MTP draft model."""
@@ -1872,11 +1879,11 @@ class NPUModelRunner(GPUModelRunner):
         # CPU values are optimistic (all drafts accepted). The kernel
         # corrects on GPU using the previous step's
         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
-        # In edge-cloud embedding_only mode, the tail segment reuses the
+        # In edge-cloud mode, the tail segment reuses the
         # num_computed_tokens already corrected by the head segment, so skip
         # both the kernel and the CPU fallback copy to avoid re-introducing
         # the scheduler's optimistic value.
-        if not self._is_edge_cloud_embed_only_tail:
+        if not self._is_edge_cloud_tail_segment:
             if (
                 self.use_async_spec_decode
                 and self.valid_sampled_token_count_gpu is not None
@@ -3052,15 +3059,14 @@ class NPUModelRunner(GPUModelRunner):
         # Save scheduler_output for edge-cloud mamba state sync in sample_tokens().
         self._last_scheduler_output = scheduler_output
 
-        # In edge-cloud embedding_only mode, execute_model is called twice for the
+        # In edge-cloud mode, execute_model is called twice for the
         # same scheduler_output: head segment (intermediate_tensors is None) and
         # tail segment (intermediate_tensors is not None). The tail segment should
         # reuse the num_computed_tokens corrected by the head segment, instead of
         # re-running update_num_computed_tokens_for_batch_change or copying the
         # potentially optimistic CPU value back to GPU.
-        self._is_edge_cloud_embed_only_tail = (
+        self._is_edge_cloud_tail_segment = (
             self._edge_cloud_enabled
-            and self.edge_cloud_cfg.mode == "embedding_only"
             and self.edge_cloud_cfg.role == "edge"
             and intermediate_tensors is not None
         )
@@ -3682,8 +3688,9 @@ class NPUModelRunner(GPUModelRunner):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         # Edge-cloud sync: receive num_accepted_tokens (and optionally
         # valid_sampled_token_count) from edge so that cloud can update
-        # num_computed_tokens for the main model in embed_only MTP mode,
-        # or run _update_states_after_model_execute() for hybrid models.
+        # speculative-decoding state. This is needed in both embedding_only
+        # and head_tail modes because sampling only runs on the edge, while
+        # the cloud prepares its next target/draft forward independently.
         # NOTE: this must run on every cloud-side sample_tokens invocation
         # (they are collectively driven by the edge EngineCore, one per edge
         # sampling step), so it lives before the cloud no-op early return.
@@ -3693,10 +3700,7 @@ class NPUModelRunner(GPUModelRunner):
             and self.speculative_config
             and (
                 self.model_config.is_hybrid
-                or (
-                    self.edge_cloud_cfg.mode == "embedding_only"
-                    and self.speculative_config.method == "mtp"
-                )
+                or self.speculative_config.method in ("mtp", "eagle3")
             )
             and self._last_scheduler_output is not None
         ):
@@ -3720,13 +3724,12 @@ class NPUModelRunner(GPUModelRunner):
             num_reqs = num_accepted.size(0)
             self.num_accepted_tokens.gpu[:num_reqs] = num_accepted
 
-            # For embed_only MTP, the cloud also needs the rejection-
+            # For edge-cloud MTP/EAGLE3, the cloud also needs the rejection-
             # corrected valid_sampled_token_count and the prev-batch
             # request mapping so that _prepare_inputs can run the async
             # spec-decode correction kernel.
             if (
-                self.edge_cloud_cfg.mode == "embedding_only"
-                and self.speculative_config.method == "mtp"
+                self.speculative_config.method in ("mtp", "eagle3")
                 and "valid_sampled_token_count" in tensor_dict
             ):
                 self.valid_sampled_token_count_gpu = tensor_dict[
@@ -3760,8 +3763,8 @@ class NPUModelRunner(GPUModelRunner):
                         self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
                     )
             else:
-                # For non-hybrid embed_only MTP, keep CPU mirror in sync
-                # so _prepare_inputs sees corrected num_accepted_tokens.
+                # For non-hybrid edge-cloud MTP/EAGLE3, keep CPU mirror in
+                # sync so _prepare_inputs sees corrected num_accepted_tokens.
                 self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                     self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
                 )
@@ -3929,26 +3932,22 @@ class NPUModelRunner(GPUModelRunner):
                     propose_draft_token_ids(valid_sampled_token_ids)
 
             # Edge-cloud sync: send num_accepted_tokens (and optionally
-            # valid_sampled_token_count) to cloud so that cloud can run
-            # _update_states_after_model_execute() for hybrid models, or correct
-            # num_computed_tokens for embed_only MTP speculative decoding.
+            # valid_sampled_token_count) to cloud so that it can update its
+            # speculative-decoding state in both embedding_only and head_tail
+            # modes.
             if (
                 self._edge_cloud_enabled
                 and self.edge_cloud_cfg.role != "cloud"
                 and self.speculative_config
                 and (
                     self.model_config.is_hybrid
-                    or (
-                        self.edge_cloud_cfg.mode == "embedding_only"
-                        and self.speculative_config.method == "mtp"
-                    )
+                    or self.speculative_config.method in ("mtp", "eagle3")
                 )
             ):
                 num_accepted = (sampler_output.sampled_token_ids != -1).sum(dim=1).cpu()
                 tensor_dict_to_send = {"num_accepted_tokens": num_accepted}
                 if (
-                    self.edge_cloud_cfg.mode == "embedding_only"
-                    and self.speculative_config.method == "mtp"
+                    self.speculative_config.method in ("mtp", "eagle3")
                     and self.valid_sampled_token_count_gpu is not None
                 ):
                     tensor_dict_to_send["valid_sampled_token_count"] = (
@@ -5622,6 +5621,19 @@ class NPUModelRunner(GPUModelRunner):
                 if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
+                    elif (
+                        self._edge_cloud_enabled
+                        and self.edge_cloud_cfg.role == "edge"
+                    ):
+                        # In edge-cloud head_tail mode, the edge side does not
+                        # host the draft model's attention layers (they run on
+                        # the cloud), so the draft attention layer is not
+                        # present in any local kv_cache_group.  The edge still
+                        # needs a common attention metadata to prepare draft
+                        # inputs (positions, seq_lens, block_table) for the
+                        # edge-cloud draft round-trip.  Fall back to the target
+                        # model's metadata.
+                        spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
             if self.enable_hamming_sparse is True:
@@ -6289,9 +6301,29 @@ class NPUModelRunner(GPUModelRunner):
             self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model()
         ):
             assert isinstance(self.drafter, AscendEagleProposer | AscendDflashProposer | AscendDraftModelProposer)
-            block_size = (self.kernel_block_sizes[0] if isinstance(
-            self.kernel_block_sizes, list) else self.kernel_block_sizes)
-            self.drafter.initialize_attn_backend(kv_cache_config, block_size)
+            skip_edge_drafter_attn_init = (
+                self._edge_cloud_enabled
+                and self.edge_cloud_cfg.role == "edge"
+                and self.speculative_config.method in ("mtp", "eagle3")
+            )
+            if skip_edge_drafter_attn_init:
+                # All draft decoder layers run on the cloud. Their stale
+                # static-forward-context entries have already been removed on
+                # the edge, so the edge KV cache config intentionally contains
+                # no draft attention layers.
+                self.drafter.draft_attn_groups = []
+                logger.info(
+                    "[EdgeCloud] Edge skipped %s drafter attention backend "
+                    "initialization.",
+                    self.speculative_config.method,
+                )
+            else:
+                block_size = (
+                    self.kernel_block_sizes[0]
+                    if isinstance(self.kernel_block_sizes, list)
+                    else self.kernel_block_sizes
+                )
+                self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)

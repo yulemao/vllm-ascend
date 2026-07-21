@@ -829,11 +829,16 @@ class NPUModelRunner(GPUModelRunner):
             # Edge-cloud MTP splits the draft model across both roles (edge
             # owns embed+fc/norm+lm_head, cloud owns the decoder layers), so
             # both sides need a drafter instance even though only the PP last
-            # rank owns the target model's lm_head. Use the same predicate as
-            # _should_defer_qwen_mtp_draft so the two stay consistent (covers
-            # method "mtp" on qwen-mtp models as well as "qwen3_5_mtp" /
-            # "qwen_mtp"). Note: edge_cloud_cfg / _edge_cloud_enabled are
-            # initialized later in __init__, so read the config directly here.
+            # rank owns the target model's lm_head. Otherwise the cloud side
+            # trips the drafter isinstance assert in
+            # GPUModelRunner._check_and_update_cudagraph_mode (see commit
+            # 187bd70 "边云支持kimi eagle3", which creates the drafter on all
+            # edge-cloud ranks for method "mtp"/"eagle3"). Use the same
+            # predicate as _should_defer_qwen_mtp_draft so the two stay
+            # consistent (covers method "mtp" on qwen-mtp models as well as
+            # "qwen3_5_mtp" / "qwen_mtp"). Note: edge_cloud_cfg /
+            # _edge_cloud_enabled are initialized later in __init__, so read
+            # the config directly here.
             edge_cloud_mtp = (
                 self.ascend_config.edge_cloud_config.enabled
                 and self._is_qwen_mtp_spec_decode()
@@ -2569,10 +2574,17 @@ class NPUModelRunner(GPUModelRunner):
             return True
         if method != "mtp":
             return False
+        # method "mtp" already establishes that this is MTP spec decode;
+        # model_type only needs to identify the Qwen family. Newer Qwen
+        # models (e.g. Qwen3.6, model_type "qwen3_6_moe" / "qwen3_5_moe")
+        # do not contain "mtp" in their model_type, so requiring it would
+        # leave the cloud-side drafter unset and trip the
+        # GPUModelRunner._check_and_update_cudagraph_mode drafter
+        # isinstance assert during startup.
         model_config = getattr(self.vllm_config, "model_config", None)
         hf_config = getattr(model_config, "hf_config", None)
         model_type = str(getattr(hf_config, "model_type", "")).lower()
-        return "qwen" in model_type and "mtp" in model_type
+        return "qwen" in model_type
 
     def _should_defer_qwen_mtp_draft(
         self, scheduler_output: "SchedulerOutput"

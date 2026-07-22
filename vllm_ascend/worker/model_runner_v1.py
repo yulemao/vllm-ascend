@@ -2643,17 +2643,70 @@ class NPUModelRunner(GPUModelRunner):
         task_id = scheduler_output.head_token
         req_ids = tuple(self.input_batch.req_ids)
         num_reqs = len(req_ids)
-        draft_positions = (
-            positions[:, -num_reqs:]
-            if self.uses_mrope
-            else self._select_pending_mtp_rows(positions, num_reqs)
-        ).clone()
-        draft_hidden_states = sample_hidden_states
-        if draft_hidden_states is None:
-            draft_hidden_states = hidden_states
-        draft_hidden_states = self._select_pending_mtp_rows(
-            draft_hidden_states, num_reqs
-        ).clone()
+        # The first draft pass (spec_step_idx == 0) must run over ALL tokens
+        # the target model just processed (the full prompt after a prefill,
+        # all verify tokens after a decode step), not just the last row of
+        # each request.  This is what populates the MTP layer's own KV
+        # cache with the prompt, and the cloud reuses the target step's
+        # attention metadata verbatim for step 0, so the token counts must
+        # match exactly.  Selecting only the last num_reqs rows here makes
+        # the cloud run e.g. a 1-token query against a 57-token prefill
+        # metadata, which fails the FusedInferAttention TND tiling check.
+        num_scheduled = [
+            int(scheduler_output.num_scheduled_tokens.get(req_id, 1))
+            for req_id in req_ids
+        ]
+        draft_positions = positions.clone()
+        # The draft needs the target hidden states of every scheduled token
+        # (sample_hidden_states only covers the logits rows).
+        draft_hidden_states = hidden_states.clone()
+
+        # Snapshot the scheduled token ids so the first draft step can build
+        # the shifted input ids (target ids shifted left by one, closed by
+        # the sampled next token), plus the per-request row whose hidden
+        # state produces the proposed draft token.
+        # The row that produces the proposed draft token is the last
+        # scheduled row for a prefill; for a verify (decode) step it is the
+        # row of the last ACCEPTED token, i.e. rejected draft tokens at the
+        # tail of each request are skipped.  Using the last verify row
+        # unconditionally would feed rejected-token hidden states/positions
+        # into the next draft round and drift positions past the real
+        # sequence.
+        if scheduler_output.batch_type == BatchType.PREFILL_LAST:
+            num_rejected = [0] * num_reqs
+        elif torch.is_tensor(sampled_token_ids):
+            valid_counts = (
+                (sampled_token_ids[:num_reqs] != -1).sum(dim=1).tolist()
+            )
+            num_rejected = [
+                max(n - max(int(v), 1), 0)
+                for n, v in zip(num_scheduled, valid_counts)
+            ]
+        else:
+            num_rejected = [
+                max(n - max(len(s), 1), 0)
+                for n, s in zip(num_scheduled, sampled_token_ids)
+            ]
+        pos_flat = positions[0] if positions.dim() == 2 else positions
+        start_offsets = torch.zeros(num_reqs, dtype=torch.long)
+        running = 0
+        for req_idx, n in enumerate(num_scheduled):
+            start_offsets[req_idx] = running
+            running += n
+        total_tokens = running
+        start_pos = pos_flat[start_offsets.to(pos_flat.device)].cpu()
+        scheduled_token_ids = torch.empty(total_tokens, dtype=torch.long)
+        sample_row_indices = torch.empty(num_reqs, dtype=torch.long)
+        start = 0
+        for req_idx, n in enumerate(num_scheduled):
+            end = start + n
+            p0 = int(start_pos[req_idx])
+            scheduled_token_ids[start:end] = torch.from_numpy(
+                self.input_batch.token_ids_cpu[req_idx, p0 : p0 + n]
+            ).to(torch.long)
+            sample_row_indices[req_idx] = end - 1 - num_rejected[req_idx]
+            start = end
+
         frozen_sampled_token_ids = _freeze_scheduled_state(
             sampled_token_ids
         )
@@ -2662,7 +2715,9 @@ class NPUModelRunner(GPUModelRunner):
             "sampled_token_ids": frozen_sampled_token_ids,
             "positions": draft_positions,
             "hidden_states": draft_hidden_states,
-            "sample_hidden_states": draft_hidden_states,
+            "num_scheduled_tokens": num_scheduled,
+            "scheduled_token_ids": scheduled_token_ids,
+            "sample_row_indices": sample_row_indices,
             "req_ids": req_ids,
             "mtp_draft_task_id": task_id,
             "draft_step_idx": 0,
@@ -2685,6 +2740,20 @@ class NPUModelRunner(GPUModelRunner):
                 next_token_ids, valid_sampled_tokens_count
             )
             context["next_token_ids"] = next_token_ids.clone()
+        else:
+            next_token_list = []
+            for req_idx, req_id in enumerate(req_ids):
+                sampled_tokens = sampled_token_ids[req_idx]
+                next_token_list.append(
+                    sampled_tokens[-1]
+                    if sampled_tokens
+                    else self.requests[req_id].get_token_id(
+                        int(self.input_batch.num_tokens_no_spec[req_idx]) - 1
+                    )
+                )
+            context["next_token_ids"] = torch.tensor(
+                next_token_list, dtype=torch.long
+            )
         self._draft_token_ids = None
 
     def take_pending_mtp_draft_scheduler_output(
@@ -2781,14 +2850,6 @@ class NPUModelRunner(GPUModelRunner):
             )
         return context
 
-    @staticmethod
-    def _select_pending_mtp_rows(
-        tensor: torch.Tensor, num_reqs: int
-    ) -> torch.Tensor:
-        if tensor.shape[0] == num_reqs:
-            return tensor
-        return tensor[-num_reqs:]
-
     def _prepare_mtp_edge_step_inputs(
         self, scheduler_output: "SchedulerOutput"
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
@@ -2802,46 +2863,30 @@ class NPUModelRunner(GPUModelRunner):
                 draft_step_idx,
             )
 
-        sampled_token_ids = context["sampled_token_ids"]
-        num_reqs = len(context["req_ids"])
-        if torch.is_tensor(sampled_token_ids):
-            assert self.drafter is not None
-            input_ids = context.get("next_token_ids")
-            if input_ids is None:
-                input_ids, _ = self.drafter.prepare_next_token_ids_padded(
-                    sampled_token_ids,
-                    self.requests,
-                    self.input_batch,
-                    self.discard_request_indices.gpu,
-                    self.num_discarded_requests,
-                )
-        else:
-            input_ids_list = []
-            for req_idx, req_id in enumerate(context["req_ids"]):
-                sampled_tokens = sampled_token_ids[req_idx]
-                input_ids_list.append(
-                    sampled_tokens[-1]
-                    if sampled_tokens
-                    else self.requests[req_id].get_token_id(
-                        int(self.input_batch.num_tokens_no_spec[req_idx]) - 1
-                    )
-                )
-            input_ids = torch.tensor(
-                input_ids_list, dtype=torch.long, device=self.device
-            )
+        # First speculative step: run the draft model over ALL tokens the
+        # target model just processed.  The draft input ids are the target
+        # token ids shifted left by one within each request, with the
+        # sampled next token closing each request (same layout as the
+        # stock first-pass drafter inputs), so the MTP layer's KV cache is
+        # populated for the whole sequence.
+        num_scheduled = context["num_scheduled_tokens"]
+        scheduled_token_ids = context["scheduled_token_ids"]
+        next_token_ids = context["next_token_ids"].cpu()
+        total_tokens = scheduled_token_ids.shape[0]
+        input_ids = torch.empty(total_tokens, dtype=torch.long)
+        start = 0
+        for req_idx, n in enumerate(num_scheduled):
+            end = start + n
+            if n > 1:
+                input_ids[start : end - 1] = scheduled_token_ids[
+                    start + 1 : end
+                ]
+            input_ids[end - 1] = next_token_ids[req_idx]
+            start = end
+        input_ids = input_ids.to(self.device, non_blocking=True)
 
         positions = context["positions"]
-        positions = (
-            positions[:, -num_reqs:]
-            if self.uses_mrope
-            else self._select_pending_mtp_rows(positions, num_reqs)
-        )
-        hidden_states = context.get("sample_hidden_states")
-        if hidden_states is None:
-            hidden_states = context["hidden_states"]
-        hidden_states = self._select_pending_mtp_rows(
-            hidden_states, num_reqs
-        )
+        hidden_states = context["hidden_states"]
         return input_ids, positions, hidden_states, draft_step_idx
 
     def _run_mtp_edge_first_segment(
@@ -2945,11 +2990,28 @@ class NPUModelRunner(GPUModelRunner):
         )
         if not torch.is_tensor(hidden_states):
             raise RuntimeError("Qwen-MTP last segment returned no hidden states")
+        num_reqs = len(context["req_ids"])
+        if draft_step_idx == 0 and hidden_states.shape[0] != num_reqs:
+            # The first draft pass ran over all scheduled tokens; only the
+            # last row of each request produces the proposed draft token and
+            # feeds the next speculative step.
+            sample_rows = context["sample_row_indices"].to(
+                hidden_states.device
+            )
+            logits_hidden_states = hidden_states[sample_rows]
+            step_positions = (
+                positions[:, sample_rows]
+                if self.uses_mrope
+                else positions[sample_rows]
+            )
+        else:
+            logits_hidden_states = hidden_states
+            step_positions = positions
         draft_token_ids = self._compute_mtp_draft_token_ids(
-            hidden_states, draft_step_idx
+            logits_hidden_states, draft_step_idx
         )
-        context["last_draft_hidden_states"] = hidden_states.clone()
-        context["last_draft_positions"] = positions.clone()
+        context["last_draft_hidden_states"] = logits_hidden_states.clone()
+        context["last_draft_positions"] = step_positions.clone()
         context["last_draft_token_ids"] = draft_token_ids.clone()
         draft_steps = context.setdefault("draft_token_id_steps", [])
         if len(draft_steps) != draft_step_idx:

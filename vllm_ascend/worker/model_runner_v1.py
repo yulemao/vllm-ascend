@@ -4399,8 +4399,17 @@ class NPUModelRunner(GPUModelRunner):
 
     def _run_mtp_cloud_segment(
         self, scheduler_output: "SchedulerOutput"
-    ) -> None:
-        """Run one independently scheduled Qwen-MTP cloud middle step."""
+    ) -> list:
+        """Run one independently scheduled Qwen-MTP cloud middle step.
+
+        Returns the async send handles of the cloud→edge result payload.
+        The caller (worker) must record them and wait before the next
+        DECODE-channel reuse instead of waiting here: the matching edge
+        tail recv (MTP_DRAFT_LAST) is only posted after the cloud
+        EngineCore publishes the tail SchedulerOutput, which is gated on
+        this worker's completion ack -- waiting inside this function
+        deadlocks the whole pipeline.
+        """
         from vllm_ascend.distributed.parallel_state import (
             edge_cloud_broadcast_recv_mtp,
             edge_cloud_send_tensor_dict_mtp,
@@ -4460,6 +4469,7 @@ class NPUModelRunner(GPUModelRunner):
         if not isinstance(output, IntermediateTensors):
             raise RuntimeError("Qwen-MTP cloud segment returned no intermediates")
 
+        send_handles: list = []
         if get_pp_group().world_size == 2:
             out_tensor_dict = {
                 key: value.contiguous()
@@ -4472,8 +4482,13 @@ class NPUModelRunner(GPUModelRunner):
                 mtp_draft_task_id=scheduler_output.mtp_draft_task_id,
                 draft_step_idx=spec_step_idx,
             )
-            for handle in edge_cloud_send_tensor_dict_mtp(out_tensor_dict):
-                handle.wait()
+            # Async send only — do NOT wait here.  The edge posts the
+            # matching tail recv (MTP_DRAFT_LAST) only after the cloud
+            # EngineCore publishes the tail SchedulerOutput, which happens
+            # after this worker's completion ack; waiting on these handles
+            # before the ack circular-deadlocks edge and cloud.  Mirrors
+            # _execute_model_cloud's _record_pp_send_work pattern.
+            send_handles = edge_cloud_send_tensor_dict_mtp(out_tensor_dict)
 
         if (
             scheduler_output.mtp_draft_task_id is not None
@@ -4482,6 +4497,7 @@ class NPUModelRunner(GPUModelRunner):
             self._cloud_spec_decode_metadata_by_task.pop(
                 scheduler_output.mtp_draft_task_id, None
             )
+        return send_handles
 
     def _run_draft_cloud_segment(self) -> None:
         from vllm_ascend.distributed.parallel_state import (

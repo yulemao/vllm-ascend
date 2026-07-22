@@ -2872,12 +2872,18 @@ class NPUModelRunner(GPUModelRunner):
 
         # First speculative step: run the draft model over ALL tokens the
         # target model just processed.  The draft input ids are the target
-        # token ids shifted left by one within each request, with the
-        # sampled next token closing each request (same layout as the
-        # stock first-pass drafter inputs), so the MTP layer's KV cache is
-        # populated for the whole sequence.
+        # token ids shifted left by one within each request, so the MTP
+        # layer's KV cache is populated for the whole sequence.  The sampled
+        # next token must close each request at the last ACCEPTED row
+        # (sample_row_indices), exactly like the stock drafter's
+        # input_ids[token_indices_to_sample] = next_token_ids -- NOT at the
+        # last scheduled row.  When some verify draft tokens were rejected,
+        # putting it at end-1 instead feeds a rejected token id (and its
+        # embedding/KV) into the row that produces the next draft token,
+        # which makes every decode-round draft miss.
         num_scheduled = context["num_scheduled_tokens"]
         scheduled_token_ids = context["scheduled_token_ids"]
+        sample_row_indices = context["sample_row_indices"]
         next_token_ids = context["next_token_ids"].cpu()
         total_tokens = scheduled_token_ids.shape[0]
         input_ids = torch.empty(total_tokens, dtype=torch.long)
@@ -2888,7 +2894,13 @@ class NPUModelRunner(GPUModelRunner):
                 input_ids[start : end - 1] = scheduled_token_ids[
                     start + 1 : end
                 ]
-            input_ids[end - 1] = next_token_ids[req_idx]
+            # Tail rows past the last accepted row are unused (their KV is
+            # overwritten next round); keep a deterministic shifted id there
+            # like the stock drafter's buffer does.
+            input_ids[end - 1] = scheduled_token_ids[end - 1]
+            input_ids[int(sample_row_indices[req_idx])] = next_token_ids[
+                req_idx
+            ]
             start = end
         input_ids = input_ids.to(self.device, non_blocking=True)
 

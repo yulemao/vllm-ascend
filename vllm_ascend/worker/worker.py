@@ -795,14 +795,14 @@ class NPUWorker(WorkerBase):
             bt = scheduler_output.batch_type
             if is_cloud_device():
                 if bt == BatchType.MTP_DRAFT_FIRST:
-                    return self._execute_model_cloud_mtp(scheduler_output)
+                    return self._execute_model_cloud_draft(scheduler_output)
                 return self._execute_model_cloud(
                     scheduler_output, layer_slice_info
                 )
             if bt == BatchType.MTP_DRAFT_FIRST:
-                return self._execute_model_edge_mtp_head(scheduler_output)
+                return self._execute_model_edge_draft_head(scheduler_output)
             if bt == BatchType.MTP_DRAFT_LAST:
-                return self._execute_model_edge_mtp_tail(scheduler_output)
+                return self._execute_model_edge_draft_tail(scheduler_output)
             if bt in (BatchType.PREFILL_FIRST, BatchType.DECODE_FIRST):
                 return self._execute_model_edge_head(
                     scheduler_output, layer_slice_info
@@ -1050,12 +1050,12 @@ class NPUWorker(WorkerBase):
             logger.info(f"Send intermediate tensors to edge, hidden_channel={channel.value}")
         return output
 
-    def _execute_model_cloud_mtp(
+    def _execute_model_cloud_draft(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput:
-        """Run one cloud-side Qwen-MTP middle step."""
+        """Run one cloud-side independently scheduled draft middle step."""
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
-        send_handles = self.model_runner._run_mtp_cloud_segment(
+        send_handles = self.model_runner._run_edge_cloud_draft_middle_segment(
             scheduler_output
         )
         # Record the cloud->edge draft payload send instead of waiting it:
@@ -1076,12 +1076,12 @@ class NPUWorker(WorkerBase):
             req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
         )
 
-    def _execute_model_edge_mtp_head(
+    def _execute_model_edge_draft_head(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput:
-        """Run and send one edge-side Qwen-MTP first segment."""
+        """Run and send one edge-side scheduled draft first segment."""
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
-        output = self.model_runner._run_mtp_edge_first_segment(
+        output = self.model_runner._run_edge_cloud_draft_first_segment(
             scheduler_output
         )
         if not isinstance(output, IntermediateTensors):
@@ -1112,10 +1112,10 @@ class NPUWorker(WorkerBase):
             req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
         )
 
-    def _execute_model_edge_mtp_tail(
+    def _execute_model_edge_draft_tail(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput:
-        """Receive and finish one edge-side Qwen-MTP draft step."""
+        """Receive and finish one edge-side scheduled draft step."""
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
         tensor_dict, comm_handles, comm_postprocess = (
             edge_cloud_broadcast_recv_mtp()
@@ -1129,10 +1129,10 @@ class NPUWorker(WorkerBase):
             f"hidden_channel: {HiddenChannelType.DECODE.value}"
         )
         assert tensor_dict is not None
-        self.model_runner._validate_mtp_payload_identity(
+        self.model_runner._validate_edge_cloud_draft_payload_identity(
             scheduler_output, tensor_dict
         )
-        return self.model_runner._run_mtp_edge_last_segment(
+        return self.model_runner._run_edge_cloud_draft_last_segment(
             scheduler_output, IntermediateTensors(tensor_dict)
         )
 
@@ -1505,20 +1505,22 @@ class NPUWorker(WorkerBase):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
 
-    def take_pending_mtp_draft_scheduler_output(
+    def take_pending_edge_cloud_draft_scheduler_output(
         self,
     ) -> SchedulerOutput | None:
-        return self.model_runner.take_pending_mtp_draft_scheduler_output()
+        return (
+            self.model_runner.take_pending_edge_cloud_draft_scheduler_output()
+        )
 
-    def take_completed_mtp_draft_result(
+    def take_completed_edge_cloud_draft_result(
         self,
     ) -> tuple[DraftTokenIds, SchedulerOutput] | None:
-        return self.model_runner.take_completed_mtp_draft_result()
+        return self.model_runner.take_completed_edge_cloud_draft_result()
 
-    def clear_pending_mtp_draft_for_req_ids(
+    def clear_pending_edge_cloud_draft_for_req_ids(
         self, req_ids: set[str] | list[str]
     ) -> None:
-        self.model_runner.clear_pending_mtp_draft_for_req_ids(req_ids)
+        self.model_runner.clear_pending_edge_cloud_draft_for_req_ids(req_ids)
 
     def check_health(self) -> None:
         import subprocess

@@ -584,11 +584,13 @@ class PassiveScheduler:
         machine.  Sliced prefill-like batches are dispatched one slice per call
         so decode batches can be interleaved between the remaining slices.
         """
-        # Prefill middle work remains highest priority. Once it drains, a
-        # Qwen-MTP draft step must run before the next verify middle step.
+        # Finish an active sliced prefill before switching work, but do not
+        # let queued prefills starve an MTP draft. The draft owns the shared
+        # bidirectional DECODE channel until its tail is consumed on edge;
+        # delaying it behind a continuous prefill stream can block all decode
+        # progress.
         if (
             self.ready_mtp_drafts
-            and not self.ready_prefills
             and not self._active_prefill_slices
         ):
             self._clear_prefill_middle_throttle()

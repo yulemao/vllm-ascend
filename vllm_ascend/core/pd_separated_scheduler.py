@@ -519,10 +519,10 @@ class PDSeparatedScheduler(Scheduler):
                 self.finished_req_ids.update(so.finished_req_ids)
             if self.prefills_last_ready:
                 return self._pick_prefill_last_batch()
-            if self._can_schedule_mtp_draft_first():
-                return self._pick_mtp_draft_first_batch()
             if self.mtp_drafts_last_ready:
                 return self._pick_mtp_draft_last_batch()
+            if self._can_schedule_mtp_draft_first():
+                return self._pick_mtp_draft_first_batch()
             if self.decodes_last_ready and self._can_schedule_decode_last():
                 return self._pick_decode_last_batch()
             if self._can_schedule_decode_first():
@@ -545,10 +545,10 @@ class PDSeparatedScheduler(Scheduler):
                 return self._pick_decode_last_batch()
             if self.prefills_last_ready:
                 return self._pick_prefill_last_batch()
-            if self._can_schedule_mtp_draft_first():
-                return self._pick_mtp_draft_first_batch()
             if self.mtp_drafts_last_ready:
                 return self._pick_mtp_draft_last_batch()
+            if self._can_schedule_mtp_draft_first():
+                return self._pick_mtp_draft_first_batch()
             if self._can_schedule_decode_first():
                 return self._pick_decode_first_batch()
             return self._make_empty_batch()
@@ -558,10 +558,10 @@ class PDSeparatedScheduler(Scheduler):
             return self._pick_decode_last_batch()
         if self.prefills_last_ready:
             return self._pick_prefill_last_batch()
-        if self._can_schedule_mtp_draft_first():
-            return self._pick_mtp_draft_first_batch()
         if self.mtp_drafts_last_ready:
             return self._pick_mtp_draft_last_batch()
+        if self._can_schedule_mtp_draft_first():
+            return self._pick_mtp_draft_first_batch()
         if self._can_schedule_decode_first():
             return self._pick_decode_first_batch()
         return self._make_empty_batch()
@@ -626,9 +626,15 @@ class PDSeparatedScheduler(Scheduler):
         )
 
     def _can_schedule_mtp_draft_first(self) -> bool:
+        # MTP head and tail payloads share the bidirectional DECODE channel.
+        # Do not start another head while an earlier head is still remote or
+        # its tail is ready locally: otherwise edge and cloud can each wait
+        # for the opposite-direction send before posting the matching recv.
         return bool(
             self.mtp_drafts_first_ready
             and self.mtp_draft_inflight_count < self.mtp_draft_inflight_limit
+            and self.mtp_draft_remote_pending_count == 0
+            and not self.mtp_drafts_last_ready
             and self.decode_inflight_count == 0
             and not self._force_decode_last
         )

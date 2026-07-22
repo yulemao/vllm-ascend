@@ -2915,13 +2915,27 @@ class NPUModelRunner(GPUModelRunner):
         input_ids, positions, hidden_states, draft_step_idx = (
             self._prepare_mtp_edge_step_inputs(scheduler_output)
         )
+        num_tokens = positions.shape[-1] if self.uses_mrope else positions.shape[0]
         segment = self._edge_cloud_draft_segments["a"]
-        output = segment(
-            input_ids=input_ids,
-            positions=positions,
-            hidden_states=hidden_states,
-            spec_step_idx=draft_step_idx,
-        )
+        # Independently scheduled MTP draft batches do not enter
+        # execute_model(), so they do not inherit its forward context. Keep
+        # the draft segments eager until the scheduler path can also preserve
+        # graph dispatch metadata and stable input buffers across A/C/E.
+        with set_ascend_forward_context(
+            attn_metadata=None,
+            vllm_config=self.vllm_config,
+            num_tokens=num_tokens,
+            num_actual_tokens=num_tokens,
+            batch_descriptor=BatchDescriptor(num_tokens),
+            aclgraph_runtime_mode=CUDAGraphMode.NONE,
+            is_draft_model=True,
+        ):
+            output = segment(
+                input_ids=input_ids,
+                positions=positions,
+                hidden_states=hidden_states,
+                spec_step_idx=draft_step_idx,
+            )
         if not isinstance(output, IntermediateTensors):
             raise RuntimeError("Qwen-MTP first segment returned no intermediates")
         output["positions"] = positions
@@ -3011,11 +3025,22 @@ class NPUModelRunner(GPUModelRunner):
             )
         )
         segment = self._edge_cloud_draft_segments["e"]
-        hidden_states = segment(
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            spec_step_idx=draft_step_idx,
-        )
+        # MTP_DRAFT_LAST is dispatched independently as well, so it needs the
+        # same explicit eager context as MTP_DRAFT_FIRST.
+        with set_ascend_forward_context(
+            attn_metadata=None,
+            vllm_config=self.vllm_config,
+            num_tokens=num_tokens,
+            num_actual_tokens=num_tokens,
+            batch_descriptor=BatchDescriptor(num_tokens),
+            aclgraph_runtime_mode=CUDAGraphMode.NONE,
+            is_draft_model=True,
+        ):
+            hidden_states = segment(
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                spec_step_idx=draft_step_idx,
+            )
         if not torch.is_tensor(hidden_states):
             raise RuntimeError("Qwen-MTP last segment returned no hidden states")
         num_reqs = len(context["req_ids"])

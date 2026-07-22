@@ -1184,11 +1184,11 @@ def edge_cloud_send_tensor_dict(
     )
 
 
-def edge_cloud_send_tensor_dict_mtp(
+def edge_cloud_send_tensor_dict_scheduled_draft(
     tensor_dict: dict[str, torch.Tensor | Any],
     channel: HiddenChannelType = HiddenChannelType.DECODE,
 ) -> list[Handle]:
-    """Send a dynamically-shaped MTP payload on the decode channel."""
+    """Send a dynamically-shaped scheduled draft payload."""
     pp_group = get_pp_group()
     if hasattr(pp_group, "isend_tensor_dict_on_hidden_channel"):
         return pp_group.isend_tensor_dict_on_hidden_channel(
@@ -1467,14 +1467,14 @@ def edge_cloud_broadcast_recv_draft() -> tuple[
     return recv_tensor_dict, [], [broadcast_postprocess]
 
 
-def edge_cloud_broadcast_recv_mtp(
+def edge_cloud_broadcast_recv_scheduled_draft(
     channel: HiddenChannelType = HiddenChannelType.DECODE,
 ) -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
     list[Callable[[], None]],
 ]:
-    """Receive a dynamically-shaped MTP payload on the decode channel."""
+    """Receive a dynamically-shaped scheduled draft payload."""
     pp_group = get_pp_group()
     tp_group = get_tp_group()
     is_pp_npu0 = pp_group.world_size == 2
@@ -1492,7 +1492,7 @@ def edge_cloud_broadcast_recv_mtp(
                 pp_group.irecv_tensor_dict()
             )
         assert tensor_dict is not None, (
-            "edge_cloud_broadcast_recv_mtp: PP tensor_dict is None, "
+            "edge_cloud_broadcast_recv_scheduled_draft: PP tensor_dict is None, "
             "sender may have failed."
         )
 

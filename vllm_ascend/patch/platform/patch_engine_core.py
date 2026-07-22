@@ -396,8 +396,7 @@ def _enqueue_pending_edge_cloud_draft_if_ready(self) -> None:
     if take_completed is not None:
         completed = take_completed()
         if completed is not None:
-            draft_token_ids, _parent_scheduler_output = completed
-            self.scheduler.update_draft_token_ids(draft_token_ids)
+            self.scheduler.update_draft_token_ids(completed)
 
     take_pending = getattr(
         self.model_executor,

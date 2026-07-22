@@ -313,7 +313,7 @@ class AscendMultiprocExecutor(MultiprocExecutor):
 
     def take_completed_edge_cloud_draft_result(
         self,
-    ) -> tuple[DraftTokenIds, SchedulerOutput] | None:
+    ) -> DraftTokenIds | None:
         return self.collective_rpc(
             "take_completed_edge_cloud_draft_result",
             unique_reply_rank=self.output_rank,

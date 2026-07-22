@@ -1514,7 +1514,7 @@ class NPUWorker(WorkerBase):
 
     def take_completed_edge_cloud_draft_result(
         self,
-    ) -> tuple[DraftTokenIds, SchedulerOutput] | None:
+    ) -> DraftTokenIds | None:
         return self.model_runner.take_completed_edge_cloud_draft_result()
 
     def clear_pending_edge_cloud_draft_for_req_ids(

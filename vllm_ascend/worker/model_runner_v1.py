@@ -2620,6 +2620,16 @@ class NPUModelRunner(GPUModelRunner):
         hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
         return "qwen" in str(getattr(hf_config, "model_type", "")).lower()
 
+    def _needs_edge_cloud_accepted_token_sync(self) -> bool:
+        speculative_config = self.speculative_config
+        if speculative_config is None:
+            return False
+        return bool(
+            self.model_config.is_hybrid
+            or speculative_config.method == "mtp"
+            or self._uses_scheduled_edge_cloud_draft()
+        )
+
     def _should_defer_edge_cloud_draft(
         self, scheduler_output: "SchedulerOutput"
     ) -> bool:
@@ -2725,14 +2735,12 @@ class NPUModelRunner(GPUModelRunner):
         )
         context: dict[str, Any] = {
             "scheduler_output": replace(scheduler_output),
-            "sampled_token_ids": frozen_sampled_token_ids,
             "positions": draft_positions,
             "hidden_states": draft_hidden_states,
             "num_scheduled_tokens": num_scheduled,
             "scheduled_token_ids": scheduled_token_ids,
             "sample_row_indices": sample_row_indices,
             "req_ids": req_ids,
-            "mtp_draft_task_id": task_id,
             "draft_step_idx": 0,
         }
         self._pending_edge_cloud_draft_contexts[task_id] = context
@@ -2811,7 +2819,7 @@ class NPUModelRunner(GPUModelRunner):
 
     def take_completed_edge_cloud_draft_result(
         self,
-    ) -> "tuple[DraftTokenIds, SchedulerOutput] | None":
+    ) -> "DraftTokenIds | None":
         for task_id, context in list(
             self._pending_edge_cloud_draft_contexts.items()
         ):
@@ -2827,9 +2835,8 @@ class NPUModelRunner(GPUModelRunner):
                 list(context["req_ids"]),
                 draft_token_tensor.detach().cpu().tolist(),
             )
-            parent_scheduler_output = context["scheduler_output"]
             self._pending_edge_cloud_draft_contexts.pop(task_id, None)
-            return result, parent_scheduler_output
+            return result
         return None
 
     def clear_pending_edge_cloud_draft_for_req_ids(
@@ -3133,7 +3140,6 @@ class NPUModelRunner(GPUModelRunner):
             )
         else:
             context["draft_complete"] = True
-            self._draft_token_ids = torch.stack(draft_steps, dim=1)
 
         req_ids = list(context["req_ids"])
         return ModelRunnerOutput(
@@ -3892,17 +3898,11 @@ class NPUModelRunner(GPUModelRunner):
             # Independently scheduled drafts are excluded: their num_accepted
             # payload rides the draft-step-0 execute_model payload and is
             # applied in _run_edge_cloud_draft_middle_segment. Receiving it
-            # here as well would emit
-            # a TP broadcast from the sample_tokens RPC stream, which races
-            # draft broadcasts (execute_model stream) on the shared
-            # mq_broadcaster and swaps payloads across ranks.
+            # here as well would race the execute_model RPC stream on the
+            # shared TP mq_broadcaster.
             if (
-                self.speculative_config
-                and not self._uses_scheduled_edge_cloud_draft()
-                and (
-                    self.model_config.is_hybrid
-                    or self.speculative_config.method in ("mtp", "eagle3")
-                )
+                not self._uses_scheduled_edge_cloud_draft()
+                and self._needs_edge_cloud_accepted_token_sync()
                 and self._last_scheduler_output is not None
             ):
                 pp_group = get_pp_group()
@@ -3921,62 +3921,11 @@ class NPUModelRunner(GPUModelRunner):
                     tensor_dict, src=0
                 )
                 assert tensor_dict is not None
-                num_accepted = tensor_dict["num_accepted_tokens"].to(
-                    self.device
+                self._apply_cloud_num_accepted_tokens(
+                    self._last_scheduler_output,
+                    tensor_dict["num_accepted_tokens"],
+                    tensor_dict.get("valid_sampled_token_count"),
                 )
-                num_reqs = num_accepted.size(0)
-                self.num_accepted_tokens.gpu[:num_reqs] = num_accepted
-
-                if (
-                    self.speculative_config.method in ("mtp", "eagle3")
-                    and "valid_sampled_token_count" in tensor_dict
-                ):
-                    self.valid_sampled_token_count_gpu = tensor_dict[
-                        "valid_sampled_token_count"
-                    ].to(self.device)
-                    self.input_batch.prev_req_id_to_index = {
-                        req_id: i
-                        for i, req_id in enumerate(self.input_batch.req_ids)
-                    }
-
-                if self.model_config.is_hybrid:
-                    if self.cache_config.mamba_cache_mode == "align":
-                        accepted_counts = (
-                            self.num_accepted_tokens.gpu[:num_reqs]
-                            .cpu()
-                            .numpy()
-                        )
-                        for i, num_tokens in enumerate(accepted_counts):
-                            self.input_batch.num_accepted_tokens_cpu[i] = (
-                                num_tokens
-                            )
-                        mamba_utils.postprocess_mamba(
-                            self._last_scheduler_output,
-                            self.kv_cache_config,
-                            self.cache_config,
-                            self.input_batch,
-                            self.requests,
-                            self.mamba_state_idx,
-                            self.compilation_config.static_forward_context,
-                            self.model.get_mamba_state_copy_func(),
-                            self._get_mamba_copy_bufs(),
-                        )
-                    else:
-                        self.input_batch.num_accepted_tokens_cpu_tensor[
-                            :num_reqs
-                        ].copy_(
-                            self.num_accepted_tokens.gpu[:num_reqs],
-                            non_blocking=True,
-                        )
-                else:
-                    self.input_batch.num_accepted_tokens_cpu_tensor[
-                        :num_reqs
-                    ].copy_(
-                        self.num_accepted_tokens.gpu[:num_reqs],
-                        non_blocking=True,
-                    )
-
-        if self._edge_cloud_enabled and not self.parallel_config.is_edge_node:
             # Cloud workers do not own segment_e / LM head / sampler in the
             # edge-cloud PD-separation topology. When the edge EngineCore
             # issues sample_tokens via collective_rpc, every worker dequeues
@@ -4167,17 +4116,16 @@ class NPUModelRunner(GPUModelRunner):
             if (
                 self._edge_cloud_enabled
                 and self.edge_cloud_cfg.role != "cloud"
-                and self.speculative_config
-                and (
-                    self.model_config.is_hybrid
-                    or self._uses_scheduled_edge_cloud_draft()
-                )
+                and self._needs_edge_cloud_accepted_token_sync()
             ):
                 num_reqs = sampler_output.sampled_token_ids.size(0)
                 num_accepted = (sampler_output.sampled_token_ids != -1).sum(dim=1).cpu()
                 tensor_dict_to_send = {"num_accepted_tokens": num_accepted}
                 if (
-                    self._uses_scheduled_edge_cloud_draft()
+                    (
+                        self._uses_scheduled_edge_cloud_draft()
+                        or self.speculative_config.method == "mtp"
+                    )
                     and self.valid_sampled_token_count_gpu is not None
                 ):
                     tensor_dict_to_send["valid_sampled_token_count"] = (
@@ -4535,7 +4483,7 @@ class NPUModelRunner(GPUModelRunner):
 
         return per_layer_attn_metadata
 
-    def _apply_cloud_num_accepted_payload(
+    def _apply_cloud_num_accepted_tokens(
         self,
         scheduler_output: "SchedulerOutput",
         num_accepted: torch.Tensor,
@@ -4544,10 +4492,9 @@ class NPUModelRunner(GPUModelRunner):
         """Apply the edge-sampled rejection correction on the cloud.
 
         Sampling only runs on the edge, but the cloud must retain the
-        rejection-corrected state for its next target/draft forward. For an
-        independently scheduled draft the payload rides the draft-step-0
-        execute_model payload (instead of the racy sample_tokens RPC stream),
-        so the correction runs here, ahead of the draft forwards.
+        rejection-corrected state for its next target/draft forward. Both the
+        legacy sample_tokens control payload and the independently scheduled
+        draft payload converge here.
         """
         num_accepted = num_accepted.to(self.device)
         num_reqs = num_accepted.size(0)
@@ -4573,21 +4520,15 @@ class NPUModelRunner(GPUModelRunner):
                     self.input_batch.num_accepted_tokens_cpu[i] = (
                         num_tokens
                     )
-                # The draft task is scheduled independently of the verify
-                # step, so the global _last_scheduler_output may already
-                # point at an unrelated batch.  Use the per-task snapshot
-                # cached during the verify step's execute_model.
+                # An independently scheduled draft uses its per-task target
+                # snapshot. Legacy control payloads carry the target output
+                # directly as scheduler_output.
                 target_scheduler_output = (
                     self._cloud_scheduler_output_by_task.get(
                         scheduler_output.mtp_draft_task_id
                     )
-                    or self._last_scheduler_output
+                    or scheduler_output
                 )
-                if target_scheduler_output is None:
-                    raise RuntimeError(
-                        "Cloud draft mamba sync has no scheduler_output for "
-                        f"task_id={scheduler_output.mtp_draft_task_id}"
-                    )
                 mamba_utils.postprocess_mamba(
                     target_scheduler_output,
                     self.kv_cache_config,
@@ -4661,7 +4602,7 @@ class NPUModelRunner(GPUModelRunner):
                     "expected step 0",
                     spec_step_idx,
                 )
-            self._apply_cloud_num_accepted_payload(
+            self._apply_cloud_num_accepted_tokens(
                 scheduler_output,
                 num_accepted_payload,
                 valid_sampled_token_count,

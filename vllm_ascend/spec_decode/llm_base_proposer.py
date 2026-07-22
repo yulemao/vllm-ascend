@@ -2201,11 +2201,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             draft_attn_metadata = None
             if (
                 self.runner is not None
-                and hasattr(self.runner, "_build_mtp_cloud_attn_metadata")
+                and hasattr(
+                    self.runner,
+                    "_build_edge_cloud_draft_attn_metadata",
+                )
                 and positions is not None
             ):
-                draft_attn_metadata = self.runner._build_mtp_cloud_attn_metadata(
-                    positions, spec_step_idx
+                draft_attn_metadata = (
+                    self.runner._build_edge_cloud_draft_attn_metadata(
+                        positions, spec_step_idx
+                    )
                 )
 
             # Preserve the outer forward context's cudagraph mode/batch

@@ -354,7 +354,7 @@ def _finish_empty_batch(self, scheduler_output: SchedulerOutput):
     """Complete an EMPTY SchedulerOutput without broadcasting to workers."""
     self._stash_empty_worker_cleanup(scheduler_output)
     self._process_aborts_queue()
-    self._clear_pending_mtp_draft_for_finished_requests()
+    self._clear_pending_edge_cloud_draft_for_finished_requests()
     with (
         self.log_error_detail(scheduler_output),
         self.log_iteration_details(scheduler_output),
@@ -362,7 +362,7 @@ def _finish_empty_batch(self, scheduler_output: SchedulerOutput):
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, EMPTY_MODEL_RUNNER_OUTPUT
         )
-    self._clear_pending_mtp_draft_for_finished_requests()
+    self._clear_pending_edge_cloud_draft_for_finished_requests()
     return engine_core_outputs, False
 
 
@@ -382,8 +382,8 @@ def _pop_deferred_empty_batch(self) -> SchedulerOutput | None:
     return deferred.pop(0)
 
 
-def _enqueue_pending_mtp_draft_if_ready(self) -> None:
-    """Move completed/new Qwen-MTP derived work across the executor boundary."""
+def _enqueue_pending_edge_cloud_draft_if_ready(self) -> None:
+    """Move completed/new edge-cloud draft work across the executor boundary."""
     if not getattr(self, "use_spec_decode", False):
         return
     ready_queue = getattr(self.scheduler, "mtp_drafts_first_ready", None)
@@ -391,7 +391,7 @@ def _enqueue_pending_mtp_draft_if_ready(self) -> None:
         return
 
     take_completed = getattr(
-        self.model_executor, "take_completed_mtp_draft_result", None
+        self.model_executor, "take_completed_edge_cloud_draft_result", None
     )
     if take_completed is not None:
         completed = take_completed()
@@ -401,7 +401,7 @@ def _enqueue_pending_mtp_draft_if_ready(self) -> None:
 
     take_pending = getattr(
         self.model_executor,
-        "take_pending_mtp_draft_scheduler_output",
+        "take_pending_edge_cloud_draft_scheduler_output",
         None,
     )
     if take_pending is None:
@@ -411,13 +411,13 @@ def _enqueue_pending_mtp_draft_if_ready(self) -> None:
         return
     if scheduler_output.batch_type != BatchType.MTP_DRAFT_FIRST:
         raise RuntimeError(
-            "Pending MTP draft must be MTP_DRAFT_FIRST, got "
+            "Pending edge-cloud draft must be MTP_DRAFT_FIRST, got "
             f"{scheduler_output.batch_type}"
         )
     ready_queue.append(scheduler_output)
 
 
-def _clear_pending_mtp_draft_for_finished_requests(self) -> None:
+def _clear_pending_edge_cloud_draft_for_finished_requests(self) -> None:
     if not getattr(self, "use_spec_decode", False):
         return
     finished_req_ids = set(
@@ -426,13 +426,15 @@ def _clear_pending_mtp_draft_for_finished_requests(self) -> None:
     if not finished_req_ids:
         return
     clear_pending = getattr(
-        self.model_executor, "clear_pending_mtp_draft_for_req_ids", None
+        self.model_executor,
+        "clear_pending_edge_cloud_draft_for_req_ids",
+        None,
     )
     if clear_pending is not None:
         clear_pending(finished_req_ids)
 
 
-def _uses_split_qwen_mtp_draft(self) -> bool:
+def _uses_scheduled_edge_cloud_draft(self) -> bool:
     speculative_config = self.vllm_config.speculative_config
     if (
         getattr(self, "_pp_pd_channel", None) is None
@@ -440,6 +442,8 @@ def _uses_split_qwen_mtp_draft(self) -> bool:
     ):
         return False
     method = getattr(speculative_config, "method", None)
+    if method == "eagle3":
+        return True
     if method in ("qwen3_5_mtp", "qwen_mtp"):
         return True
     if method != "mtp":
@@ -448,9 +452,9 @@ def _uses_split_qwen_mtp_draft(self) -> bool:
     return "qwen" in str(getattr(hf_config, "model_type", "")).lower()
 
 
-def _has_unresolved_qwen_mtp_parent(self) -> bool:
+def _has_unresolved_edge_cloud_draft_parent(self) -> bool:
     """Keep async scheduling behind a tail that still has to create draft work."""
-    if not self._uses_split_qwen_mtp_draft():
+    if not self._uses_scheduled_edge_cloud_draft():
         return False
     batch_queue = getattr(self, "batch_queue", None)
     if not batch_queue:
@@ -511,12 +515,12 @@ def _patched_step(self):
     # Before processing the model output, process any aborts that happened
     # during the model execution.
     self._process_aborts_queue()
-    self._clear_pending_mtp_draft_for_finished_requests()
+    self._clear_pending_edge_cloud_draft_for_finished_requests()
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output
     )
-    self._clear_pending_mtp_draft_for_finished_requests()
-    self._enqueue_pending_mtp_draft_if_ready()
+    self._clear_pending_edge_cloud_draft_for_finished_requests()
+    self._enqueue_pending_edge_cloud_draft_if_ready()
 
     return (
         engine_core_outputs,
@@ -539,7 +543,7 @@ def _patched_step_with_batch_queue(self):
     deferred_scheduler_output = None
     if (
         self.scheduler.has_requests()
-        and not self._has_unresolved_qwen_mtp_parent()
+        and not self._has_unresolved_edge_cloud_draft_parent()
     ):
         # [ascend insert] Pull cloud-returned tail-segment batches into
         # the scheduler ready queues before picking the next batch.
@@ -638,12 +642,12 @@ def _patched_step_with_batch_queue(self):
             raise RuntimeError("unexpected error")
 
     self._process_aborts_queue()
-    self._clear_pending_mtp_draft_for_finished_requests()
+    self._clear_pending_edge_cloud_draft_for_finished_requests()
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output
     )
-    self._clear_pending_mtp_draft_for_finished_requests()
-    self._enqueue_pending_mtp_draft_if_ready()
+    self._clear_pending_edge_cloud_draft_for_finished_requests()
+    self._enqueue_pending_edge_cloud_draft_if_ready()
 
     if deferred_empty_batch := self._pop_deferred_empty_batch():
         empty_outputs, _ = self._finish_empty_batch(deferred_empty_batch)
@@ -662,7 +666,10 @@ def _patched_step_with_batch_queue(self):
                 engine_core_outputs = empty_outputs
 
     if deferred_scheduler_output:
-        if self.use_spec_decode and not self._uses_split_qwen_mtp_draft():
+        if (
+            self.use_spec_decode
+            and not self._uses_scheduled_edge_cloud_draft()
+        ):
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids_in_output(
@@ -794,15 +801,17 @@ def install() -> None:
     EngineCore._finish_empty_batch = _finish_empty_batch
     EngineCore._defer_empty_batch = _defer_empty_batch
     EngineCore._pop_deferred_empty_batch = _pop_deferred_empty_batch
-    EngineCore._enqueue_pending_mtp_draft_if_ready = (
-        _enqueue_pending_mtp_draft_if_ready
+    EngineCore._enqueue_pending_edge_cloud_draft_if_ready = (
+        _enqueue_pending_edge_cloud_draft_if_ready
     )
-    EngineCore._clear_pending_mtp_draft_for_finished_requests = (
-        _clear_pending_mtp_draft_for_finished_requests
+    EngineCore._clear_pending_edge_cloud_draft_for_finished_requests = (
+        _clear_pending_edge_cloud_draft_for_finished_requests
     )
-    EngineCore._uses_split_qwen_mtp_draft = _uses_split_qwen_mtp_draft
-    EngineCore._has_unresolved_qwen_mtp_parent = (
-        _has_unresolved_qwen_mtp_parent
+    EngineCore._uses_scheduled_edge_cloud_draft = (
+        _uses_scheduled_edge_cloud_draft
+    )
+    EngineCore._has_unresolved_edge_cloud_draft_parent = (
+        _has_unresolved_edge_cloud_draft_parent
     )
     EngineCore.step = _patched_step
     EngineCore.step_with_batch_queue = _patched_step_with_batch_queue

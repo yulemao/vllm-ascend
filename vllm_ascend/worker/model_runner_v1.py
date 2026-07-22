@@ -506,8 +506,10 @@ class NPUModelRunner(GPUModelRunner):
         # head_token.  Each entry holds the minimal context needed to verify
         # that a later tail-segment batch matches its head segment.
         self._pending_head_states: dict[str, "HeadState"] = {}
-        self._pending_mtp_draft_contexts: dict[str, dict[str, Any]] = {}
-        self._pending_mtp_draft_task_ids: deque[str] = deque()
+        self._pending_edge_cloud_draft_contexts: dict[
+            str, dict[str, Any]
+        ] = {}
+        self._pending_edge_cloud_draft_task_ids: deque[str] = deque()
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -807,11 +809,11 @@ class NPUModelRunner(GPUModelRunner):
         # for edge-cloud mamba state sync (especially on the cloud side).
         self._last_scheduler_output: "SchedulerOutput | None" = None
 
-        # Saved on the cloud side during execute_model() for use by
-        # _run_draft_cloud_segment() which runs later in sample_tokens().
+        # Latest cloud-side target metadata for draft paths that do not cross
+        # an independent scheduling boundary.
         self._cloud_spec_decode_common_attn_metadata: AscendCommonAttentionMetadata | None = None
         self._cloud_spec_decode_num_reqs: int = 0
-        # Independently scheduled MTP drafts can run after unrelated prefill
+        # Independently scheduled drafts can run after unrelated prefill
         # or decode work.  Keep immutable target-step snapshots until the
         # matching draft task consumes them instead of relying on the latest
         # global metadata pointer.
@@ -820,11 +822,14 @@ class NPUModelRunner(GPUModelRunner):
         ] = {}
         self._cloud_spec_decode_metadata_cache_max: int = 8
         # Same per-task treatment for the verify step's scheduler_output:
-        # the independently scheduled MTP draft task applies the
+        # the independently scheduled draft task applies the
         # num_accepted / mamba state correction, and by then
         # _last_scheduler_output may already point at an unrelated batch.
         self._cloud_scheduler_output_by_task: dict[
             str, "SchedulerOutput"
+        ] = {}
+        self._eagle3_cloud_aux_hidden_states_by_task: dict[
+            str, torch.Tensor
         ] = {}
         self.enable_hamming_sparse = (self.ascend_config.enable_hamming_sparse is True)
         self.enable_hamming_sparse = self.enable_hamming_sparse and not vllm_config.speculative_config
@@ -2601,11 +2606,13 @@ class NPUModelRunner(GPUModelRunner):
 
         return draft_token_ids
 
-    def _is_qwen_mtp_spec_decode(self) -> bool:
+    def _uses_scheduled_edge_cloud_draft(self) -> bool:
         speculative_config = self.speculative_config
         if speculative_config is None:
             return False
         method = getattr(speculative_config, "method", None)
+        if method == "eagle3":
+            return True
         if method in ("qwen3_5_mtp", "qwen_mtp"):
             return True
         if method != "mtp":
@@ -2613,11 +2620,11 @@ class NPUModelRunner(GPUModelRunner):
         hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
         return "qwen" in str(getattr(hf_config, "model_type", "")).lower()
 
-    def _should_defer_qwen_mtp_draft(
+    def _should_defer_edge_cloud_draft(
         self, scheduler_output: "SchedulerOutput"
     ) -> bool:
         return bool(
-            self._is_qwen_mtp_spec_decode()
+            self._uses_scheduled_edge_cloud_draft()
             and self._edge_cloud_enabled
             and is_edge_device()
             and self.drafter is not None
@@ -2627,21 +2634,20 @@ class NPUModelRunner(GPUModelRunner):
             )
         )
 
-    def _queue_pending_mtp_draft_task(self, task_id: str) -> None:
-        if task_id not in self._pending_mtp_draft_task_ids:
-            self._pending_mtp_draft_task_ids.append(task_id)
+    def _queue_pending_edge_cloud_draft_task(self, task_id: str) -> None:
+        if task_id not in self._pending_edge_cloud_draft_task_ids:
+            self._pending_edge_cloud_draft_task_ids.append(task_id)
 
-    def _stash_pending_mtp_draft_context(
+    def _stash_pending_edge_cloud_draft_context(
         self,
         scheduler_output: "SchedulerOutput",
         sampled_token_ids: torch.Tensor | list[list[int]],
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        sample_hidden_states: torch.Tensor | None,
     ) -> None:
         if scheduler_output.head_token is None:
             raise RuntimeError(
-                "Cannot defer MTP draft without the target head_token"
+                "Cannot defer edge-cloud draft without the target head_token"
             )
         # The target head_token is already globally unique and is present on
         # both the cloud target step and the edge tail step.  Reusing it as
@@ -2653,7 +2659,7 @@ class NPUModelRunner(GPUModelRunner):
         # The first draft pass (spec_step_idx == 0) must run over ALL tokens
         # the target model just processed (the full prompt after a prefill,
         # all verify tokens after a decode step), not just the last row of
-        # each request.  This is what populates the MTP layer's own KV
+        # each request. This is what populates the draft layer's own KV
         # cache with the prompt, and the cloud reuses the target step's
         # attention metadata verbatim for step 0, so the token counts must
         # match exactly.  Selecting only the last num_reqs rows here makes
@@ -2729,8 +2735,8 @@ class NPUModelRunner(GPUModelRunner):
             "mtp_draft_task_id": task_id,
             "draft_step_idx": 0,
         }
-        self._pending_mtp_draft_contexts[task_id] = context
-        self._queue_pending_mtp_draft_task(task_id)
+        self._pending_edge_cloud_draft_contexts[task_id] = context
+        self._queue_pending_edge_cloud_draft_task(task_id)
 
         if torch.is_tensor(sampled_token_ids):
             assert self.drafter is not None
@@ -2763,14 +2769,16 @@ class NPUModelRunner(GPUModelRunner):
             )
         self._draft_token_ids = None
 
-    def take_pending_mtp_draft_scheduler_output(
+    def take_pending_edge_cloud_draft_scheduler_output(
         self,
     ) -> "SchedulerOutput | None":
         context = None
         task_id = None
-        while self._pending_mtp_draft_task_ids:
-            candidate_task_id = self._pending_mtp_draft_task_ids.popleft()
-            candidate = self._pending_mtp_draft_contexts.get(
+        while self._pending_edge_cloud_draft_task_ids:
+            candidate_task_id = (
+                self._pending_edge_cloud_draft_task_ids.popleft()
+            )
+            candidate = self._pending_edge_cloud_draft_contexts.get(
                 candidate_task_id
             )
             if (
@@ -2787,7 +2795,7 @@ class NPUModelRunner(GPUModelRunner):
 
         req_ids = tuple(context.get("req_ids") or ())
         if not req_ids:
-            self._pending_mtp_draft_contexts.pop(task_id, None)
+            self._pending_edge_cloud_draft_contexts.pop(task_id, None)
             return None
         draft_step_idx = int(context.get("draft_step_idx", 0) or 0)
         context["enqueued"] = True
@@ -2801,11 +2809,11 @@ class NPUModelRunner(GPUModelRunner):
             draft_step_idx=draft_step_idx,
         )
 
-    def take_completed_mtp_draft_result(
+    def take_completed_edge_cloud_draft_result(
         self,
     ) -> "tuple[DraftTokenIds, SchedulerOutput] | None":
         for task_id, context in list(
-            self._pending_mtp_draft_contexts.items()
+            self._pending_edge_cloud_draft_contexts.items()
         ):
             if not context.get("draft_complete", False):
                 continue
@@ -2820,36 +2828,38 @@ class NPUModelRunner(GPUModelRunner):
                 draft_token_tensor.detach().cpu().tolist(),
             )
             parent_scheduler_output = context["scheduler_output"]
-            self._pending_mtp_draft_contexts.pop(task_id, None)
+            self._pending_edge_cloud_draft_contexts.pop(task_id, None)
             return result, parent_scheduler_output
         return None
 
-    def clear_pending_mtp_draft_for_req_ids(
+    def clear_pending_edge_cloud_draft_for_req_ids(
         self, req_ids: set[str] | list[str]
     ) -> None:
         req_id_set = set(req_ids)
         stale_task_ids = [
             task_id
-            for task_id, context in self._pending_mtp_draft_contexts.items()
+            for task_id, context in (
+                self._pending_edge_cloud_draft_contexts.items()
+            )
             if req_id_set.intersection(context.get("req_ids") or ())
         ]
         for task_id in stale_task_ids:
-            self._pending_mtp_draft_contexts.pop(task_id, None)
+            self._pending_edge_cloud_draft_contexts.pop(task_id, None)
         if stale_task_ids:
             stale = set(stale_task_ids)
-            self._pending_mtp_draft_task_ids = deque(
+            self._pending_edge_cloud_draft_task_ids = deque(
                 task_id
-                for task_id in self._pending_mtp_draft_task_ids
+                for task_id in self._pending_edge_cloud_draft_task_ids
                 if task_id not in stale
             )
 
-    def _get_pending_mtp_draft_context(
+    def _get_pending_edge_cloud_draft_context(
         self, scheduler_output: "SchedulerOutput"
     ) -> dict[str, Any]:
         task_id = scheduler_output.mtp_draft_task_id
         if task_id is None:
             raise RuntimeError("MTP_DRAFT batch missing mtp_draft_task_id")
-        context = self._pending_mtp_draft_contexts.get(task_id)
+        context = self._pending_edge_cloud_draft_contexts.get(task_id)
         if context is None:
             raise RuntimeError(
                 "MTP_DRAFT batch has no pending draft context: "
@@ -2857,10 +2867,12 @@ class NPUModelRunner(GPUModelRunner):
             )
         return context
 
-    def _prepare_mtp_edge_step_inputs(
+    def _prepare_edge_cloud_draft_step_inputs(
         self, scheduler_output: "SchedulerOutput"
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        context = self._get_pending_mtp_draft_context(scheduler_output)
+        context = self._get_pending_edge_cloud_draft_context(
+            scheduler_output
+        )
         draft_step_idx = int(scheduler_output.draft_step_idx or 0)
         if draft_step_idx > 0:
             return (
@@ -2872,8 +2884,8 @@ class NPUModelRunner(GPUModelRunner):
 
         # First speculative step: run the draft model over ALL tokens the
         # target model just processed.  The draft input ids are the target
-        # token ids shifted left by one within each request, so the MTP
-        # layer's KV cache is populated for the whole sequence.  The sampled
+        # token ids shifted left by one within each request, so the draft
+        # layer's KV cache is populated for the whole sequence. The sampled
         # next token must close each request at the last ACCEPTED row
         # (sample_row_indices), exactly like the stock drafter's
         # input_ids[token_indices_to_sample] = next_token_ids -- NOT at the
@@ -2908,16 +2920,18 @@ class NPUModelRunner(GPUModelRunner):
         hidden_states = context["hidden_states"]
         return input_ids, positions, hidden_states, draft_step_idx
 
-    def _run_mtp_edge_first_segment(
+    def _run_edge_cloud_draft_first_segment(
         self, scheduler_output: "SchedulerOutput"
     ) -> IntermediateTensors:
-        context = self._get_pending_mtp_draft_context(scheduler_output)
+        context = self._get_pending_edge_cloud_draft_context(
+            scheduler_output
+        )
         input_ids, positions, hidden_states, draft_step_idx = (
-            self._prepare_mtp_edge_step_inputs(scheduler_output)
+            self._prepare_edge_cloud_draft_step_inputs(scheduler_output)
         )
         num_tokens = positions.shape[-1] if self.uses_mrope else positions.shape[0]
         segment = self._edge_cloud_draft_segments["a"]
-        # Independently scheduled MTP draft batches do not enter
+        # Independently scheduled draft batches do not enter
         # execute_model(), so they do not inherit its forward context. Keep
         # the draft segments eager until the scheduler path can also preserve
         # graph dispatch metadata and stable input buffers across A/C/E.
@@ -2953,7 +2967,17 @@ class NPUModelRunner(GPUModelRunner):
                 hidden_states=hidden_states,
             )
         if not isinstance(output, IntermediateTensors):
-            raise RuntimeError("Qwen-MTP first segment returned no intermediates")
+            raise RuntimeError(
+                "Edge-cloud draft first segment returned no intermediates"
+            )
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "eagle3"
+            and draft_step_idx > 0
+        ):
+            # Eagle3 carries the previous draft layer's pre-norm residual to
+            # the cloud. Its edge segment only embeds the proposed token.
+            output["hidden_states"] = hidden_states
         output["positions"] = positions
         output["spec_step_idx"] = torch.tensor(
             draft_step_idx, dtype=torch.int64, device="cpu"
@@ -2967,13 +2991,21 @@ class NPUModelRunner(GPUModelRunner):
             if num_accepted_payload:
                 for key, value in num_accepted_payload.items():
                     output[key] = value
-        context["current_mtp_positions"] = positions
+        context["current_draft_positions"] = positions
         return output
 
-    def _compute_mtp_draft_token_ids(
+    def _compute_edge_cloud_draft_token_ids(
         self, hidden_states: torch.Tensor, draft_step_idx: int
     ) -> torch.Tensor:
         assert self.drafter is not None and self.drafter.model is not None
+        if self.speculative_config.method == "eagle3":
+            if get_ascend_config().enable_reduce_sample:
+                return self.drafter.compute_draft_token_ids(hidden_states)
+            logits = self.drafter.model.compute_logits(hidden_states)
+            assert logits is not None
+            if lmhead_tp_enable():
+                logits = logits[: hidden_states.shape[0]]
+            return logits.argmax(dim=-1)
         mtp_model = self.drafter.model
         if hasattr(mtp_model, "compute_logits"):
             try:
@@ -2991,7 +3023,7 @@ class NPUModelRunner(GPUModelRunner):
         return logits.argmax(dim=-1)
 
     @staticmethod
-    def _validate_mtp_payload_identity(
+    def _validate_edge_cloud_draft_payload_identity(
         scheduler_output: "SchedulerOutput", tensor_dict: dict[str, Any]
     ) -> None:
         expected_task_id = scheduler_output.mtp_draft_task_id
@@ -3022,14 +3054,16 @@ class NPUModelRunner(GPUModelRunner):
                 f"got={actual_head_token}"
             )
 
-    def _run_mtp_edge_last_segment(
+    def _run_edge_cloud_draft_last_segment(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors,
     ) -> ModelRunnerOutput:
-        context = self._get_pending_mtp_draft_context(scheduler_output)
+        context = self._get_pending_edge_cloud_draft_context(
+            scheduler_output
+        )
         draft_step_idx = int(scheduler_output.draft_step_idx or 0)
-        positions = context.get("current_mtp_positions")
+        positions = context.get("current_draft_positions")
         if positions is None:
             positions = intermediate_tensors.tensors.get("positions")
         if positions is None:
@@ -3056,33 +3090,49 @@ class NPUModelRunner(GPUModelRunner):
             # see _run_mtp_edge_first_segment): warmup calls segment "e"
             # with only positions + intermediate_tensors, and the last
             # segment (final norm) does not consume spec_step_idx anyway.
-            hidden_states = segment(
+            segment_output = segment(
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
             )
-        if not torch.is_tensor(hidden_states):
-            raise RuntimeError("Qwen-MTP last segment returned no hidden states")
+        if self.speculative_config.method == "eagle3":
+            if not (
+                isinstance(segment_output, tuple)
+                and len(segment_output) == 2
+                and all(torch.is_tensor(item) for item in segment_output)
+            ):
+                raise RuntimeError(
+                    "Eagle3 last segment did not return its hidden-state pair"
+                )
+            last_hidden_states, hidden_states = segment_output
+        else:
+            if not torch.is_tensor(segment_output):
+                raise RuntimeError(
+                    "MTP last segment returned no hidden states"
+                )
+            last_hidden_states = hidden_states = segment_output
         num_reqs = len(context["req_ids"])
-        if draft_step_idx == 0 and hidden_states.shape[0] != num_reqs:
+        if draft_step_idx == 0 and last_hidden_states.shape[0] != num_reqs:
             # The first draft pass ran over all scheduled tokens; only the
             # last row of each request produces the proposed draft token and
             # feeds the next speculative step.
             sample_rows = context["sample_row_indices"].to(
                 hidden_states.device
             )
-            logits_hidden_states = hidden_states[sample_rows]
+            logits_hidden_states = last_hidden_states[sample_rows]
+            next_hidden_states = hidden_states[sample_rows]
             step_positions = (
                 positions[:, sample_rows]
                 if self.uses_mrope
                 else positions[sample_rows]
             )
         else:
-            logits_hidden_states = hidden_states
+            logits_hidden_states = last_hidden_states
+            next_hidden_states = hidden_states
             step_positions = positions
-        draft_token_ids = self._compute_mtp_draft_token_ids(
+        draft_token_ids = self._compute_edge_cloud_draft_token_ids(
             logits_hidden_states, draft_step_idx
         )
-        context["last_draft_hidden_states"] = logits_hidden_states.clone()
+        context["last_draft_hidden_states"] = next_hidden_states.clone()
         context["last_draft_positions"] = step_positions.clone()
         context["last_draft_token_ids"] = draft_token_ids.clone()
         draft_steps = context.setdefault("draft_token_id_steps", [])
@@ -3097,7 +3147,7 @@ class NPUModelRunner(GPUModelRunner):
             context["draft_step_idx"] = next_step_idx
             context["enqueued"] = False
             assert scheduler_output.mtp_draft_task_id is not None
-            self._queue_pending_mtp_draft_task(
+            self._queue_pending_edge_cloud_draft_task(
                 scheduler_output.mtp_draft_task_id
             )
         else:
@@ -3535,8 +3585,8 @@ class NPUModelRunner(GPUModelRunner):
                         num_tokens_across_dp,
                     )
 
-                # Save spec_decode_common_attn_metadata for cloud-side
-                # MTP draft proposal.  On the cloud side,
+                # Save spec_decode_common_attn_metadata for the cloud-side
+                # draft proposal. On the cloud side,
                 # execute_model_state is None (cloud is not the last PP
                 # rank), so the metadata would otherwise be lost.
                 num_reqs = self.input_batch.num_reqs
@@ -3856,28 +3906,18 @@ class NPUModelRunner(GPUModelRunner):
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         if self._edge_cloud_enabled and not self.parallel_config.is_edge_node:
-            # Eagle3 still generates its draft synchronously from the parent
-            # verify step. Receive and run that middle segment before the
-            # accepted-token control payload sent later by the edge sampler.
-            if (
-                self.speculative_config
-                and self.speculative_config.method == "eagle3"
-                and hasattr(self, "_edge_cloud_draft_segments")
-                and "c" in self._edge_cloud_draft_segments
-            ):
-                self._run_draft_cloud_segment()
-
             # Sampling only runs on the edge, but the cloud must retain the
             # rejection-corrected state for its next target/draft forward.
-            # Deferred Qwen-MTP is excluded: its num_accepted payload rides
-            # the draft-step-0 execute_model payload and is applied in
-            # _run_mtp_cloud_segment.  Receiving it here as well would emit
+            # Independently scheduled drafts are excluded: their num_accepted
+            # payload rides the draft-step-0 execute_model payload and is
+            # applied in _run_edge_cloud_draft_middle_segment. Receiving it
+            # here as well would emit
             # a TP broadcast from the sample_tokens RPC stream, which races
-            # the MTP draft broadcasts (execute_model stream) on the shared
+            # draft broadcasts (execute_model stream) on the shared
             # mq_broadcaster and swaps payloads across ranks.
             if (
                 self.speculative_config
-                and not self._is_qwen_mtp_spec_decode()
+                and not self._uses_scheduled_edge_cloud_draft()
                 and (
                     self.model_config.is_hybrid
                     or self.speculative_config.method in ("mtp", "eagle3")
@@ -4115,27 +4155,26 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     and not self.speculative_config.disable_padded_drafter_batch
                 )
-                defer_qwen_mtp_draft = self._should_defer_qwen_mtp_draft(
-                    scheduler_output
+                defer_edge_cloud_draft = (
+                    self._should_defer_edge_cloud_draft(scheduler_output)
                 )
-                if defer_qwen_mtp_draft:
+                if defer_edge_cloud_draft:
                     sampled_token_ids = (
                         sampler_output.sampled_token_ids
                         if use_padded_batch
                         else valid_sampled_token_ids
                     )
-                    self._stash_pending_mtp_draft_context(
+                    self._stash_pending_edge_cloud_draft_context(
                         scheduler_output,
                         sampled_token_ids,
                         positions,
                         hidden_states,
-                        sample_hidden_states,
                     )
                 elif use_padded_batch:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
-                if not use_padded_batch and not defer_qwen_mtp_draft:
+                if not use_padded_batch and not defer_edge_cloud_draft:
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
@@ -4150,35 +4189,35 @@ class NPUModelRunner(GPUModelRunner):
                 and self.speculative_config
                 and (
                     self.model_config.is_hybrid
-                    or self.speculative_config.method in ("mtp", "eagle3")
+                    or self._uses_scheduled_edge_cloud_draft()
                 )
             ):
                 num_reqs = sampler_output.sampled_token_ids.size(0)
                 num_accepted = (sampler_output.sampled_token_ids != -1).sum(dim=1).cpu()
                 tensor_dict_to_send = {"num_accepted_tokens": num_accepted}
                 if (
-                    self.speculative_config.method in ("mtp", "eagle3")
+                    self._uses_scheduled_edge_cloud_draft()
                     and self.valid_sampled_token_count_gpu is not None
                 ):
                     tensor_dict_to_send["valid_sampled_token_count"] = (
                         self.valid_sampled_token_count_gpu.cpu()
                     )
-                if self._should_defer_qwen_mtp_draft(scheduler_output):
-                    # Deferred Qwen-MTP: do NOT send here.  This sample_tokens
-                    # runs on a different RPC stream than the cloud's
-                    # independently scheduled MTP draft steps, and the two
+                if self._should_defer_edge_cloud_draft(scheduler_output):
+                    # Deferred edge-cloud draft: do NOT send here.
+                    # sample_tokens runs on a different RPC stream than the cloud's
+                    # independently scheduled draft steps, and the two
                     # streams race on the cloud's shared TP mq_broadcaster
                     # (payloads get swapped -> unpack/type errors).  Stash
                     # the payload in the pending draft context instead;
-                    # _run_mtp_edge_first_segment piggybacks it on the
+                    # _run_edge_cloud_draft_first_segment piggybacks it on the
                     # draft-step-0 payload, keeping every cloud-side TP
                     # broadcast inside the execute_model stream.
-                    context = self._pending_mtp_draft_contexts.get(
+                    context = self._pending_edge_cloud_draft_contexts.get(
                         scheduler_output.head_token
                     )
                     if context is None:
                         raise RuntimeError(
-                            "Deferred Qwen-MTP draft context missing for "
+                            "Deferred edge-cloud draft context missing for "
                             f"head_token={scheduler_output.head_token}"
                         )
                     context["num_accepted_payload"] = tensor_dict_to_send
@@ -4276,7 +4315,7 @@ class NPUModelRunner(GPUModelRunner):
         common_attn_metadata: AscendCommonAttentionMetadata,
         num_reqs: int,
     ) -> None:
-        if not self._is_qwen_mtp_spec_decode():
+        if not self._uses_scheduled_edge_cloud_draft():
             # Other draft implementations consume the metadata synchronously
             # and do not cross a scheduler boundary.
             self._cloud_spec_decode_common_attn_metadata = (
@@ -4294,7 +4333,7 @@ class NPUModelRunner(GPUModelRunner):
         task_id = scheduler_output.head_token
         if task_id is None:
             raise RuntimeError(
-                "Cannot cache cloud MTP metadata without target head_token"
+                "Cannot cache cloud draft metadata without target head_token"
             )
         task_cache = self._cloud_spec_decode_metadata_by_task
         if (
@@ -4305,8 +4344,11 @@ class NPUModelRunner(GPUModelRunner):
             stale_task_id = next(iter(task_cache))
             task_cache.pop(stale_task_id)
             self._cloud_scheduler_output_by_task.pop(stale_task_id, None)
+            self._eagle3_cloud_aux_hidden_states_by_task.pop(
+                stale_task_id, None
+            )
             logger.warning(
-                "Cloud MTP metadata cache exceeded bound (%d); evicting "
+                "Cloud draft metadata cache exceeded bound (%d); evicting "
                 "unconsumed task_id=%s",
                 self._cloud_spec_decode_metadata_cache_max,
                 stale_task_id,
@@ -4342,7 +4384,7 @@ class NPUModelRunner(GPUModelRunner):
             )
         return cached
 
-    def _build_mtp_cloud_attn_metadata(
+    def _build_edge_cloud_draft_attn_metadata(
         self,
         positions: torch.Tensor,
         spec_step_idx: int,
@@ -4423,8 +4465,14 @@ class NPUModelRunner(GPUModelRunner):
                     spec_step_idx
                 )
 
-            # Subsequent speculative steps are always decode-only.
-            common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
+            # Match the proposer path: MTP uses SpecDecoding metadata while
+            # Eagle3 keeps the regular chunked-prefill attention state for
+            # its single-token follow-up passes.
+            common_attn_metadata.attn_state = (
+                AscendAttentionState.ChunkedPrefill
+                if self.speculative_config.method == "eagle3"
+                else AscendAttentionState.SpecDecoding
+            )
 
             # Edge sends the SAME (first-pass) snapshot of
             # slot_mapping / query_start_loc / num_actual_tokens /
@@ -4482,7 +4530,11 @@ class NPUModelRunner(GPUModelRunner):
             # model to read from an uninitialized KV cache, which corrupts
             # hidden states and leads to 100% draft-hit dead loops.
             if common_attn_metadata.attn_state is None:
-                common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
+                common_attn_metadata.attn_state = (
+                    AscendAttentionState.ChunkedPrefill
+                    if self.speculative_config.method == "eagle3"
+                    else AscendAttentionState.SpecDecoding
+                )
 
         # Build per-layer attention metadata using draft_attn_groups.
         per_layer_attn_metadata: dict[str, Any] = {}
@@ -4511,10 +4563,10 @@ class NPUModelRunner(GPUModelRunner):
         """Apply the edge-sampled rejection correction on the cloud.
 
         Sampling only runs on the edge, but the cloud must retain the
-        rejection-corrected state for its next target/draft forward.  For
-        deferred Qwen-MTP the payload rides the draft-step-0 execute_model
-        payload (instead of the racy sample_tokens RPC stream), so the
-        correction runs here, ahead of the draft forwards.
+        rejection-corrected state for its next target/draft forward. For an
+        independently scheduled draft the payload rides the draft-step-0
+        execute_model payload (instead of the racy sample_tokens RPC stream),
+        so the correction runs here, ahead of the draft forwards.
         """
         num_accepted = num_accepted.to(self.device)
         num_reqs = num_accepted.size(0)
@@ -4552,7 +4604,7 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 if target_scheduler_output is None:
                     raise RuntimeError(
-                        "Cloud MTP mamba sync has no scheduler_output for "
+                        "Cloud draft mamba sync has no scheduler_output for "
                         f"task_id={scheduler_output.mtp_draft_task_id}"
                     )
                 mamba_utils.postprocess_mamba(
@@ -4581,10 +4633,10 @@ class NPUModelRunner(GPUModelRunner):
                 non_blocking=True,
             )
 
-    def _run_mtp_cloud_segment(
+    def _run_edge_cloud_draft_middle_segment(
         self, scheduler_output: "SchedulerOutput"
     ) -> list:
-        """Run one independently scheduled Qwen-MTP cloud middle step.
+        """Run one independently scheduled edge-cloud draft middle step.
 
         Returns the async send handles of the cloud→edge result payload.
         The caller (worker) must record them and wait before the next
@@ -4607,7 +4659,9 @@ class NPUModelRunner(GPUModelRunner):
         for postprocess in comm_postprocess:
             postprocess()
         assert tensor_dict is not None
-        self._validate_mtp_payload_identity(scheduler_output, tensor_dict)
+        self._validate_edge_cloud_draft_payload_identity(
+            scheduler_output, tensor_dict
+        )
 
         spec_step_idx = int(scheduler_output.draft_step_idx or 0)
         # The edge piggybacks the verify step's num_accepted payload on the
@@ -4622,7 +4676,7 @@ class NPUModelRunner(GPUModelRunner):
         if num_accepted_payload is not None:
             if spec_step_idx != 0:
                 logger.warning(
-                    "num_accepted payload arrived on MTP draft step %d; "
+                    "num_accepted payload arrived on draft step %d; "
                     "expected step 0",
                     spec_step_idx,
                 )
@@ -4644,7 +4698,21 @@ class NPUModelRunner(GPUModelRunner):
             "positions": positions,
             "spec_step_idx": spec_step_idx,
         }
-        draft_attn_metadata = self._build_mtp_cloud_attn_metadata(
+        if self.speculative_config.method == "eagle3":
+            task_id = scheduler_output.mtp_draft_task_id
+            aux_hidden_states = (
+                self._eagle3_cloud_aux_hidden_states_by_task.get(task_id)
+                if spec_step_idx == 0 and task_id is not None
+                else None
+            )
+            self._prepare_eagle3_cloud_hidden_states(
+                self._edge_cloud_draft_segments["c"],
+                intermediate,
+                aux_hidden_states,
+                num_tokens,
+                is_first_step=spec_step_idx == 0,
+            )
+        draft_attn_metadata = self._build_edge_cloud_draft_attn_metadata(
             positions, spec_step_idx, scheduler_output
         )
 
@@ -4673,7 +4741,9 @@ class NPUModelRunner(GPUModelRunner):
         ):
             output = self._edge_cloud_draft_segments["c"](**model_kwargs)
         if not isinstance(output, IntermediateTensors):
-            raise RuntimeError("Qwen-MTP cloud segment returned no intermediates")
+            raise RuntimeError(
+                "Edge-cloud draft middle segment returned no intermediates"
+            )
 
         send_handles: list = []
         if get_pp_group().world_size == 2:
@@ -4706,122 +4776,10 @@ class NPUModelRunner(GPUModelRunner):
             self._cloud_scheduler_output_by_task.pop(
                 scheduler_output.mtp_draft_task_id, None
             )
+            self._eagle3_cloud_aux_hidden_states_by_task.pop(
+                scheduler_output.mtp_draft_task_id, None
+            )
         return send_handles
-
-    def _run_draft_cloud_segment(self) -> None:
-        from vllm_ascend.distributed.parallel_state import (
-            edge_cloud_broadcast_recv_draft,
-        )
-
-        # The edge side calls the draft model for each speculative step
-        # (including the first pass).  We loop the same number of times so
-        # that every edge request has a matching cloud response.
-        num_steps = (
-            self.speculative_config.num_speculative_tokens
-            if self.speculative_config else 1
-        )
-
-        for _ in range(num_steps):
-            # Receive intermediate from edge (including positions and spec_step_idx)
-            tensor_dict, comm_handles, comm_postprocess = (
-                edge_cloud_broadcast_recv_draft()
-            )
-            for handle in comm_handles:
-                handle.wait()
-            for postprocess in comm_postprocess:
-                postprocess()
-            intermediate = IntermediateTensors(tensor_dict)
-
-            # Build kwargs for cloud segment
-            positions = intermediate.tensors.get("positions", None)
-            num_tokens = positions.shape[-1] if positions is not None else 0
-
-            # Copy received tensors into persistent buffers so that the
-            # ACLGraphWrapper-wrapped segment_c sees stable input addresses.
-            intermediate = self._sync_edge_cloud_draft_intermediate_tensors(
-                num_tokens, intermediate
-            )
-
-            # Run cloud segment (all draft decoder layers are on cloud)
-            segment = self._edge_cloud_draft_segments["c"]
-            num_tokens = positions.shape[-1] if positions is not None else 0
-
-            model_kwargs = {
-                "intermediate_tensors": intermediate,
-                "positions": positions,
-            }
-            # Eagle3 layer 0 concatenates input_embeds with hidden_states, so
-            # the cloud segment needs both.
-            if "input_embeds" in intermediate.tensors:
-                model_kwargs["inputs_embeds"] = intermediate.tensors["input_embeds"]
-            spec_step_idx = 0
-            if "spec_step_idx" in tensor_dict:
-                spec_step_idx = tensor_dict["spec_step_idx"].item()
-
-            # Prepare the input before the ACLGraph-wrapped segment.  The
-            # segment must not branch on spec_step_idx: graph capture would
-            # otherwise freeze the first captured branch.
-            if (
-                self.speculative_config is not None
-                and self.speculative_config.method == "eagle3"
-            ):
-                aux_hidden_states = (
-                    getattr(self, "_eagle3_cloud_aux_hidden_states", None)
-                    if spec_step_idx == 0
-                    else None
-                )
-                self._prepare_eagle3_cloud_hidden_states(
-                    segment,
-                    intermediate,
-                    aux_hidden_states,
-                    num_tokens,
-                    is_first_step=spec_step_idx == 0,
-                )
-
-            # Build attention metadata for the draft decoder layers.
-            # Without this, the Ascend attention backend silently
-            # returns zeros, corrupting hidden states.
-            draft_attn_metadata = self._build_mtp_cloud_attn_metadata(
-                positions, spec_step_idx
-            )
-
-            # Determine cudagraph runtime mode for the draft cloud segment so
-            # that ACLGraphWrapper can replay a captured graph during decode.
-            cudagraph_runtime_mode = CUDAGraphMode.NONE
-            batch_descriptor = BatchDescriptor(num_tokens)
-            # if (
-            #     self.edge_cloud_cfg.enable_decode_graph
-            #     and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
-            #     and num_tokens > 0
-            # ):
-            #     cudagraph_runtime_mode, batch_descriptor = (
-            #         self.cudagraph_dispatcher.dispatch(
-            #             num_tokens=num_tokens,
-            #             uniform_decode=True,
-            #             has_lora=False,
-            #         )
-            #     )
-
-            with set_ascend_forward_context(
-                attn_metadata=draft_attn_metadata,
-                vllm_config=self.vllm_config,
-                num_tokens=num_tokens,
-                num_actual_tokens=num_tokens,
-                batch_descriptor=batch_descriptor,
-                aclgraph_runtime_mode=cudagraph_runtime_mode,
-                is_draft_model=True,
-            ):
-                output = segment(**model_kwargs)
-            assert isinstance(output, IntermediateTensors)
-
-            # Send back to edge
-            if get_pp_group().world_size == 2:
-                send_work = get_pp_group().isend_tensor_dict(
-                    {k: v.contiguous() if isinstance(v, torch.Tensor) else v
-                     for k, v in output.items()}
-                )
-                for handle in send_work:
-                    handle.wait()
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):
@@ -5920,9 +5878,18 @@ class NPUModelRunner(GPUModelRunner):
         # Build a new IntermediateTensors instead of mutating the returned one,
         # because the returned object may be reused by ACL graph replay.
         if "aux_hidden_states" in hidden_states.tensors:
-            self._eagle3_cloud_aux_hidden_states = hidden_states.tensors[
-                "aux_hidden_states"
-            ]
+            aux_hidden_states = hidden_states.tensors["aux_hidden_states"]
+            self._eagle3_cloud_aux_hidden_states = aux_hidden_states
+            scheduler_output = self._last_scheduler_output
+            if (
+                self._uses_scheduled_edge_cloud_draft()
+                and self.speculative_config.method == "eagle3"
+                and scheduler_output is not None
+                and scheduler_output.head_token is not None
+            ):
+                self._eagle3_cloud_aux_hidden_states_by_task[
+                    scheduler_output.head_token
+                ] = _freeze_scheduled_state(aux_hidden_states)
             return IntermediateTensors(
                 {
                     k: v

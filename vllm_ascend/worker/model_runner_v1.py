@@ -819,6 +819,13 @@ class NPUModelRunner(GPUModelRunner):
             str, tuple[AscendCommonAttentionMetadata, int]
         ] = {}
         self._cloud_spec_decode_metadata_cache_max: int = 8
+        # Same per-task treatment for the verify step's scheduler_output:
+        # the independently scheduled MTP draft task applies the
+        # num_accepted / mamba state correction, and by then
+        # _last_scheduler_output may already point at an unrelated batch.
+        self._cloud_scheduler_output_by_task: dict[
+            str, "SchedulerOutput"
+        ] = {}
         self.enable_hamming_sparse = (self.ascend_config.enable_hamming_sparse is True)
         self.enable_hamming_sparse = self.enable_hamming_sparse and not vllm_config.speculative_config
         if self.enable_hamming_sparse is True:
@@ -2909,6 +2916,15 @@ class NPUModelRunner(GPUModelRunner):
         output["spec_step_idx"] = torch.tensor(
             draft_step_idx, dtype=torch.int64, device="cpu"
         )
+        if draft_step_idx == 0:
+            # Piggyback the verify step's num_accepted payload (stashed in
+            # sample_tokens) on the first draft payload.  The cloud applies
+            # the correction when it receives step 0, inside its
+            # execute_model stream.
+            num_accepted_payload = context.get("num_accepted_payload")
+            if num_accepted_payload:
+                for key, value in num_accepted_payload.items():
+                    output[key] = value
         context["current_mtp_positions"] = positions
         return output
 
@@ -3797,8 +3813,15 @@ class NPUModelRunner(GPUModelRunner):
 
             # Sampling only runs on the edge, but the cloud must retain the
             # rejection-corrected state for its next target/draft forward.
+            # Deferred Qwen-MTP is excluded: its num_accepted payload rides
+            # the draft-step-0 execute_model payload and is applied in
+            # _run_mtp_cloud_segment.  Receiving it here as well would emit
+            # a TP broadcast from the sample_tokens RPC stream, which races
+            # the MTP draft broadcasts (execute_model stream) on the shared
+            # mq_broadcaster and swaps payloads across ranks.
             if (
                 self.speculative_config
+                and not self._is_qwen_mtp_spec_decode()
                 and (
                     self.model_config.is_hybrid
                     or self.speculative_config.method in ("mtp", "eagle3")
@@ -4084,7 +4107,26 @@ class NPUModelRunner(GPUModelRunner):
                     tensor_dict_to_send["valid_sampled_token_count"] = (
                         self.valid_sampled_token_count_gpu.cpu()
                     )
-                if get_pp_group().world_size == 2:
+                if self._should_defer_qwen_mtp_draft(scheduler_output):
+                    # Deferred Qwen-MTP: do NOT send here.  This sample_tokens
+                    # runs on a different RPC stream than the cloud's
+                    # independently scheduled MTP draft steps, and the two
+                    # streams race on the cloud's shared TP mq_broadcaster
+                    # (payloads get swapped -> unpack/type errors).  Stash
+                    # the payload in the pending draft context instead;
+                    # _run_mtp_edge_first_segment piggybacks it on the
+                    # draft-step-0 payload, keeping every cloud-side TP
+                    # broadcast inside the execute_model stream.
+                    context = self._pending_mtp_draft_contexts.get(
+                        scheduler_output.head_token
+                    )
+                    if context is None:
+                        raise RuntimeError(
+                            "Deferred Qwen-MTP draft context missing for "
+                            f"head_token={scheduler_output.head_token}"
+                        )
+                    context["num_accepted_payload"] = tensor_dict_to_send
+                elif get_pp_group().world_size == 2:
                     send_work = get_pp_group().isend_tensor_dict(tensor_dict_to_send)
                     for handle in send_work:
                         handle.wait()
@@ -4206,6 +4248,7 @@ class NPUModelRunner(GPUModelRunner):
         ):
             stale_task_id = next(iter(task_cache))
             task_cache.pop(stale_task_id)
+            self._cloud_scheduler_output_by_task.pop(stale_task_id, None)
             logger.warning(
                 "Cloud MTP metadata cache exceeded bound (%d); evicting "
                 "unconsumed task_id=%s",
@@ -4213,6 +4256,12 @@ class NPUModelRunner(GPUModelRunner):
                 stale_task_id,
             )
         task_cache[task_id] = (frozen_metadata, num_reqs)
+        # Freeze the verify step's scheduler_output alongside the metadata.
+        # The draft task that consumes it is scheduled independently, so the
+        # global _last_scheduler_output may already have moved on.
+        self._cloud_scheduler_output_by_task[task_id] = replace(
+            scheduler_output
+        )
 
     def _resolve_cloud_spec_decode_metadata(
         self,
@@ -4397,6 +4446,85 @@ class NPUModelRunner(GPUModelRunner):
 
         return per_layer_attn_metadata
 
+    def _apply_cloud_num_accepted_payload(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_accepted: torch.Tensor,
+        valid_sampled_token_count: torch.Tensor | None,
+    ) -> None:
+        """Apply the edge-sampled rejection correction on the cloud.
+
+        Sampling only runs on the edge, but the cloud must retain the
+        rejection-corrected state for its next target/draft forward.  For
+        deferred Qwen-MTP the payload rides the draft-step-0 execute_model
+        payload (instead of the racy sample_tokens RPC stream), so the
+        correction runs here, ahead of the draft forwards.
+        """
+        num_accepted = num_accepted.to(self.device)
+        num_reqs = num_accepted.size(0)
+        self.num_accepted_tokens.gpu[:num_reqs] = num_accepted
+
+        if valid_sampled_token_count is not None:
+            self.valid_sampled_token_count_gpu = (
+                valid_sampled_token_count.to(self.device)
+            )
+            self.input_batch.prev_req_id_to_index = {
+                req_id: i
+                for i, req_id in enumerate(self.input_batch.req_ids)
+            }
+
+        if self.model_config.is_hybrid:
+            if self.cache_config.mamba_cache_mode == "align":
+                accepted_counts = (
+                    self.num_accepted_tokens.gpu[:num_reqs]
+                    .cpu()
+                    .numpy()
+                )
+                for i, num_tokens in enumerate(accepted_counts):
+                    self.input_batch.num_accepted_tokens_cpu[i] = (
+                        num_tokens
+                    )
+                # The draft task is scheduled independently of the verify
+                # step, so the global _last_scheduler_output may already
+                # point at an unrelated batch.  Use the per-task snapshot
+                # cached during the verify step's execute_model.
+                target_scheduler_output = (
+                    self._cloud_scheduler_output_by_task.get(
+                        scheduler_output.mtp_draft_task_id
+                    )
+                    or self._last_scheduler_output
+                )
+                if target_scheduler_output is None:
+                    raise RuntimeError(
+                        "Cloud MTP mamba sync has no scheduler_output for "
+                        f"task_id={scheduler_output.mtp_draft_task_id}"
+                    )
+                mamba_utils.postprocess_mamba(
+                    target_scheduler_output,
+                    self.kv_cache_config,
+                    self.cache_config,
+                    self.input_batch,
+                    self.requests,
+                    self.mamba_state_idx,
+                    self.compilation_config.static_forward_context,
+                    self.model.get_mamba_state_copy_func(),
+                    self._get_mamba_copy_bufs(),
+                )
+            else:
+                self.input_batch.num_accepted_tokens_cpu_tensor[
+                    :num_reqs
+                ].copy_(
+                    self.num_accepted_tokens.gpu[:num_reqs],
+                    non_blocking=True,
+                )
+        else:
+            self.input_batch.num_accepted_tokens_cpu_tensor[
+                :num_reqs
+            ].copy_(
+                self.num_accepted_tokens.gpu[:num_reqs],
+                non_blocking=True,
+            )
+
     def _run_mtp_cloud_segment(
         self, scheduler_output: "SchedulerOutput"
     ) -> list:
@@ -4425,6 +4553,29 @@ class NPUModelRunner(GPUModelRunner):
         assert tensor_dict is not None
         self._validate_mtp_payload_identity(scheduler_output, tensor_dict)
 
+        spec_step_idx = int(scheduler_output.draft_step_idx or 0)
+        # The edge piggybacks the verify step's num_accepted payload on the
+        # first draft payload (kept inside the execute_model RPC stream so
+        # it cannot race the cloud's TP mq_broadcaster from sample_tokens).
+        # Pop it before building IntermediateTensors and apply the
+        # rejection-corrected state for the next target/draft forward.
+        num_accepted_payload = tensor_dict.pop("num_accepted_tokens", None)
+        valid_sampled_token_count = tensor_dict.pop(
+            "valid_sampled_token_count", None
+        )
+        if num_accepted_payload is not None:
+            if spec_step_idx != 0:
+                logger.warning(
+                    "num_accepted payload arrived on MTP draft step %d; "
+                    "expected step 0",
+                    spec_step_idx,
+                )
+            self._apply_cloud_num_accepted_payload(
+                scheduler_output,
+                num_accepted_payload,
+                valid_sampled_token_count,
+            )
+
         positions = tensor_dict.get("positions")
         if positions is None:
             raise RuntimeError("MTP_DRAFT cloud payload missing positions")
@@ -4432,7 +4583,6 @@ class NPUModelRunner(GPUModelRunner):
         intermediate = self._sync_edge_cloud_draft_intermediate_tensors(
             num_tokens, IntermediateTensors(tensor_dict)
         )
-        spec_step_idx = int(scheduler_output.draft_step_idx or 0)
         model_kwargs = {
             "intermediate_tensors": intermediate,
             "positions": positions,
@@ -4495,6 +4645,9 @@ class NPUModelRunner(GPUModelRunner):
             and spec_step_idx + 1 >= self.num_spec_tokens
         ):
             self._cloud_spec_decode_metadata_by_task.pop(
+                scheduler_output.mtp_draft_task_id, None
+            )
+            self._cloud_scheduler_output_by_task.pop(
                 scheduler_output.mtp_draft_task_id, None
             )
         return send_handles

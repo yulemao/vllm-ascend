@@ -171,7 +171,7 @@ def _drain_pd_channel_inbox(self) -> None:
     if not (
         hasattr(self.scheduler, "prefills_last_ready")
         and hasattr(self.scheduler, "decodes_last_ready")
-        and hasattr(self.scheduler, "mtp_drafts_last_ready")
+        and hasattr(self.scheduler, "drafts_last_ready")
     ):
         return
     new_outputs = self._pp_pd_channel.consume_new_outputs()
@@ -182,12 +182,12 @@ def _drain_pd_channel_inbox(self) -> None:
             self.scheduler.prefills_last_ready.append(so)
         elif bt == BatchType.DECODE_LAST:
             self.scheduler.decodes_last_ready.append(so)
-        elif bt == BatchType.MTP_DRAFT_LAST:
-            self.scheduler.mtp_drafts_last_ready.append(so)
+        elif bt == BatchType.DRAFT_LAST:
+            self.scheduler.drafts_last_ready.append(so)
         else:
             logger.error(
                 "PD-separation POST_OUT received unexpected batch_type=%s; "
-                "expected PREFILL_LAST, DECODE_LAST, or MTP_DRAFT_LAST. "
+                "expected PREFILL_LAST, DECODE_LAST, or DRAFT_LAST. "
                 "Dropping.",
                 bt.value if bt is not None else "<none>",
             )
@@ -210,14 +210,14 @@ def _maybe_publish_pre_out(
     if getattr(self, "_pp_pd_channel", None) is None:
         return
     bt = scheduler_output.batch_type
-    if bt in (BatchType.DECODE_FIRST, BatchType.MTP_DRAFT_FIRST):
+    if bt in (BatchType.DECODE_FIRST, BatchType.DRAFT_FIRST):
         self._pp_pd_channel.publish(scheduler_output)
     elif bt in (
         BatchType.EMPTY,
         BatchType.PREFILL_FIRST,
         BatchType.PREFILL_LAST,
         BatchType.DECODE_LAST,
-        BatchType.MTP_DRAFT_LAST,
+        BatchType.DRAFT_LAST,
     ):
         return
     else:
@@ -233,7 +233,7 @@ def _ensure_pd_head_token(self, scheduler_output: SchedulerOutput) -> None:
     if scheduler_output.batch_type not in (
         BatchType.PREFILL_FIRST,
         BatchType.DECODE_FIRST,
-        BatchType.MTP_DRAFT_FIRST,
+        BatchType.DRAFT_FIRST,
     ):
         return
     if not scheduler_output.head_token:
@@ -260,7 +260,7 @@ def _publish_pre_out_when_ready(self) -> None:
     _, oldest_so, _ = batch_queue[-1]
     if oldest_so.batch_type not in (
         BatchType.PREFILL_FIRST,
-        BatchType.MTP_DRAFT_FIRST,
+        BatchType.DRAFT_FIRST,
     ):
         return
 
@@ -386,7 +386,7 @@ def _enqueue_pending_edge_cloud_draft_if_ready(self) -> None:
     """Move completed/new edge-cloud draft work across the executor boundary."""
     if not getattr(self, "use_spec_decode", False):
         return
-    ready_queue = getattr(self.scheduler, "mtp_drafts_first_ready", None)
+    ready_queue = getattr(self.scheduler, "drafts_first_ready", None)
     if ready_queue is None:
         return
 
@@ -408,9 +408,9 @@ def _enqueue_pending_edge_cloud_draft_if_ready(self) -> None:
     scheduler_output = take_pending()
     if scheduler_output is None:
         return
-    if scheduler_output.batch_type != BatchType.MTP_DRAFT_FIRST:
+    if scheduler_output.batch_type != BatchType.DRAFT_FIRST:
         raise RuntimeError(
-            "Pending edge-cloud draft must be MTP_DRAFT_FIRST, got "
+            "Pending edge-cloud draft must be DRAFT_FIRST, got "
             f"{scheduler_output.batch_type}"
         )
     ready_queue.append(scheduler_output)

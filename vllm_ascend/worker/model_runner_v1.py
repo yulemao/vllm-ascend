@@ -2809,11 +2809,11 @@ class NPUModelRunner(GPUModelRunner):
         context["enqueued"] = True
         return replace(
             context["scheduler_output"],
-            batch_type=BatchType.MTP_DRAFT_FIRST,
+            batch_type=BatchType.DRAFT_FIRST,
             head_token=None,
             hidden_channel=HiddenChannelType.DECODE,
             parent_req_id=req_ids[0],
-            mtp_draft_task_id=task_id,
+            draft_task_id=task_id,
             draft_step_idx=draft_step_idx,
         )
 
@@ -2863,13 +2863,13 @@ class NPUModelRunner(GPUModelRunner):
     def _get_pending_edge_cloud_draft_context(
         self, scheduler_output: "SchedulerOutput"
     ) -> dict[str, Any]:
-        task_id = scheduler_output.mtp_draft_task_id
+        task_id = scheduler_output.draft_task_id
         if task_id is None:
-            raise RuntimeError("MTP_DRAFT batch missing mtp_draft_task_id")
+            raise RuntimeError("DRAFT batch missing draft_task_id")
         context = self._pending_edge_cloud_draft_contexts.get(task_id)
         if context is None:
             raise RuntimeError(
-                "MTP_DRAFT batch has no pending draft context: "
+                "DRAFT batch has no pending draft context: "
                 f"task_id={task_id}"
             )
         return context
@@ -3017,11 +3017,11 @@ class NPUModelRunner(GPUModelRunner):
     def _validate_edge_cloud_draft_payload_identity(
         scheduler_output: "SchedulerOutput", tensor_dict: dict[str, Any]
     ) -> None:
-        expected_task_id = scheduler_output.mtp_draft_task_id
-        actual_task_id = tensor_dict.get("mtp_draft_task_id")
+        expected_task_id = scheduler_output.draft_task_id
+        actual_task_id = tensor_dict.get("draft_task_id")
         if expected_task_id is not None and actual_task_id != expected_task_id:
             raise RuntimeError(
-                "MTP_DRAFT payload task mismatch: "
+                "DRAFT payload task mismatch: "
                 f"expected={expected_task_id}, got={actual_task_id}"
             )
         expected_step = int(scheduler_output.draft_step_idx or 0)
@@ -3031,7 +3031,7 @@ class NPUModelRunner(GPUModelRunner):
                 actual_step = int(actual_step.item())
             if actual_step is not None and int(actual_step) != expected_step:
                 raise RuntimeError(
-                    f"MTP_DRAFT payload {field} mismatch: "
+                    f"DRAFT payload {field} mismatch: "
                     f"expected={expected_step}, got={actual_step}"
                 )
         actual_head_token = tensor_dict.get("head_token")
@@ -3040,7 +3040,7 @@ class NPUModelRunner(GPUModelRunner):
             and actual_head_token != scheduler_output.head_token
         ):
             raise RuntimeError(
-                "MTP_DRAFT payload head_token mismatch: "
+                "DRAFT payload head_token mismatch: "
                 f"expected={scheduler_output.head_token}, "
                 f"got={actual_head_token}"
             )
@@ -3058,7 +3058,7 @@ class NPUModelRunner(GPUModelRunner):
         if positions is None:
             positions = intermediate_tensors.tensors.get("positions")
         if positions is None:
-            raise RuntimeError("MTP_DRAFT_LAST missing positions")
+            raise RuntimeError("DRAFT_LAST missing positions")
         num_tokens = positions.shape[-1] if self.uses_mrope else positions.shape[0]
         intermediate_tensors = (
             self._sync_edge_cloud_draft_intermediate_tensors(
@@ -3066,8 +3066,8 @@ class NPUModelRunner(GPUModelRunner):
             )
         )
         segment = self._edge_cloud_draft_segments["e"]
-        # MTP_DRAFT_LAST is dispatched independently as well, so it needs the
-        # same explicit eager context as MTP_DRAFT_FIRST.
+        # DRAFT_LAST is dispatched independently as well, so it needs the
+        # same explicit eager context as DRAFT_FIRST.
         with set_ascend_forward_context(
             attn_metadata=None,
             vllm_config=self.vllm_config,
@@ -3126,7 +3126,7 @@ class NPUModelRunner(GPUModelRunner):
         draft_steps = context.setdefault("draft_token_id_steps", [])
         if len(draft_steps) != draft_step_idx:
             raise RuntimeError(
-                "MTP_DRAFT step order mismatch: "
+                "DRAFT step order mismatch: "
                 f"expected={len(draft_steps)}, got={draft_step_idx}"
             )
         draft_steps.append(draft_token_ids.clone())
@@ -3134,9 +3134,9 @@ class NPUModelRunner(GPUModelRunner):
         if next_step_idx < self.num_spec_tokens:
             context["draft_step_idx"] = next_step_idx
             context["enqueued"] = False
-            assert scheduler_output.mtp_draft_task_id is not None
+            assert scheduler_output.draft_task_id is not None
             self._queue_pending_edge_cloud_draft_task(
-                scheduler_output.mtp_draft_task_id
+                scheduler_output.draft_task_id
             )
         else:
             context["draft_complete"] = True
@@ -4300,15 +4300,15 @@ class NPUModelRunner(GPUModelRunner):
                 self._cloud_spec_decode_num_reqs,
             )
 
-        task_id = scheduler_output.mtp_draft_task_id
+        task_id = scheduler_output.draft_task_id
         if task_id is None:
-            raise RuntimeError("MTP_DRAFT batch missing mtp_draft_task_id")
+            raise RuntimeError("DRAFT batch missing draft_task_id")
 
         task_cache = self._cloud_spec_decode_metadata_by_task
         cached = task_cache.get(task_id)
         if cached is None:
             raise RuntimeError(
-                "MTP_DRAFT has no matching target attention metadata: "
+                "DRAFT has no matching target attention metadata: "
                 f"task_id={task_id}"
             )
         return cached
@@ -4525,7 +4525,7 @@ class NPUModelRunner(GPUModelRunner):
                 # directly as scheduler_output.
                 target_scheduler_output = (
                     self._cloud_scheduler_output_by_task.get(
-                        scheduler_output.mtp_draft_task_id
+                        scheduler_output.draft_task_id
                     )
                     or scheduler_output
                 )
@@ -4563,18 +4563,18 @@ class NPUModelRunner(GPUModelRunner):
         Returns the async send handles of the cloud→edge result payload.
         The caller (worker) must record them and wait before the next
         DECODE-channel reuse instead of waiting here: the matching edge
-        tail recv (MTP_DRAFT_LAST) is only posted after the cloud
+        tail recv (DRAFT_LAST) is only posted after the cloud
         EngineCore publishes the tail SchedulerOutput, which is gated on
         this worker's completion ack -- waiting inside this function
         deadlocks the whole pipeline.
         """
         from vllm_ascend.distributed.parallel_state import (
-            edge_cloud_broadcast_recv_mtp,
-            edge_cloud_send_tensor_dict_mtp,
+            edge_cloud_broadcast_recv_scheduled_draft,
+            edge_cloud_send_tensor_dict_scheduled_draft,
         )
 
         tensor_dict, comm_handles, comm_postprocess = (
-            edge_cloud_broadcast_recv_mtp()
+            edge_cloud_broadcast_recv_scheduled_draft()
         )
         for handle in comm_handles:
             handle.wait()
@@ -4610,7 +4610,7 @@ class NPUModelRunner(GPUModelRunner):
 
         positions = tensor_dict.get("positions")
         if positions is None:
-            raise RuntimeError("MTP_DRAFT cloud payload missing positions")
+            raise RuntimeError("DRAFT cloud payload missing positions")
         num_tokens = positions.shape[-1]
         intermediate = self._sync_edge_cloud_draft_intermediate_tensors(
             num_tokens, IntermediateTensors(tensor_dict)
@@ -4621,7 +4621,7 @@ class NPUModelRunner(GPUModelRunner):
             "spec_step_idx": spec_step_idx,
         }
         if self.speculative_config.method == "eagle3":
-            task_id = scheduler_output.mtp_draft_task_id
+            task_id = scheduler_output.draft_task_id
             aux_hidden_states = (
                 self._eagle3_cloud_aux_hidden_states_by_task.get(task_id)
                 if spec_step_idx == 0 and task_id is not None
@@ -4677,29 +4677,31 @@ class NPUModelRunner(GPUModelRunner):
             }
             out_tensor_dict.update(
                 head_token=scheduler_output.head_token,
-                mtp_draft_task_id=scheduler_output.mtp_draft_task_id,
+                draft_task_id=scheduler_output.draft_task_id,
                 draft_step_idx=spec_step_idx,
             )
             # Async send only — do NOT wait here.  The edge posts the
-            # matching tail recv (MTP_DRAFT_LAST) only after the cloud
+            # matching tail recv (DRAFT_LAST) only after the cloud
             # EngineCore publishes the tail SchedulerOutput, which happens
             # after this worker's completion ack; waiting on these handles
             # before the ack circular-deadlocks edge and cloud.  Mirrors
             # _execute_model_cloud's _record_pp_send_work pattern.
-            send_handles = edge_cloud_send_tensor_dict_mtp(out_tensor_dict)
+            send_handles = edge_cloud_send_tensor_dict_scheduled_draft(
+                out_tensor_dict
+            )
 
         if (
-            scheduler_output.mtp_draft_task_id is not None
+            scheduler_output.draft_task_id is not None
             and spec_step_idx + 1 >= self.num_spec_tokens
         ):
             self._cloud_spec_decode_metadata_by_task.pop(
-                scheduler_output.mtp_draft_task_id, None
+                scheduler_output.draft_task_id, None
             )
             self._cloud_scheduler_output_by_task.pop(
-                scheduler_output.mtp_draft_task_id, None
+                scheduler_output.draft_task_id, None
             )
             self._eagle3_cloud_aux_hidden_states_by_task.pop(
-                scheduler_output.mtp_draft_task_id, None
+                scheduler_output.draft_task_id, None
             )
         return send_handles
 

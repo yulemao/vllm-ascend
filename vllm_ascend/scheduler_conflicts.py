@@ -33,8 +33,8 @@ def _vllm_pd_scheduler_schema_available() -> bool:
         "PREFILL_LAST",
         "DECODE_FIRST",
         "DECODE_LAST",
-        "MTP_DRAFT_FIRST",
-        "MTP_DRAFT_LAST",
+        "DRAFT_FIRST",
+        "DRAFT_LAST",
     )
     if any(not hasattr(BatchType, name) for name in required_batch_types):
         return False
@@ -51,7 +51,7 @@ def _vllm_pd_scheduler_schema_available() -> bool:
             "head_token",
             "hidden_channel",
             "parent_req_id",
-            "mtp_draft_task_id",
+            "draft_task_id",
             "draft_step_idx",
         )
     )
@@ -69,7 +69,7 @@ def validate_pd_separation_scheduler_conflicts(vllm_config: Any, ascend_config: 
         raise ValueError(
             "edge_cloud_config.pd_separation.enabled requires vLLM PD scheduler "
             "schema: BatchType, HiddenChannelType, and "
-            "SchedulerOutput batch/head/channel/MTP draft fields."
+            "SchedulerOutput batch/head/channel/scheduled draft fields."
         )
 
     if getattr(ascend_config, "recompute_scheduler_enable", False):

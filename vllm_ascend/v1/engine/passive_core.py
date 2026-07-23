@@ -357,9 +357,9 @@ def _trim_scheduler_output_for_worker_enqueue(
 
     Cloud worker ``_update_states`` only needs ``all_token_ids`` for cached
     requests that are not already in its persistent batch and have output
-    tokens.  The best local approximation is the previous cloud dispatch batch:
-    continuously dispatched requests can drop ``all_token_ids`` while newly
-    appearing / resumed requests keep it.
+    tokens.  The best local approximation is the most recent cloud dispatch
+    that ran ``_update_states``: continuously resident requests can drop
+    ``all_token_ids`` while newly appearing / resumed requests keep it.
     """
     cached = scheduler_output.scheduled_cached_reqs
     if cached is None:
@@ -428,6 +428,18 @@ def _trim_scheduler_output_for_worker_enqueue(
     cached_copy.all_token_ids = trimmed_all_token_ids
     so_copy.scheduled_cached_reqs = cached_copy
     return so_copy
+
+
+def _updates_worker_persistent_batch(
+    scheduler_output: SchedulerOutput,
+    slice_info,
+) -> bool:
+    """Whether this dispatch runs ``_update_states`` on the cloud worker."""
+    return (
+        scheduler_output.batch_type != BatchType.DRAFT_FIRST
+        and scheduler_output.total_num_scheduled_tokens > 0
+        and (slice_info is None or slice_info.is_first_slice)
+    )
 
 
 class PassiveEngineCoreProc:
@@ -697,9 +709,12 @@ class PassiveEngineCoreProc:
             self.executor.rpc_broadcast_mq.enqueue(
                 (b"pp_scheduler_output", payload, {}, None)
             )
-            self._prev_dispatch_req_ids = set(
-                batch.scheduler_output.num_scheduled_tokens.keys()
-            )
+            if _updates_worker_persistent_batch(
+                batch.scheduler_output, slice_info
+            ):
+                self._prev_dispatch_req_ids = set(
+                    batch.scheduler_output.num_scheduled_tokens.keys()
+                )
             _dt_enqueue = (time.monotonic() - _t0) * 1000
             if _dt_trim > 0.5 or _dt_enqueue > 0.5:
                 logger.info(

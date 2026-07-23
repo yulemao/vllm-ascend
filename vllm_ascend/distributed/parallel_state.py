@@ -20,6 +20,7 @@ from vllm.distributed.parallel_state import (
 )
 
 from vllm_ascend.ascend_config import get_ascend_config
+import vllm_ascend.envs as envs
 from vllm_ascend.utils import enable_dsa_cp_with_layer_shard, enable_sp, flashcomm2_enable
 from vllm.logger import logger
 
@@ -378,6 +379,81 @@ def _select_edge_cloud_meta_for_recv() -> EdgeCloudTensorMeta:
     )
 
 
+def warmup_edge_cloud_hidden_channels() -> None:
+    """Pre-establish every edge-cloud hidden-channel P2P link at startup.
+
+    The first isend/irecv on a hidden channel rendezvous the two sides
+    (gloo metadata exchange + HCCL link setup) and blocks the host until
+    the peer posts the matching op.  DRAFT_FIRST is published to the cloud
+    at schedule time while PREFILL_FIRST is published only when it is
+    about to execute, so a draft batch can overtake a prefill batch on the
+    cloud side.  If both batches happen to be the first use of their
+    channels, the two sides rendezvous on *different* channels and
+    deadlock: edge TP0 blocks in the PREFILL_2 send rendezvous while the
+    cloud workers block in the DECODE draft recv.  Exchanging a tiny
+    tensor-dict on every channel in both directions here -- in a fixed
+    global order -- moves that first-use rendezvous to init time, where
+    both sides are guaranteed to arrive in the same order.
+    """
+    pp_group = get_pp_group()
+    if pp_group.world_size != 2:
+        return
+    if not hasattr(pp_group, "isend_tensor_dict_on_hidden_channel"):
+        logger.warning(
+            "[edge-cloud] hidden-channel warmup skipped: pp group lacks "
+            "isend_tensor_dict_on_hidden_channel"
+        )
+        return
+    # Only warm channels whose groups were actually created (PREFILL_2
+    # requires create_hidden_channel_groups(), DECODE requires
+    # create_alternate_groups()).  Both sides run the same patched code,
+    # so they derive the same channel list and the fixed order below is
+    # consistent across the pair.
+    channels = [HiddenChannelType.PREFILL_1]
+    if getattr(pp_group, "prefill2_device_group", None) is not None:
+        channels.append(HiddenChannelType.PREFILL_2)
+    if getattr(pp_group, "alt_device_group", None) is not None:
+        channels.append(HiddenChannelType.DECODE)
+    rank = pp_group.rank_in_group
+    for channel in channels:
+        # Warm both directions in a fixed global order (rank0 -> rank1,
+        # then rank1 -> rank0) so the two sides can never rendezvous on
+        # different channels or directions and deadlock inside the warmup
+        # itself.  The tensor-dict exchange covers both the HCCL device
+        # group (hidden tensors) and the gloo cpu group (the metadata
+        # path used by scheduled-draft payloads).
+        for sender_rank in (0, 1):
+            if rank == sender_rank:
+                payload = {
+                    "channel_warmup": torch.zeros(
+                        8, dtype=torch.bfloat16, device="npu"
+                    ),
+                    "warmup_channel": channel.value,
+                }
+                handles = pp_group.isend_tensor_dict_on_hidden_channel(
+                    payload, channel=channel
+                )
+            else:
+                tensor_dict, handles, _ = (
+                    pp_group.irecv_tensor_dict_on_hidden_channel(
+                        channel=channel
+                    )
+                )
+                assert tensor_dict is not None and tensor_dict.get(
+                    "warmup_channel"
+                ) == channel.value, (
+                    "[edge-cloud] hidden-channel warmup received "
+                    f"unexpected payload on channel {channel.value}: "
+                    f"{tensor_dict!r}"
+                )
+            for handle in handles:
+                handle.wait()
+    logger.info(
+        "[edge-cloud] warmed up hidden channels %s (both directions)",
+        [c.value for c in channels],
+    )
+
+
 def init_ascend_model_parallel(
     parallel_config: ParallelConfig,
 ):
@@ -412,6 +488,13 @@ def init_ascend_model_parallel(
             pp_group.create_alternate_groups(backend)
             if hasattr(pp_group, "create_hidden_channel_groups"):
                 pp_group.create_hidden_channel_groups(backend)
+            # Pre-establish the HCCL/gloo links of every hidden channel so
+            # the first-use rendezvous never happens mid-pipeline, where a
+            # DRAFT_FIRST batch overtaking a PREFILL_FIRST batch on the
+            # cloud side would make the two sides rendezvous on different
+            # channels and deadlock.
+            if envs.VLLM_ASCEND_EDGE_CLOUD_CHANNEL_WARMUP:
+                warmup_edge_cloud_hidden_channels()
 
         # Ascend-specific groups that are currently disabled by default
         # in edge-cloud mode. If enabled in the future, they must follow

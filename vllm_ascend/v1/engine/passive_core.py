@@ -697,9 +697,26 @@ class PassiveEngineCoreProc:
             self.executor.rpc_broadcast_mq.enqueue(
                 (b"pp_scheduler_output", payload, {}, None)
             )
-            self._prev_dispatch_req_ids = set(
-                batch.scheduler_output.num_scheduled_tokens.keys()
-            )
+            # Only refresh _prev_dispatch_req_ids for batches that run
+            # _update_states on the cloud worker, i.e. that actually update its
+            # persistent input_batch.  On the cloud, DRAFT_FIRST is routed to
+            # _execute_model_cloud_draft (see worker.py), which does NOT call
+            # cloud_prepare_early/_update_states; every other batch type goes
+            # through _execute_model_cloud -> cloud_prepare_early ->
+            # _update_states.  _trim_scheduler_output_for_worker_enqueue treats
+            # _prev_dispatch_req_ids as "already resident in the worker's
+            # input_batch" and drops all_token_ids for those requests.  If a
+            # DRAFT_FIRST batch refreshed this set, a request that entered the
+            # pipeline via a draft dispatch would be assumed resident and have
+            # its all_token_ids trimmed while it is still absent from the
+            # worker's input_batch (req_index is None); the worker then needs
+            # all_token_ids to rebuild output_token_ids and crashes with a
+            # KeyError in gpu_model_runner._update_states.  Mirror the exact
+            # routing condition in worker.py here.
+            if batch.scheduler_output.batch_type is not BatchType.DRAFT_FIRST:
+                self._prev_dispatch_req_ids = set(
+                    batch.scheduler_output.num_scheduled_tokens.keys()
+                )
             _dt_enqueue = (time.monotonic() - _t0) * 1000
             if _dt_trim > 0.5 or _dt_enqueue > 0.5:
                 logger.info(

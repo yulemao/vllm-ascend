@@ -207,11 +207,15 @@ def _drain_pd_channel_inbox(self) -> None:
 def _maybe_publish_pre_out(
     self, scheduler_output: SchedulerOutput
 ) -> None:
-    """Forward DECODE_FIRST batches on the edge → cloud channel immediately.
+    """Forward DECODE_FIRST / DRAFT_FIRST batches on the edge → cloud
+    channel immediately.
 
-    DECODE_FIRST is published synchronously at schedule time because its
-    cloud-side decode-middle segment must start as soon as possible to keep
-    the decode pipeline full.
+    Both are published synchronously at schedule time because their
+    cloud-side middle segment must start as soon as possible to keep the
+    decode/draft pipeline full — and because the edge worker enters the
+    hidden-channel send right after dequeue, so a late notification leaves
+    the cloud side of the channel rendezvous (gloo metadata + HCCL comm
+    init) too far behind the edge side.
 
     PREFILL_FIRST is handled by _publish_pre_out_when_ready instead, which
     delays the ZMQ notification until the prefill head segment becomes the
@@ -259,6 +263,12 @@ def _publish_pre_out_when_ready(self) -> None:
     the edge worker is about to actually execute them, preventing the cloud
     from blocking on irecv while the edge prefill head segment is still
     queued behind other batches.
+
+    DRAFT_FIRST is intentionally NOT handled here: like DECODE_FIRST it is
+    published at schedule time (see _patched_step_with_batch_queue), because
+    the edge draft head starts its channel send immediately upon execution
+    and a delayed publish leaves the cloud side of the channel rendezvous
+    tens of seconds behind, which tears down the half-open connection.
     """
     ch = getattr(self, "_pp_pd_channel", None)
     if ch is None:
@@ -269,10 +279,7 @@ def _publish_pre_out_when_ready(self) -> None:
         return
 
     _, oldest_so, _ = batch_queue[-1]
-    if oldest_so.batch_type not in (
-        BatchType.PREFILL_FIRST,
-        BatchType.DRAFT_FIRST,
-    ):
+    if oldest_so.batch_type is not BatchType.PREFILL_FIRST:
         return
 
     head_token = getattr(oldest_so, "head_token", None)
@@ -577,10 +584,20 @@ def _patched_step_with_batch_queue(self):
         # state.
         self._ensure_pd_head_token(scheduler_output)
 
-        # [ascend insert] DECODE_FIRST is published immediately to keep the
-        # decode pipeline full; PREFILL_FIRST is delayed via
-        # _publish_pre_out_when_ready until it becomes next to execute.
-        if scheduler_output.batch_type == BatchType.DECODE_FIRST:
+        # [ascend insert] DECODE_FIRST and DRAFT_FIRST are published
+        # immediately at schedule time to keep the decode/draft pipeline
+        # full.  The edge worker starts the hidden-channel send as soon as
+        # the batch is dequeued, so the cloud must learn about the batch
+        # right away: on first use of the channel the two sides rendezvous
+        # (gloo metadata exchange + HCCL comm init), and if the cloud side
+        # only shows up tens of seconds later the half-open connection is
+        # torn down before the peer joins, killing both workers.
+        # PREFILL_FIRST is still delayed via _publish_pre_out_when_ready
+        # until it becomes next to execute.
+        if scheduler_output.batch_type in (
+            BatchType.DECODE_FIRST,
+            BatchType.DRAFT_FIRST,
+        ):
             self._maybe_publish_pre_out(scheduler_output)
 
         if scheduler_output.batch_type == BatchType.EMPTY:

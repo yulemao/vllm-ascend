@@ -143,13 +143,20 @@ def _load_patch_distributed_module():
     class BaseGroupCoordinator:
         pass
 
+    class TensorMetadata:
+        pass
+
     def _get_unique_name(group_name: str) -> str:
         unique_name_counter["value"] += 1
         return f"{group_name}-{unique_name_counter['value']}"
 
     parallel_state_module.GroupCoordinator = BaseGroupCoordinator
+    parallel_state_module.TensorMetadata = TensorMetadata
     parallel_state_module._get_unique_name = _get_unique_name
     parallel_state_module._register_group = MagicMock()
+    parallel_state_module._split_tensor_dict = MagicMock(
+        return_value=([], [])
+    )
     parallel_state_module.destroy_distributed_environment = destroy_distributed_environment
 
     shm_broadcast_module: Any = ModuleType("vllm.distributed.device_communicators.shm_broadcast")
@@ -277,6 +284,39 @@ def _calls_with_backend(module_env, backend: str) -> list[dict[str, object]]:
 
 def test_group_coordinator_is_patched(module_env):
     assert module_env.parallel_state_module.GroupCoordinator is module_env.module.GroupCoordinatorPatch
+
+
+def test_hidden_channels_create_independent_draft_groups(module_env):
+    group = _make_group(module_env, group_name="pp")
+    group.create_alternate_groups("hccl")
+    group.create_hidden_channel_groups("hccl")
+
+    prefill1_groups = group._hidden_channel_groups("prefill_1")
+    prefill2_groups = group._hidden_channel_groups("prefill_2")
+    decode_groups = group._hidden_channel_groups("decode")
+    draft_groups = group._hidden_channel_groups("draft")
+
+    assert len({
+        id(prefill1_groups[0]),
+        id(prefill2_groups[0]),
+        id(decode_groups[0]),
+        id(draft_groups[0]),
+    }) == 4
+    assert len({
+        id(prefill1_groups[1]),
+        id(prefill2_groups[1]),
+        id(decode_groups[1]),
+        id(draft_groups[1]),
+    }) == 4
+
+    group.destroy()
+
+    assert call(draft_groups[0]) in (
+        module_env.destroy_process_group.call_args_list
+    )
+    assert call(draft_groups[1]) in (
+        module_env.destroy_process_group.call_args_list
+    )
 
 
 def test_same_hccl_group_reuses_device_pg_once(module_env):

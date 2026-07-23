@@ -12,9 +12,11 @@ Tests cover:
   - _migrate_prefill_to_running guard
 """
 
-import pytest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, PropertyMock
+
+import pytest
 
 
 # ------------------------------------------------------------------ #
@@ -220,6 +222,129 @@ class TestPrefillChunkFlight:
 
         scheduler._ahead_chunk_count["req-0"] = 0
         assert scheduler._can_ahead_schedule("req-0") is True
+
+
+# ------------------------------------------------------------------ #
+# Test: Draft/decode cross-request overlap                            #
+# ------------------------------------------------------------------ #
+
+
+class TestDraftDecodeOverlap:
+    def test_decode_can_progress_while_unrelated_draft_is_inflight(self):
+        from vllm_ascend.core.pd_separated_scheduler import (
+            PDSeparatedScheduler,
+        )
+
+        scheduler = PDSeparatedScheduler.__new__(PDSeparatedScheduler)
+        scheduler.running = [
+            SimpleNamespace(request_id="draft-parent"),
+            SimpleNamespace(request_id="decode-ready"),
+        ]
+        scheduler.draft_pending_req_ids = {"draft-parent"}
+        scheduler.decode_inflight_count = 0
+        scheduler.decode_inflight_limit = 1
+        scheduler._force_decode_last = False
+
+        assert scheduler._can_schedule_decode_first() is True
+
+        scheduler.draft_pending_req_ids.add("decode-ready")
+        assert scheduler._can_schedule_decode_first() is False
+
+    def test_draft_can_progress_while_decode_is_inflight(self):
+        from vllm_ascend.core.pd_separated_scheduler import (
+            PDSeparatedScheduler,
+        )
+
+        scheduler = PDSeparatedScheduler.__new__(PDSeparatedScheduler)
+        scheduler.drafts_first_ready = deque([object()])
+        scheduler.drafts_last_ready = deque()
+        scheduler.draft_inflight_count = 0
+        scheduler.draft_inflight_limit = 1
+        scheduler.draft_remote_pending_count = 0
+        scheduler.decode_inflight_count = 1
+        scheduler._force_decode_last = True
+
+        assert scheduler._can_schedule_draft_first() is True
+
+    def test_decode_batch_excludes_its_pending_draft_parent(self):
+        from vllm.v1.core.sched.output import SchedulerOutput
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm_ascend.core import pd_separated_scheduler as pd_scheduler
+        from vllm_ascend.core.pd_separated_scheduler import (
+            HiddenChannelManager,
+            PDSeparatedScheduler,
+        )
+
+        scheduler = PDSeparatedScheduler.__new__(PDSeparatedScheduler)
+        draft_parent = SimpleNamespace(request_id="draft-parent")
+        decode_ready = SimpleNamespace(request_id="decode-ready")
+        scheduler.running = [draft_parent, decode_ready]
+        scheduler.draft_pending_req_ids = {"draft-parent"}
+        scheduler.chunk_prefill_first = []
+        scheduler.waiting = deque()
+        scheduler.skipped_waiting = deque()
+        scheduler.policy = "fcfs"
+        scheduler.hidden_channel_manager = HiddenChannelManager()
+        scheduler.decode_inflight_count = 0
+        scheduler._force_decode_last = False
+        scheduler.decodes_last_ready = deque()
+        scheduler._ensure_cached_all_token_ids = MagicMock()
+        scheduler._start_decode_last_delay = MagicMock()
+
+        decode_output = SchedulerOutput.make_empty()
+        decode_output.total_num_scheduled_tokens = 1
+        decode_output.num_scheduled_tokens = {"decode-ready": 1}
+
+        def schedule_only_eligible(self):
+            assert [req.request_id for req in self.running] == [
+                "decode-ready"
+            ]
+            return decode_output
+
+        with patch.object(
+            pd_scheduler,
+            "create_request_queue",
+            side_effect=[deque(), deque()],
+        ), patch.object(
+            Scheduler,
+            "schedule",
+            autospec=True,
+            side_effect=schedule_only_eligible,
+        ):
+            picked = scheduler._pick_decode_first_batch()
+
+        assert picked.num_scheduled_tokens == {"decode-ready": 1}
+        assert [req.request_id for req in scheduler.running] == [
+            "draft-parent",
+            "decode-ready",
+        ]
+
+    def test_draft_batch_uses_dedicated_channel_and_blocks_parent_decode(self):
+        from vllm.v1.core.sched.output import (
+            BatchType,
+            HiddenChannelType,
+            SchedulerOutput,
+        )
+        from vllm_ascend.core.pd_separated_scheduler import (
+            HiddenChannelManager,
+            PDSeparatedScheduler,
+        )
+
+        scheduler = PDSeparatedScheduler.__new__(PDSeparatedScheduler)
+        draft = SchedulerOutput.make_empty()
+        draft.num_scheduled_tokens = {"draft-parent": 1}
+        draft.parent_req_id = "draft-parent"
+        scheduler.drafts_first_ready = deque([draft])
+        scheduler.hidden_channel_manager = HiddenChannelManager()
+        scheduler.draft_pending_req_ids = set()
+        scheduler.draft_inflight_count = 0
+        scheduler.draft_remote_pending_count = 0
+
+        picked = scheduler._pick_draft_first_batch()
+
+        assert picked.batch_type == BatchType.DRAFT_FIRST
+        assert picked.hidden_channel == HiddenChannelType.DRAFT
+        assert scheduler.draft_pending_req_ids == {"draft-parent"}
 
 
 # ------------------------------------------------------------------ #

@@ -70,9 +70,10 @@ class PrefillChunkFlight:
 class HiddenChannelManager:
     """Manages data-plane hidden tensor channels for edge-cloud PD separation.
 
-    Two prefill channels (PREFILL_1 / PREFILL_2) support 2P1D; one decode
-    channel (DECODE) supports single in-flight decode. Channels are allocated
-    in FIFO order and freed when the tail segment completes.
+    Two prefill channels (PREFILL_1 / PREFILL_2) support 2P1D. Decode and
+    scheduled draft work use separate fixed channels so one of each can be
+    in flight without cross-channel head-of-line blocking. Prefill channels
+    are allocated in FIFO order and freed when the tail segment completes.
     """
 
     def __init__(self) -> None:
@@ -112,11 +113,15 @@ class HiddenChannelManager:
         return bool(self._free_prefills)
 
     # ------------------------------------------------------------------ #
-    # Decode channel (always DECODE, no free-list)                        #
+    # Fixed decode/draft channels (no free-list)                          #
     # ------------------------------------------------------------------ #
     @staticmethod
     def decode_channel() -> HiddenChannelType:
         return HiddenChannelType.DECODE
+
+    @staticmethod
+    def draft_channel() -> HiddenChannelType:
+        return HiddenChannelType.DRAFT
 
     # ------------------------------------------------------------------ #
     # Introspection                                                      #
@@ -180,9 +185,13 @@ class PDSeparatedScheduler(Scheduler):
         self.draft_inflight_limit: int = 1
         self.draft_inflight_count: int = 0
         self.draft_remote_pending_count: int = 0
+        # Requests whose speculative tokens are still being produced must
+        # not enter their own verify decode. Other running requests remain
+        # eligible so decode can overlap the remote draft pipeline.
+        self.draft_pending_req_ids: set[str] = set()
 
-        # Phase6 data-plane channel manager.  Two prefill hidden channels are
-        # available for 2P1D; decode uses a dedicated fixed channel.
+        # Phase6 data-plane channel manager. Two prefill hidden channels are
+        # available for 2P1D; decode and draft use dedicated fixed channels.
         self.hidden_channel_manager = HiddenChannelManager()
 
         # Buffer queue: requests whose P-first segment is done but P-last
@@ -616,27 +625,22 @@ class PDSeparatedScheduler(Scheduler):
 
     def _can_schedule_decode_first(self) -> bool:
         return bool(
-            self.running
+            any(
+                req.request_id not in self.draft_pending_req_ids
+                for req in self.running
+            )
             and self.decode_inflight_count < self.decode_inflight_limit
-            and self.draft_inflight_count == 0
-            and self.draft_remote_pending_count == 0
-            and not self.drafts_first_ready
-            and not self.drafts_last_ready
             and not self._force_decode_last
         )
 
     def _can_schedule_draft_first(self) -> bool:
-        # Scheduled draft head/tail payloads share the DECODE channel.
-        # Do not start another head while an earlier head is still remote or
-        # its tail is ready locally: otherwise edge and cloud can each wait
-        # for the opposite-direction send before posting the matching recv.
+        # Keep a single draft step in flight on the DRAFT channel. Decode uses
+        # its own channel and may progress independently.
         return bool(
             self.drafts_first_ready
             and self.draft_inflight_count < self.draft_inflight_limit
             and self.draft_remote_pending_count == 0
             and not self.drafts_last_ready
-            and self.decode_inflight_count == 0
-            and not self._force_decode_last
         )
 
     def _log_scheduler_state(self, state: PrefillState, batch_type: BatchType) -> None:
@@ -655,6 +659,7 @@ class PDSeparatedScheduler(Scheduler):
                 f"prefill_inflight: {self.prefill_inflight_count}/{self.prefill_inflight_limit}, "
                 f"draft_inflight: {self.draft_inflight_count}/{self.draft_inflight_limit}, "
                 f"draft_remote_pending: {self.draft_remote_pending_count}, "
+                f"draft_pending_reqs: {len(self.draft_pending_req_ids)}, "
                 f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}, "
                 f"chunk_flights: {len(self._prefill_flight_by_token)}, "
                 f"pending_tails: {self._total_pending_tails()}, "
@@ -674,6 +679,7 @@ class PDSeparatedScheduler(Scheduler):
                 f"prefill_inflight: {self.prefill_inflight_count}/{self.prefill_inflight_limit}, "
                 f"draft_inflight: {self.draft_inflight_count}/{self.draft_inflight_limit}, "
                 f"draft_remote_pending: {self.draft_remote_pending_count}, "
+                f"draft_pending_reqs: {len(self.draft_pending_req_ids)}, "
                 f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}",
             )
 
@@ -1090,9 +1096,9 @@ class PDSeparatedScheduler(Scheduler):
             raise RuntimeError("DRAFT_LAST missing draft_task_id")
         if scheduler_output.draft_step_idx is None:
             raise RuntimeError("DRAFT_LAST missing draft_step_idx")
-        if scheduler_output.hidden_channel != HiddenChannelType.DECODE:
+        if scheduler_output.hidden_channel != HiddenChannelType.DRAFT:
             raise RuntimeError(
-                "DRAFT_LAST expects decode hidden channel, got "
+                "DRAFT_LAST expects draft hidden channel, got "
                 f"{scheduler_output.hidden_channel}"
             )
 
@@ -1103,7 +1109,16 @@ class PDSeparatedScheduler(Scheduler):
         scheduler_output.batch_type = BatchType.DRAFT_FIRST
         if scheduler_output.head_token is None:
             scheduler_output.head_token = uuid4().hex
-        scheduler_output.hidden_channel = HiddenChannelType.DECODE
+        scheduler_output.hidden_channel = (
+            self.hidden_channel_manager.draft_channel()
+        )
+        self.draft_pending_req_ids.update(
+            scheduler_output.num_scheduled_tokens
+        )
+        if scheduler_output.parent_req_id:
+            self.draft_pending_req_ids.add(
+                scheduler_output.parent_req_id
+            )
         self.draft_inflight_count += 1
         self.draft_remote_pending_count += 1
         return scheduler_output
@@ -1144,6 +1159,7 @@ class PDSeparatedScheduler(Scheduler):
     def _drop_stale_drafts_for_req_ids(self, req_ids: set[str]) -> None:
         if not req_ids:
             return
+        self.draft_pending_req_ids.difference_update(req_ids)
         self.drafts_first_ready = deque(
             output
             for output in self.drafts_first_ready
@@ -1225,10 +1241,17 @@ class PDSeparatedScheduler(Scheduler):
         if not self.running:
             return self._make_empty_batch()
 
+        saved_running = self.running
         saved_chunk_prefill_first = self.chunk_prefill_first
         saved_waiting = self.waiting
         saved_skipped = self.skipped_waiting
 
+        # A request cannot verify tokens until its own draft chain completes,
+        # but unrelated requests can use the independent DECODE channel.
+        self.running = [
+            req for req in saved_running
+            if req.request_id not in self.draft_pending_req_ids
+        ]
         self.chunk_prefill_first = []
         self.waiting = create_request_queue(self.policy)
         self.skipped_waiting = create_request_queue(self.policy)
@@ -1238,6 +1261,18 @@ class PDSeparatedScheduler(Scheduler):
             scheduler_output = super().schedule()
         finally:
             if scheduler_output is not None:
+                eligible_running_ids = {
+                    id(req) for req in self.running
+                }
+                blocked_running_ids = {
+                    id(req) for req in saved_running
+                    if req.request_id in self.draft_pending_req_ids
+                }
+                self.running = [
+                    req for req in saved_running
+                    if id(req) in eligible_running_ids
+                    or id(req) in blocked_running_ids
+                ]
                 if scheduler_output.total_num_scheduled_tokens == 0:
                     scheduler_output.batch_type = BatchType.EMPTY
                     logger.debug(
@@ -1276,6 +1311,7 @@ class PDSeparatedScheduler(Scheduler):
                 self.waiting = saved_waiting
                 self.skipped_waiting = saved_skipped
             else:
+                self.running = saved_running
                 self.chunk_prefill_first = saved_chunk_prefill_first
                 self.waiting = saved_waiting
                 self.skipped_waiting = saved_skipped
@@ -1516,6 +1552,13 @@ class PDSeparatedScheduler(Scheduler):
             self.draft_remote_pending_count = max(
                 0, self.draft_remote_pending_count - 1
             )
+            self.draft_pending_req_ids.difference_update(
+                scheduler_output.num_scheduled_tokens
+            )
+            if scheduler_output.parent_req_id:
+                self.draft_pending_req_ids.discard(
+                    scheduler_output.parent_req_id
+                )
             logger.info(
                 "[PD] update_from_output DRAFT_LAST done, "
                 "draft_remote_pending: %d",

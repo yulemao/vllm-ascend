@@ -827,7 +827,7 @@ class NPUWorker(WorkerBase):
         if bt in (BatchType.DECODE_FIRST, BatchType.DECODE_LAST):
             return HiddenChannelType.DECODE
         if bt in (BatchType.DRAFT_FIRST, BatchType.DRAFT_LAST):
-            return HiddenChannelType.DECODE
+            return HiddenChannelType.DRAFT
         raise RuntimeError(f"No hidden channel for batch_type={bt}")
 
     def _execute_model_edge_head(
@@ -1061,11 +1061,11 @@ class NPUWorker(WorkerBase):
         # Record the cloud->edge draft payload send instead of waiting it:
         # the edge posts the matching tail recv (DRAFT_LAST) only after
         # this worker's ack lets the cloud EngineCore publish the tail
-        # SchedulerOutput.  Waited lazily before the next DECODE-channel
+        # SchedulerOutput. Waited lazily before the next DRAFT-channel
         # reuse, same as _execute_model_cloud.
         if send_handles:
             self._record_pp_send_work(
-                send_handles, channel=HiddenChannelType.DECODE
+                send_handles, channel=HiddenChannelType.DRAFT
             )
         logger.info(
             f"Execute model, batch_type: {scheduler_output.batch_type}, after."
@@ -1100,11 +1100,11 @@ class NPUWorker(WorkerBase):
             )
             self._record_pp_send_work(
                 edge_cloud_send_tensor_dict_scheduled_draft(tensor_dict),
-                channel=HiddenChannelType.DECODE,
+                channel=HiddenChannelType.DRAFT,
             )
             logger.info(
                 "Send intermediate tensors to cloud, "
-                f"hidden_channel: {HiddenChannelType.DECODE.value}"
+                f"hidden_channel: {HiddenChannelType.DRAFT.value}"
             )
         req_ids = list(scheduler_output.num_scheduled_tokens)
         return ModelRunnerOutput(
@@ -1126,7 +1126,7 @@ class NPUWorker(WorkerBase):
             postprocess()
         logger.info(
             "Receive intermediate tensors from cloud after, "
-            f"hidden_channel: {HiddenChannelType.DECODE.value}"
+            f"hidden_channel: {HiddenChannelType.DRAFT.value}"
         )
         assert tensor_dict is not None
         self.model_runner._validate_edge_cloud_draft_payload_identity(

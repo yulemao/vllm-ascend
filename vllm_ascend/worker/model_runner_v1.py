@@ -2810,7 +2810,7 @@ class NPUModelRunner(GPUModelRunner):
             context["scheduler_output"],
             batch_type=BatchType.DRAFT_FIRST,
             head_token=None,
-            hidden_channel=HiddenChannelType.DECODE,
+            hidden_channel=HiddenChannelType.DRAFT,
             parent_req_id=req_ids[0],
             draft_task_id=task_id,
             draft_step_idx=draft_step_idx,
@@ -4647,7 +4647,7 @@ class NPUModelRunner(GPUModelRunner):
 
         Returns the async send handles of the cloud→edge result payload.
         The caller (worker) must record them and wait before the next
-        DECODE-channel reuse instead of waiting here: the matching edge
+        DRAFT-channel reuse instead of waiting here: the matching edge
         tail recv (DRAFT_LAST) is only posted after the cloud
         EngineCore publishes the tail SchedulerOutput, which is gated on
         this worker's completion ack -- waiting inside this function

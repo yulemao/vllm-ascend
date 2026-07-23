@@ -175,9 +175,11 @@ class GroupCoordinatorPatch(GroupCoordinator):
             self.alt_cpu_group: torch.distributed.ProcessGroup | None = None
             # Phase6 hidden data-plane channels. The default device/cpu groups
             # are PREFILL_1, the legacy alt groups are DECODE, and the extra
-            # hidden groups below are PREFILL_2.
+            # hidden groups below are PREFILL_2 and DRAFT.
             self.prefill2_device_group: torch.distributed.ProcessGroup | None = None
             self.prefill2_cpu_group: torch.distributed.ProcessGroup | None = None
+            self.draft_device_group: torch.distributed.ProcessGroup | None = None
+            self.draft_cpu_group: torch.distributed.ProcessGroup | None = None
 
             self.device = torch.npu.current_device()
             if use_device_communicator and self.world_size > 1:
@@ -251,6 +253,16 @@ class GroupCoordinatorPatch(GroupCoordinator):
             torch.distributed.destroy_process_group(prefill2_device_group)
             self.prefill2_device_group = None
 
+        draft_cpu_group = getattr(self, "draft_cpu_group", None)
+        if draft_cpu_group is not None:
+            torch.distributed.destroy_process_group(draft_cpu_group)
+            self.draft_cpu_group = None
+
+        draft_device_group = getattr(self, "draft_device_group", None)
+        if draft_device_group is not None:
+            torch.distributed.destroy_process_group(draft_device_group)
+            self.draft_device_group = None
+
         if getattr(self, "mq_broadcaster", None) is not None:
             self.mq_broadcaster = None
 
@@ -297,14 +309,17 @@ class GroupCoordinatorPatch(GroupCoordinator):
         self,
         torch_distributed_backend: str | Backend,
     ) -> None:
-        """Create the extra Phase6 PREFILL_2 group.
+        """Create the extra Phase6 PREFILL_2 and DRAFT groups.
 
         The default pp group is PREFILL_1 and the existing alternate group is
-        DECODE.  This method adds PREFILL_2 as the third independent data-plane
-        channel over the same ranks.
+        DECODE. This method adds PREFILL_2 and DRAFT as independent data-plane
+        channels over the same ranks.
         """
         assert self.prefill2_device_group is None, (
             "PREFILL_2 hidden channel group already created"
+        )
+        assert self.draft_device_group is None, (
+            "DRAFT hidden channel group already created"
         )
         hccl_pg_options = create_hccl_pg_options("pp_prefill2")
         prefill2_device_group = None
@@ -324,6 +339,24 @@ class GroupCoordinatorPatch(GroupCoordinator):
         self.prefill2_device_group = prefill2_device_group
         self.prefill2_cpu_group = prefill2_cpu_group
 
+        hccl_pg_options = create_hccl_pg_options("pp_draft")
+        draft_device_group = None
+        draft_cpu_group = None
+        for ranks in self._all_group_ranks:
+            device_group = torch.distributed.new_group(
+                ranks,
+                backend=torch_distributed_backend,
+                pg_options=hccl_pg_options,
+            )
+            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+            if self.rank in ranks:
+                draft_device_group = device_group
+                draft_cpu_group = cpu_group
+        assert draft_device_group is not None
+        assert draft_cpu_group is not None
+        self.draft_device_group = draft_device_group
+        self.draft_cpu_group = draft_cpu_group
+
     def _hidden_channel_groups(self, channel: Any):
         value = getattr(channel, "value", channel)
         if value == "prefill_1":
@@ -336,6 +369,10 @@ class GroupCoordinatorPatch(GroupCoordinator):
             assert self.prefill2_device_group is not None
             assert self.prefill2_cpu_group is not None
             return self.prefill2_device_group, self.prefill2_cpu_group
+        if value == "draft":
+            assert self.draft_device_group is not None
+            assert self.draft_cpu_group is not None
+            return self.draft_device_group, self.draft_cpu_group
         raise ValueError(f"Unknown hidden channel: {channel}")
 
     def send_object_on_hidden_channel(

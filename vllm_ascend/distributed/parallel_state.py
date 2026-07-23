@@ -39,7 +39,7 @@ _FLASHCOMM2_ODP: GroupCoordinator | None = None
 # ------------------------------------------------------------------ #
 # Per-channel dedicated streams for edge-cloud P2P (isend/irecv).     #
 # ------------------------------------------------------------------ #
-# Each hidden channel (PREFILL_1, PREFILL_2) gets its own NPU stream
+# Each hidden channel (PREFILL_1, PREFILL_2, DECODE, DRAFT) gets its own NPU stream
 # so that isend/irecv on different channels don't serialize on the
 # default stream.  Without this, a guard-thread early-posted irecv on
 # prefill_2 can block a busy_loop isend on prefill_1 (both on the
@@ -405,8 +405,8 @@ def init_ascend_model_parallel(
         )
 
         # Phase6 hidden data-plane channels are still required in edge-cloud
-        # mode.  The default PP group is PREFILL_1, the alternate PP group is
-        # DECODE, and the extra hidden-channel group is PREFILL_2.
+        # mode. The default PP group is PREFILL_1, the alternate PP group is
+        # DECODE, and the extra hidden-channel groups are PREFILL_2 and DRAFT.
         pp_group = get_pp_group()
         if pp_group.world_size > 1:
             pp_group.create_alternate_groups(backend)
@@ -764,7 +764,8 @@ def _get_edge_cloud_hidden_channel_device_group(
             )
             return pp_group.alt_device_group
         raise RuntimeError(
-            "PREFILL_2 hidden channel requires create_hidden_channel_groups()"
+            f"{channel.value} hidden channel requires "
+            "create_hidden_channel_groups()"
         )
 
     if use_alt_group:
@@ -1186,17 +1187,23 @@ def edge_cloud_send_tensor_dict(
 
 def edge_cloud_send_tensor_dict_scheduled_draft(
     tensor_dict: dict[str, torch.Tensor | Any],
-    channel: HiddenChannelType = HiddenChannelType.DECODE,
+    channel: HiddenChannelType = HiddenChannelType.DRAFT,
 ) -> list[Handle]:
     """Send a dynamically-shaped scheduled draft payload."""
     pp_group = get_pp_group()
     if hasattr(pp_group, "isend_tensor_dict_on_hidden_channel"):
-        return pp_group.isend_tensor_dict_on_hidden_channel(
-            tensor_dict,
-            dst=None,
-            channel=channel,
-        )
-    return pp_group.isend_tensor_dict(tensor_dict)
+        with _hidden_channel_stream_ctx(
+            channel, wait_for_default=True
+        ):
+            return pp_group.isend_tensor_dict_on_hidden_channel(
+                tensor_dict,
+                dst=None,
+                channel=channel,
+            )
+    raise RuntimeError(
+        "Scheduled draft requires the dedicated hidden-channel "
+        "GroupCoordinator patch"
+    )
 
 
 def _apply_sp_chunk_inplace(tensor_dict: dict[str, Any]) -> None:
@@ -1468,7 +1475,7 @@ def edge_cloud_broadcast_recv_draft() -> tuple[
 
 
 def edge_cloud_broadcast_recv_scheduled_draft(
-    channel: HiddenChannelType = HiddenChannelType.DECODE,
+    channel: HiddenChannelType = HiddenChannelType.DRAFT,
 ) -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
@@ -1481,15 +1488,19 @@ def edge_cloud_broadcast_recv_scheduled_draft(
 
     if is_pp_npu0:
         if hasattr(pp_group, "irecv_tensor_dict_on_hidden_channel"):
-            tensor_dict, comm_handles, comm_postprocess = (
-                pp_group.irecv_tensor_dict_on_hidden_channel(
-                    src=None,
-                    channel=channel,
+            with _hidden_channel_stream_ctx(
+                channel, wait_for_default=False
+            ):
+                tensor_dict, comm_handles, comm_postprocess = (
+                    pp_group.irecv_tensor_dict_on_hidden_channel(
+                        src=None,
+                        channel=channel,
+                    )
                 )
-            )
         else:
-            tensor_dict, comm_handles, comm_postprocess = (
-                pp_group.irecv_tensor_dict()
+            raise RuntimeError(
+                "Scheduled draft requires the dedicated hidden-channel "
+                "GroupCoordinator patch"
             )
         assert tensor_dict is not None, (
             "edge_cloud_broadcast_recv_scheduled_draft: PP tensor_dict is None, "

@@ -585,10 +585,9 @@ class PassiveScheduler:
         so decode batches can be interleaved between the remaining slices.
         """
         # Finish an active sliced prefill before switching work, but do not
-        # let queued prefills starve a scheduled draft. It owns the shared
-        # bidirectional DECODE channel until its tail is consumed on edge;
-        # delaying it behind a continuous prefill stream can block all decode
-        # progress.
+        # let queued prefills starve a scheduled draft. Draft has an
+        # independent data-plane channel, while prompt completion still
+        # depends on returning its tail to the edge promptly.
         if (
             self.ready_drafts
             and not self._active_prefill_slices

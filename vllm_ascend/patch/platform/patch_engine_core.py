@@ -205,7 +205,8 @@ def _maybe_publish_pre_out(
     PREFILL_FIRST is handled by _publish_pre_out_when_ready instead, which
     delays the ZMQ notification until the prefill head segment becomes the
     next batch to execute, preventing the cloud from blocking on irecv while
-    the edge prefill is still queued behind other batches.
+    the edge prefill is still queued behind other batches. DRAFT_FIRST uses
+    the same delayed path with batch-queue scheduling.
     """
     if getattr(self, "_pp_pd_channel", None) is None:
         return
@@ -557,8 +558,8 @@ def _patched_step_with_batch_queue(self):
         self._ensure_pd_head_token(scheduler_output)
 
         # [ascend insert] DECODE_FIRST is published immediately to keep the
-        # decode pipeline full; PREFILL_FIRST is delayed via
-        # _publish_pre_out_when_ready until it becomes next to execute.
+        # decode pipeline full; PREFILL_FIRST and DRAFT_FIRST are delayed via
+        # _publish_pre_out_when_ready until they become next to execute.
         if scheduler_output.batch_type == BatchType.DECODE_FIRST:
             self._maybe_publish_pre_out(scheduler_output)
 

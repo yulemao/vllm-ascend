@@ -2669,10 +2669,17 @@ class NPUModelRunner(GPUModelRunner):
             int(scheduler_output.num_scheduled_tokens.get(req_id, 1))
             for req_id in req_ids
         ]
-        draft_positions = positions.clone()
+        # Strip acl_graph capture-bucket padding (e.g. 60 -> 64 tokens for a
+        # 15-req verify step) so the stashed tensors match the *real*
+        # scheduled_token_ids built below.  Without this, the deferred draft
+        # concatenates a 60-row inputs_embeds with a 64-row hidden_states and
+        # crashes in aclnnCat (error EZ1001) once the running batch drops below
+        # a capture boundary (e.g. 16 -> 15 requests).
+        scheduled_token_count = sum(num_scheduled)
+        draft_positions = positions[:scheduled_token_count].clone()
         # The draft needs the target hidden states of every scheduled token
         # (sample_hidden_states only covers the logits rows).
-        draft_hidden_states = hidden_states.clone()
+        draft_hidden_states = hidden_states[:scheduled_token_count].clone()
 
         # Snapshot the scheduled token ids so the first draft step can build
         # the shifted input ids (target ids shifted left by one, closed by

@@ -2930,11 +2930,27 @@ class NPUModelRunner(GPUModelRunner):
             aclgraph_runtime_mode=CUDAGraphMode.NONE,
             is_draft_model=True,
         ):
+            # The compiled segment is traced exactly once (during warmup,
+            # via the proposer) and Dynamo guards are disabled
+            # (skip_all_guards_unsafe), so the call signature here must
+            # match the warmup trace exactly: warmup passes a real
+            # inputs_embeds tensor whenever the drafter supports mm inputs
+            # (the traced graph then consumes it instead of running
+            # embed_input_ids), and never passes spec_step_idx.  Omitting
+            # inputs_embeds feeds None into a tensor placeholder of the
+            # cached graph and crashes with "tensor does not have a device".
+            inputs_embeds = None
+            if getattr(self.drafter, "supports_mm_inputs", False):
+                inputs_embeds = self.drafter.model.embed_input_ids(
+                    input_ids,
+                    multimodal_embeddings=None,
+                    is_multimodal=None,
+                )
             output = segment(
                 input_ids=input_ids,
                 positions=positions,
+                inputs_embeds=inputs_embeds,
                 hidden_states=hidden_states,
-                spec_step_idx=draft_step_idx,
             )
         if not isinstance(output, IntermediateTensors):
             raise RuntimeError("Qwen-MTP first segment returned no intermediates")
@@ -3036,10 +3052,13 @@ class NPUModelRunner(GPUModelRunner):
             aclgraph_runtime_mode=CUDAGraphMode.NONE,
             is_draft_model=True,
         ):
+            # Match the warmup trace signature exactly (guards are skipped,
+            # see _run_mtp_edge_first_segment): warmup calls segment "e"
+            # with only positions + intermediate_tensors, and the last
+            # segment (final norm) does not consume spec_step_idx anyway.
             hidden_states = segment(
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
-                spec_step_idx=draft_step_idx,
             )
         if not torch.is_tensor(hidden_states):
             raise RuntimeError("Qwen-MTP last segment returned no hidden states")

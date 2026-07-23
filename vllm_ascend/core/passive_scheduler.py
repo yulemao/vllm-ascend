@@ -109,8 +109,8 @@ class PassiveScheduler:
 
     `schedule()` returns a `ScheduledBatch` with 1 SchedulerOutput plus
     the slice plan; a single PURE_PREFILL / PD_MIX batch may carry N
-    layer slices, while PURE_DECODE / DECODE_FIRST batches always carry
-    `[None]` (single full-layer execution).
+    layer slices, while PURE_DECODE / DECODE_FIRST / DRAFT_FIRST batches
+    always carry `[None]` (single full-layer execution).
     """
 
     _ARRIVAL_SEQ_ATTR = "_passive_scheduler_arrival_seq"
@@ -569,13 +569,13 @@ class PassiveScheduler:
         elapsed_ms = (time.monotonic() - started_at) * 1000
         limit_ms = self._prefill_middle_throttle_seconds * 1000
         if elapsed_ms >= limit_ms:
-            logger.error(
+            logger.warning(
                 f"[PD-PASSIVE] Throttle timeout: waited {elapsed_ms:.1f}ms, "
                 f"fallback to prefill",
             )
             self._clear_prefill_middle_throttle()
             return True
-        logger.info(
+        logger.debug(
             f"[PD-PASSIVE] Throttle active: {elapsed_ms:.1f}ms / {limit_ms:.0f}ms, "
             f"still waiting for decode",
         )
@@ -588,15 +588,19 @@ class PassiveScheduler:
         machine.  Sliced prefill-like batches are dispatched one slice per call
         so decode batches can be interleaved between the remaining slices.
         """
-        # Finish an active sliced prefill before switching work, but do not
-        # let queued prefills starve a scheduled draft. It owns the shared
-        # bidirectional DECODE channel until its tail is consumed on edge;
-        # delaying it behind a continuous prefill stream can block all decode
-        # progress.
-        if (
-            self.ready_drafts
-            and not self._active_prefill_slices
-        ):
+        # Do not let queued prefills starve a scheduled draft. It owns the
+        # shared bidirectional DECODE channel until its tail is consumed on
+        # edge; delaying it behind a continuous prefill stream can block all
+        # decode progress.  A draft is decode-like here: it is never sliced
+        # (see _slice_for) and runs as a single full-layer batch, so — exactly
+        # like a decode batch — it may be interleaved between the continuation
+        # slices of an active sliced prefill.  Interleaving is in fact
+        # required: the edge draft head blocks in the channel rendezvous
+        # (gloo metadata recv / HCCL comm init) until the cloud receives the
+        # payload, so holding the draft back until ``_active_prefill_slices``
+        # drains can stall that handshake past its timeout and kill both
+        # sides' workers.
+        if self.ready_drafts:
             self._clear_prefill_middle_throttle()
             return self._build_batch(self.ready_drafts.popleft())
 

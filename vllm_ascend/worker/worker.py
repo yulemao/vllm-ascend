@@ -1555,6 +1555,15 @@ class NPUWorker(WorkerBase):
     ) -> None:
         self.model_runner.clear_pending_edge_cloud_draft_for_req_ids(req_ids)
 
+    def sync_edge_cloud_draft_state(
+        self,
+        finished_req_ids: set[str] | list[str],
+        force_drop_task_ids: set[str] | list[str] = (),
+    ) -> "tuple[dict[str, set[str]], list[str]]":
+        return self.model_runner.sync_edge_cloud_draft_state(
+            finished_req_ids, force_drop_task_ids
+        )
+
     def check_health(self) -> None:
         import subprocess
 

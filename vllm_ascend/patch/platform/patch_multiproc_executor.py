@@ -335,6 +335,20 @@ class AscendMultiprocExecutor(MultiprocExecutor):
             local_only=self._edge_local_only(),
         )
 
+    def sync_edge_cloud_draft_state(
+        self,
+        finished_req_ids: set[str] | list[str],
+        force_drop_task_ids: set[str] | list[str] = (),
+    ) -> "tuple[dict[str, set[str]], list[str]]":
+        return self.collective_rpc(
+            "sync_edge_cloud_draft_state",
+            args=(finished_req_ids, force_drop_task_ids),
+            # Edge-local like clear_pending_edge_cloud_draft_for_req_ids:
+            # the deferred-draft state lives on the edge workers only.
+            unique_reply_rank=self.output_rank,
+            local_only=self._edge_local_only(),
+        )
+
 
 class AscendWorkerProc(WorkerProc):
     def _init_message_queues(

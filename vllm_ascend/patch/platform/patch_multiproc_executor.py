@@ -304,9 +304,12 @@ class AscendMultiprocExecutor(MultiprocExecutor):
 
     def take_pending_edge_cloud_draft_scheduler_output(
         self,
-    ) -> SchedulerOutput | None:
+        finished_req_ids: set[str] | list[str] = (),
+        force_drop_task_ids: set[str] | list[str] = (),
+    ) -> tuple[SchedulerOutput | None, list[str]]:
         return self.collective_rpc(
             "take_pending_edge_cloud_draft_scheduler_output",
+            args=(finished_req_ids, force_drop_task_ids),
             unique_reply_rank=self.output_rank,
             local_only=self._edge_local_only(),
         )
@@ -319,36 +322,6 @@ class AscendMultiprocExecutor(MultiprocExecutor):
             unique_reply_rank=self.output_rank,
             local_only=self._edge_local_only(),
         )
-
-    def clear_pending_edge_cloud_draft_for_req_ids(
-        self, req_ids: set[str] | list[str]
-    ) -> None:
-        self.collective_rpc(
-            "clear_pending_edge_cloud_draft_for_req_ids",
-            args=(req_ids,),
-            # local_only=True keeps this RPC off the cross-node queue, so the
-            # cloud workers never execute it and never reply.  Without
-            # unique_reply_rank the engine would wait for replies from ALL
-            # global ranks (edge + cloud response_mqs) and deadlock forever
-            # on the first request finish.
-            unique_reply_rank=self.output_rank,
-            local_only=self._edge_local_only(),
-        )
-
-    def sync_edge_cloud_draft_state(
-        self,
-        finished_req_ids: set[str] | list[str],
-        force_drop_task_ids: set[str] | list[str] = (),
-    ) -> "tuple[dict[str, set[str]], list[str]]":
-        return self.collective_rpc(
-            "sync_edge_cloud_draft_state",
-            args=(finished_req_ids, force_drop_task_ids),
-            # Edge-local like clear_pending_edge_cloud_draft_for_req_ids:
-            # the deferred-draft state lives on the edge workers only.
-            unique_reply_rank=self.output_rank,
-            local_only=self._edge_local_only(),
-        )
-
 
 class AscendWorkerProc(WorkerProc):
     def _init_message_queues(

@@ -263,9 +263,9 @@ class PDSeparatedScheduler(Scheduler):
         # requests' KV blocks.  Edge-cloud defers the draft to a later
         # DRAFT_FIRST batch, so without retention the blocks could be freed
         # and reused before the cloud-side draft steps read/write them.
-        # The engine core syncs the runner's pending/in-flight draft
-        # membership into `_edge_cloud_draft_req_tasks`; _free_request then
-        # delays _free_blocks for referenced requests until the draft task
+        # The EngineCore registers each deferred task locally from the parent
+        # SchedulerOutput's head_token before update_from_output. _free_request
+        # then delays _free_blocks for referenced requests until the draft task
         # completes or is dropped (release_draft_retained_blocks).
         # Everything is gated on `_edge_cloud_draft_retention_enabled` so
         # deployments without the scheduled edge-cloud draft behave exactly
@@ -274,6 +274,7 @@ class PDSeparatedScheduler(Scheduler):
             self._check_scheduled_edge_cloud_draft()
         )
         self._edge_cloud_draft_req_tasks: dict[str, set[str]] = {}
+        self._edge_cloud_draft_task_reqs: dict[str, set[str]] = {}
         self._draft_retained_requests: dict[str, dict[str, Request]] = {}
         # Draft task ids this scheduler dropped from its ready queues
         # while the runner still held the (enqueued) context.  Drained by
@@ -1207,21 +1208,30 @@ class PDSeparatedScheduler(Scheduler):
         hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
         return "qwen" in str(getattr(hf_config, "model_type", "")).lower()
 
-    def set_edge_cloud_draft_req_tasks(
-        self, req_task_map: dict[str, set[str]]
+    def register_edge_cloud_draft_task(
+        self, task_id: str, req_ids: set[str]
     ) -> None:
-        """Sync the runner's pending/in-flight deferred-draft membership.
-
-        Called by the EngineCore patch each step when scheduled edge-cloud
-        draft is active.  Replaces the previous snapshot; the runner-side
-        contexts are the ground truth.
-        """
-        if not self._edge_cloud_draft_retention_enabled:
+        """Register a deferred draft before its parent output is applied."""
+        if (
+            not self._edge_cloud_draft_retention_enabled
+            or not task_id
+            or not req_ids
+        ):
             return
-        self._edge_cloud_draft_req_tasks = {
-            req_id: set(task_ids)
-            for req_id, task_ids in req_task_map.items()
-        }
+        previous_req_ids = self._edge_cloud_draft_task_reqs.get(task_id)
+        if previous_req_ids is not None:
+            if previous_req_ids != req_ids:
+                raise RuntimeError(
+                    "Deferred draft task registration changed request set: "
+                    f"task_id={task_id}, previous={previous_req_ids}, "
+                    f"new={req_ids}"
+                )
+            return
+        self._edge_cloud_draft_task_reqs[task_id] = set(req_ids)
+        for req_id in req_ids:
+            self._edge_cloud_draft_req_tasks.setdefault(req_id, set()).add(
+                task_id
+            )
 
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
@@ -1250,10 +1260,9 @@ class PDSeparatedScheduler(Scheduler):
         Idempotent.  A request referenced by several in-flight draft
         tasks is only freed once its last referencing task releases.
         """
-        retained = self._draft_retained_requests.pop(task_id, None)
-        if not retained:
-            return
-        for req_id, request in retained.items():
+        task_req_ids = self._edge_cloud_draft_task_reqs.pop(task_id, set())
+        retained = self._draft_retained_requests.pop(task_id, {})
+        for req_id in task_req_ids:
             req_tasks = self._edge_cloud_draft_req_tasks.get(req_id)
             if req_tasks is not None:
                 req_tasks.discard(task_id)
@@ -1261,6 +1270,9 @@ class PDSeparatedScheduler(Scheduler):
                     # Still referenced by another in-flight draft task.
                     continue
                 self._edge_cloud_draft_req_tasks.pop(req_id, None)
+            request = retained.get(req_id)
+            if request is None:
+                continue
             current = self.requests.get(req_id)
             if current is request and request.is_finished():
                 self._free_blocks(request)
@@ -1269,23 +1281,23 @@ class PDSeparatedScheduler(Scheduler):
                 # request's blocks without evicting the new entry.
                 self.kv_cache_manager.free(request)
 
-    def release_untracked_draft_retentions(
-        self, known_task_ids: set[str]
-    ) -> None:
-        """Backstop: release retentions whose draft context no longer
-        exists on the runner (e.g. dropped without a completion path)."""
-        for task_id in list(self._draft_retained_requests):
-            if task_id not in known_task_ids:
-                self.release_draft_retained_blocks(task_id)
-
-    @staticmethod
-    def _scheduler_output_fully_within_req_ids(
-        scheduler_output: SchedulerOutput, req_ids: set[str]
+    def _scheduler_output_all_requests_finished(
+        self, scheduler_output: SchedulerOutput
     ) -> bool:
-        batch_req_ids = set(scheduler_output.num_scheduled_tokens)
+        batch_req_ids = self._edge_cloud_draft_task_reqs.get(
+            scheduler_output.draft_task_id or ""
+        )
+        if batch_req_ids is None:
+            batch_req_ids = set(scheduler_output.num_scheduled_tokens)
+        else:
+            batch_req_ids = set(batch_req_ids)
         if scheduler_output.parent_req_id is not None:
             batch_req_ids.add(scheduler_output.parent_req_id)
-        return bool(batch_req_ids) and batch_req_ids.issubset(req_ids)
+        return bool(batch_req_ids) and all(
+            (request := self.requests.get(req_id)) is None
+            or request.is_finished()
+            for req_id in batch_req_ids
+        )
 
     def _drop_stale_drafts_for_req_ids(self, req_ids: set[str]) -> None:
         if not req_ids:
@@ -1298,8 +1310,12 @@ class PDSeparatedScheduler(Scheduler):
         # hold the enqueued context) via take_dropped_draft_task_ids().
         kept_first: deque[SchedulerOutput] = deque()
         for output in self.drafts_first_ready:
-            if self._scheduler_output_fully_within_req_ids(
-                output, req_ids
+            output_req_ids = set(output.num_scheduled_tokens)
+            if output.parent_req_id is not None:
+                output_req_ids.add(output.parent_req_id)
+            if (
+                output_req_ids.intersection(req_ids)
+                and self._scheduler_output_all_requests_finished(output)
             ):
                 if output.draft_task_id is not None:
                     self._dropped_draft_task_ids_to_report.append(
@@ -1311,7 +1327,13 @@ class PDSeparatedScheduler(Scheduler):
         kept_last: deque[SchedulerOutput] = deque()
         dropped_last = 0
         for output in self.drafts_last_ready:
-            if self._scheduler_output_fully_within_req_ids(output, req_ids):
+            output_req_ids = set(output.num_scheduled_tokens)
+            if output.parent_req_id is not None:
+                output_req_ids.add(output.parent_req_id)
+            if (
+                output_req_ids.intersection(req_ids)
+                and self._scheduler_output_all_requests_finished(output)
+            ):
                 dropped_last += 1
                 if output.draft_task_id is not None:
                     self._dropped_draft_task_ids_to_report.append(
@@ -1334,12 +1356,7 @@ class PDSeparatedScheduler(Scheduler):
     def _is_stale_draft_output(
         self, scheduler_output: SchedulerOutput
     ) -> bool:
-        req_ids = set(scheduler_output.num_scheduled_tokens)
-        if scheduler_output.parent_req_id:
-            req_ids.add(scheduler_output.parent_req_id)
-        return bool(req_ids) and all(
-            req_id not in self.requests for req_id in req_ids
-        )
+        return self._scheduler_output_all_requests_finished(scheduler_output)
 
     def _pick_decode_last_batch(self) -> SchedulerOutput:
         if not self.decodes_last_ready:

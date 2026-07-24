@@ -2805,6 +2805,18 @@ class NPUModelRunner(GPUModelRunner):
             self._pending_edge_cloud_draft_contexts.pop(task_id, None)
             return None
         draft_step_idx = int(context.get("draft_step_idx", 0) or 0)
+        num_accepted_tokens = None
+        valid_sampled_token_count = None
+        if draft_step_idx == 0:
+            accepted_state = context.get("num_accepted_state") or {}
+            accepted = accepted_state.get("num_accepted_tokens")
+            if accepted is not None:
+                num_accepted_tokens = [int(value) for value in accepted.tolist()]
+            valid_count = accepted_state.get("valid_sampled_token_count")
+            if valid_count is not None:
+                valid_sampled_token_count = [
+                    int(value) for value in valid_count.tolist()
+                ]
         context["enqueued"] = True
         return replace(
             context["scheduler_output"],
@@ -2814,6 +2826,8 @@ class NPUModelRunner(GPUModelRunner):
             parent_req_id=req_ids[0],
             draft_task_id=task_id,
             draft_step_idx=draft_step_idx,
+            num_accepted_tokens=num_accepted_tokens,
+            valid_sampled_token_count=valid_sampled_token_count,
         )
 
     def take_completed_edge_cloud_draft_result(
@@ -2986,15 +3000,6 @@ class NPUModelRunner(GPUModelRunner):
             # the cloud. Its edge segment only embeds the proposed token.
             output["hidden_states"] = hidden_states
         output["positions"] = positions
-        if draft_step_idx == 0:
-            # Piggyback the verify step's num_accepted payload (stashed in
-            # sample_tokens) on the first draft payload.  The cloud applies
-            # the correction when it receives step 0, inside its
-            # execute_model stream.
-            num_accepted_payload = context.get("num_accepted_payload")
-            if num_accepted_payload:
-                for key, value in num_accepted_payload.items():
-                    output[key] = value
         context["current_draft_positions"] = positions
         return output
 
@@ -4176,14 +4181,9 @@ class NPUModelRunner(GPUModelRunner):
                     )
                 if self._should_defer_edge_cloud_draft(scheduler_output):
                     # Deferred edge-cloud draft: do NOT send here.
-                    # sample_tokens runs on a different RPC stream than the cloud's
-                    # independently scheduled draft steps, and the two
-                    # streams race on the cloud's shared TP mq_broadcaster
-                    # (payloads get swapped -> unpack/type errors).  Stash
-                    # the payload in the pending draft context instead;
-                    # _run_edge_cloud_draft_first_segment piggybacks it on the
-                    # draft-step-0 payload, keeping every cloud-side TP
-                    # broadcast inside the execute_model stream.
+                    # Store the sampling state in the pending context so
+                    # take_pending_edge_cloud_draft_scheduler_output can put
+                    # it on the step-0 DRAFT_FIRST control message.
                     context = self._pending_edge_cloud_draft_contexts.get(
                         scheduler_output.head_token
                     )
@@ -4192,7 +4192,7 @@ class NPUModelRunner(GPUModelRunner):
                             "Deferred edge-cloud draft context missing for "
                             f"head_token={scheduler_output.head_token}"
                         )
-                    context["num_accepted_payload"] = tensor_dict_to_send
+                    context["num_accepted_state"] = tensor_dict_to_send
                 elif get_pp_group().world_size == 2:
                     send_work = get_pp_group().isend_tensor_dict(tensor_dict_to_send)
                     for handle in send_work:
@@ -4526,7 +4526,7 @@ class NPUModelRunner(GPUModelRunner):
 
         return per_layer_attn_metadata
 
-    def _apply_cloud_num_accepted_payload(
+    def _apply_cloud_num_accepted_state(
         self,
         scheduler_output: "SchedulerOutput",
         num_accepted: torch.Tensor,
@@ -4536,9 +4536,9 @@ class NPUModelRunner(GPUModelRunner):
 
         Sampling only runs on the edge, but the cloud must retain the
         rejection-corrected state for its next target/draft forward. For an
-        independently scheduled draft the payload rides the draft-step-0
-        execute_model payload (instead of the racy sample_tokens RPC stream),
-        so the correction runs here, ahead of the draft forwards.
+        independently scheduled draft carries this state on its step-0
+        SchedulerOutput, so the correction runs here ahead of the draft
+        forwards.
         """
         num_accepted = num_accepted.to(self.device)
         num_reqs = num_accepted.size(0)
@@ -4627,27 +4627,29 @@ class NPUModelRunner(GPUModelRunner):
         ``_execute_model_cloud``.
         """
         spec_step_idx = int(scheduler_output.draft_step_idx or 0)
-        # The edge piggybacks the verify step's num_accepted payload on the
-        # first draft payload (kept inside the execute_model RPC stream so
-        # it cannot race the cloud's TP mq_broadcaster from sample_tokens).
-        # Pop it before syncing intermediate tensors and apply the
-        # rejection-corrected state for the next target/draft forward.
-        num_accepted_payload = intermediate_tensors.tensors.pop(
-            "num_accepted_tokens", None
-        )
-        valid_sampled_token_count = intermediate_tensors.tensors.pop(
-            "valid_sampled_token_count", None
-        )
-        if num_accepted_payload is not None:
+        # The edge carries rejection-corrected sampling state on the step-0
+        # SchedulerOutput. Keeping it on the control plane avoids extra CPU
+        # tensors in the dynamic hidden-state payload.
+        num_accepted_values = scheduler_output.num_accepted_tokens
+        valid_sampled_values = scheduler_output.valid_sampled_token_count
+        if num_accepted_values is not None:
             if spec_step_idx != 0:
                 logger.warning(
-                    "num_accepted payload arrived on draft step %d; "
+                    "num_accepted scheduler state arrived on draft step %d; "
                     "expected step 0",
                     spec_step_idx,
                 )
-            self._apply_cloud_num_accepted_payload(
+            num_accepted = torch.tensor(
+                num_accepted_values, dtype=torch.int64
+            )
+            valid_sampled_token_count = (
+                torch.tensor(valid_sampled_values, dtype=torch.int64)
+                if valid_sampled_values is not None
+                else None
+            )
+            self._apply_cloud_num_accepted_state(
                 scheduler_output,
-                num_accepted_payload,
+                num_accepted,
                 valid_sampled_token_count,
             )
 

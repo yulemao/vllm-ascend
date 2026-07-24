@@ -1077,19 +1077,52 @@ class NPUWorker(WorkerBase):
     def _execute_model_cloud_draft(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput:
-        """Run one cloud-side independently scheduled draft middle step."""
+        """Run one cloud-side independently scheduled draft middle step.
+
+        Owns the cross-PP edge-cloud communication, mirroring
+        ``_execute_model_cloud``: recv the edge->cloud draft payload, run
+        the cloud target/C segment forward (in the model_runner), then send
+        the cloud->edge result.  The send is recorded (not waited): the edge
+        posts the matching tail recv (DRAFT_LAST) only after this worker's
+        ack lets the cloud EngineCore publish the tail SchedulerOutput;
+        waiting before the next DECODE-channel reuse circular-deadlocks edge
+        and cloud.
+        """
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
-        send_handles = self.model_runner._run_edge_cloud_draft_middle_segment(
-            scheduler_output
+        tensor_dict, comm_handles, comm_postprocess = (
+            edge_cloud_broadcast_recv_scheduled_draft()
         )
-        # Record the cloud->edge draft payload send instead of waiting it:
-        # the edge posts the matching tail recv (DRAFT_LAST) only after
-        # this worker's ack lets the cloud EngineCore publish the tail
-        # SchedulerOutput.  Waited lazily before the next DECODE-channel
-        # reuse, same as _execute_model_cloud.
-        if send_handles:
+        for handle in comm_handles:
+            handle.wait()
+        for postprocess in comm_postprocess:
+            postprocess()
+        assert tensor_dict is not None
+        self.model_runner._validate_edge_cloud_draft_payload_identity(
+            scheduler_output, tensor_dict
+        )
+        output = self.model_runner._run_edge_cloud_draft_middle_segment(
+            scheduler_output, IntermediateTensors(tensor_dict)
+        )
+        if get_pp_group().world_size == 2:
+            out_tensor_dict = {
+                key: value.contiguous()
+                if isinstance(value, torch.Tensor)
+                else value
+                for key, value in output.items()
+            }
+            out_tensor_dict.update(
+                head_token=scheduler_output.head_token,
+                draft_task_id=scheduler_output.draft_task_id,
+                draft_step_idx=int(scheduler_output.draft_step_idx or 0),
+            )
+            # Async send only -- record, do NOT wait.  See method docstring.
             self._record_pp_send_work(
-                send_handles, channel=HiddenChannelType.DECODE
+                edge_cloud_send_tensor_dict_scheduled_draft(out_tensor_dict),
+                channel=HiddenChannelType.DECODE,
+            )
+            logger.info(
+                "Send intermediate tensors to edge, "
+                f"hidden_channel: {HiddenChannelType.DECODE.value}"
             )
         logger.info(
             f"Execute model, batch_type: {scheduler_output.batch_type}, after."

@@ -1073,9 +1073,6 @@ class NPUWorker(WorkerBase):
         for postprocess in comm_postprocess:
             postprocess()
         assert tensor_dict is not None
-        self.model_runner._validate_edge_cloud_draft_payload_identity(
-            scheduler_output, tensor_dict
-        )
         output = self.model_runner._run_edge_cloud_draft_middle_segment(
             scheduler_output, IntermediateTensors(tensor_dict)
         )
@@ -1086,11 +1083,6 @@ class NPUWorker(WorkerBase):
                 else value
                 for key, value in output.items()
             }
-            out_tensor_dict.update(
-                head_token=scheduler_output.head_token,
-                draft_task_id=scheduler_output.draft_task_id,
-                draft_step_idx=int(scheduler_output.draft_step_idx or 0),
-            )
             # Async send only -- record, do NOT wait.  See method docstring.
             self._record_pp_send_work(
                 edge_cloud_send_tensor_dict_scheduled_draft(out_tensor_dict),
@@ -1126,11 +1118,6 @@ class NPUWorker(WorkerBase):
                 else value
                 for key, value in output.items()
             }
-            tensor_dict.update(
-                head_token=scheduler_output.head_token,
-                draft_task_id=scheduler_output.draft_task_id,
-                draft_step_idx=int(scheduler_output.draft_step_idx or 0),
-            )
             self._record_pp_send_work(
                 edge_cloud_send_tensor_dict_scheduled_draft(tensor_dict),
                 channel=HiddenChannelType.DECODE,
@@ -1162,9 +1149,6 @@ class NPUWorker(WorkerBase):
             f"hidden_channel: {HiddenChannelType.DECODE.value}"
         )
         assert tensor_dict is not None
-        self.model_runner._validate_edge_cloud_draft_payload_identity(
-            scheduler_output, tensor_dict
-        )
         return self.model_runner._run_edge_cloud_draft_last_segment(
             scheduler_output, IntermediateTensors(tensor_dict)
         )

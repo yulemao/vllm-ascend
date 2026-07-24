@@ -2986,9 +2986,6 @@ class NPUModelRunner(GPUModelRunner):
             # the cloud. Its edge segment only embeds the proposed token.
             output["hidden_states"] = hidden_states
         output["positions"] = positions
-        output["spec_step_idx"] = torch.tensor(
-            draft_step_idx, dtype=torch.int64, device="cpu"
-        )
         if draft_step_idx == 0:
             # Piggyback the verify step's num_accepted payload (stashed in
             # sample_tokens) on the first draft payload.  The cloud applies
@@ -3028,38 +3025,6 @@ class NPUModelRunner(GPUModelRunner):
         if lmhead_tp_enable():
             logits = logits[: hidden_states.shape[0]]
         return logits.argmax(dim=-1)
-
-    @staticmethod
-    def _validate_edge_cloud_draft_payload_identity(
-        scheduler_output: "SchedulerOutput", tensor_dict: dict[str, Any]
-    ) -> None:
-        expected_task_id = scheduler_output.draft_task_id
-        actual_task_id = tensor_dict.get("draft_task_id")
-        if expected_task_id is not None and actual_task_id != expected_task_id:
-            raise RuntimeError(
-                "DRAFT payload task mismatch: "
-                f"expected={expected_task_id}, got={actual_task_id}"
-            )
-        expected_step = int(scheduler_output.draft_step_idx or 0)
-        for field in ("draft_step_idx", "spec_step_idx"):
-            actual_step = tensor_dict.get(field)
-            if torch.is_tensor(actual_step):
-                actual_step = int(actual_step.item())
-            if actual_step is not None and int(actual_step) != expected_step:
-                raise RuntimeError(
-                    f"DRAFT payload {field} mismatch: "
-                    f"expected={expected_step}, got={actual_step}"
-                )
-        actual_head_token = tensor_dict.get("head_token")
-        if (
-            scheduler_output.head_token is not None
-            and actual_head_token != scheduler_output.head_token
-        ):
-            raise RuntimeError(
-                "DRAFT payload head_token mismatch: "
-                f"expected={scheduler_output.head_token}, "
-                f"got={actual_head_token}"
-            )
 
     def _run_edge_cloud_draft_last_segment(
         self,

@@ -255,6 +255,58 @@ class PDSeparatedScheduler(Scheduler):
         self._decode_first_only_start_ts: float | None = None
         self._decode_first_only_window_ms: int = 10
 
+        # ------------------------------------------------------------------ #
+        # Edge-cloud deferred-draft KV retention                             #
+        # ------------------------------------------------------------------ #
+        # Non-edge-cloud proposes draft tokens inside the same execute_model
+        # call, i.e. strictly BEFORE update_from_output frees the finished
+        # requests' KV blocks.  Edge-cloud defers the draft to a later
+        # DRAFT_FIRST batch, so without retention the blocks could be freed
+        # and reused before the cloud-side draft steps read/write them.
+        # The EngineCore registers each deferred task locally from the parent
+        # SchedulerOutput's head_token before update_from_output. _free_request
+        # then delays _free_blocks for referenced requests until the draft task
+        # completes or is dropped (release_draft_retained_blocks).
+        # Everything is gated on `_edge_cloud_draft_retention_enabled` so
+        # deployments without the scheduled edge-cloud draft behave exactly
+        # as upstream.
+        self._edge_cloud_draft_retention_enabled: bool = (
+            self._check_scheduled_edge_cloud_draft()
+        )
+        self._edge_cloud_draft_req_tasks: dict[str, set[str]] = {}
+        self._edge_cloud_draft_task_reqs: dict[str, set[str]] = {}
+        self._draft_retained_requests: dict[str, dict[str, Request]] = {}
+        # Draft task ids this scheduler dropped from its ready queues
+        # while the runner still held the (enqueued) context.  Drained by
+        # the EngineCore patch, which forwards them to the runner so the
+        # orphaned context is reaped and the retention released.
+        self._dropped_draft_task_ids_to_report: list[str] = []
+        # Draft task ids whose cloud-side cached metadata will never be
+        # (fully) consumed.  Stamped onto outgoing SchedulerOutputs so
+        # the cloud model runner can purge the entries instead of
+        # leaking them until the bounded cache evicts.
+        self._pending_cloud_draft_invalidations: list[str] = []
+
+    def invalidate_cloud_draft_tasks(self, task_ids: list[str]) -> None:
+        """Queue cloud-side draft metadata invalidations (edge only)."""
+        if not self._edge_cloud_draft_retention_enabled:
+            return
+        self._pending_cloud_draft_invalidations.extend(task_ids)
+
+    def schedule(self) -> SchedulerOutput:
+        scheduler_output = self._schedule_pd_separated()
+        # EMPTY batches are not broadcast to the workers, so keep the
+        # invalidations pending until a real batch can carry them.
+        if (
+            self._pending_cloud_draft_invalidations
+            and scheduler_output.batch_type != BatchType.EMPTY
+        ):
+            scheduler_output.cloud_draft_invalidate_task_ids = (
+                self._pending_cloud_draft_invalidations
+            )
+            self._pending_cloud_draft_invalidations = []
+        return scheduler_output
+
     # ------------------------------------------------------------------ #
     # Chunk-prefill-prior helpers                                         #
     # ------------------------------------------------------------------ #
@@ -446,9 +498,6 @@ class PDSeparatedScheduler(Scheduler):
         ]
         for token in to_remove:
             self._prefill_flight_by_token.pop(token, None)
-
-    def schedule(self) -> SchedulerOutput:
-        return self._schedule_pd_separated()
 
     def _make_empty_batch(self) -> SchedulerOutput:
         scheduler_output = SchedulerOutput.make_empty()
@@ -1121,6 +1170,10 @@ class PDSeparatedScheduler(Scheduler):
                 self.draft_remote_pending_count = max(
                     0, self.draft_remote_pending_count - 1
                 )
+                if scheduler_output.draft_task_id is not None:
+                    self._dropped_draft_task_ids_to_report.append(
+                        scheduler_output.draft_task_id
+                    )
                 logger.info(
                     "[PD] drop stale DRAFT_LAST task_id=%s step=%s",
                     scheduler_output.draft_task_id,
@@ -1130,30 +1183,162 @@ class PDSeparatedScheduler(Scheduler):
             return scheduler_output
         return self._make_empty_batch()
 
-    @staticmethod
-    def _scheduler_output_intersects_req_ids(
-        scheduler_output: SchedulerOutput, req_ids: set[str]
-    ) -> bool:
-        if scheduler_output.parent_req_id in req_ids:
+    # ------------------------------------------------------------------ #
+    # Edge-cloud deferred-draft KV retention                              #
+    # ------------------------------------------------------------------ #
+    def _check_scheduled_edge_cloud_draft(self) -> bool:
+        """Mirror of the runner/engine-core scheduled edge-cloud draft
+        predicate.  Gates the retention logic so schedulers without the
+        edge-cloud draft methods behave exactly as upstream.
+        """
+        speculative_config = self.vllm_config.speculative_config
+        if speculative_config is None:
+            return False
+        if not getattr(
+            self.vllm_config.parallel_config, "enable_edge_cloud", False
+        ):
+            return False
+        method = getattr(speculative_config, "method", None)
+        if method == "eagle3":
             return True
-        return any(
-            req_id in req_ids
-            for req_id in scheduler_output.num_scheduled_tokens
+        if method in ("qwen3_5_mtp", "qwen_mtp"):
+            return True
+        if method != "mtp":
+            return False
+        hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
+        return "qwen" in str(getattr(hf_config, "model_type", "")).lower()
+
+    def register_edge_cloud_draft_task(
+        self, task_id: str, req_ids: set[str]
+    ) -> None:
+        """Register a deferred draft before its parent output is applied."""
+        if (
+            not self._edge_cloud_draft_retention_enabled
+            or not task_id
+            or not req_ids
+        ):
+            return
+        previous_req_ids = self._edge_cloud_draft_task_reqs.get(task_id)
+        if previous_req_ids is not None:
+            if previous_req_ids != req_ids:
+                raise RuntimeError(
+                    "Deferred draft task registration changed request set: "
+                    f"task_id={task_id}, previous={previous_req_ids}, "
+                    f"new={req_ids}"
+                )
+            return
+        self._edge_cloud_draft_task_reqs[task_id] = set(req_ids)
+        for req_id in req_ids:
+            self._edge_cloud_draft_req_tasks.setdefault(req_id, set()).add(
+                task_id
+            )
+
+    def _free_request(
+        self, request: Request, delay_free_blocks: bool = False
+    ) -> dict[str, Any] | None:
+        task_ids = (
+            self._edge_cloud_draft_req_tasks.get(request.request_id)
+            if self._edge_cloud_draft_retention_enabled
+            else None
+        )
+        if not task_ids:
+            return super()._free_request(request, delay_free_blocks)
+        # The request is referenced by a pending/in-flight deferred draft.
+        # Finish it normally (outputs, finished_req_ids) but keep its KV
+        # blocks until the draft chain completes on the cloud — same
+        # ordering guarantee the non-edge-cloud path gets for free by
+        # proposing drafts inside execute_model.
+        for task_id in task_ids:
+            self._draft_retained_requests.setdefault(task_id, {})[
+                request.request_id
+            ] = request
+        return super()._free_request(request, delay_free_blocks=True)
+
+    def release_draft_retained_blocks(self, task_id: str) -> None:
+        """Free KV blocks retained for a completed/dropped draft task.
+
+        Idempotent.  A request referenced by several in-flight draft
+        tasks is only freed once its last referencing task releases.
+        """
+        task_req_ids = self._edge_cloud_draft_task_reqs.pop(task_id, set())
+        retained = self._draft_retained_requests.pop(task_id, {})
+        for req_id in task_req_ids:
+            req_tasks = self._edge_cloud_draft_req_tasks.get(req_id)
+            if req_tasks is not None:
+                req_tasks.discard(task_id)
+                if req_tasks:
+                    # Still referenced by another in-flight draft task.
+                    continue
+                self._edge_cloud_draft_req_tasks.pop(req_id, None)
+            request = retained.get(req_id)
+            if request is None:
+                continue
+            current = self.requests.get(req_id)
+            if current is request and request.is_finished():
+                self._free_blocks(request)
+            elif current is not None and current is not request:
+                # req_id resubmitted after finishing: free the old
+                # request's blocks without evicting the new entry.
+                self.kv_cache_manager.free(request)
+
+    def _scheduler_output_all_requests_finished(
+        self, scheduler_output: SchedulerOutput
+    ) -> bool:
+        batch_req_ids = self._edge_cloud_draft_task_reqs.get(
+            scheduler_output.draft_task_id or ""
+        )
+        if batch_req_ids is None:
+            batch_req_ids = set(scheduler_output.num_scheduled_tokens)
+        else:
+            batch_req_ids = set(batch_req_ids)
+        if scheduler_output.parent_req_id is not None:
+            batch_req_ids.add(scheduler_output.parent_req_id)
+        return bool(batch_req_ids) and all(
+            (request := self.requests.get(req_id)) is None
+            or request.is_finished()
+            for req_id in batch_req_ids
         )
 
     def _drop_stale_drafts_for_req_ids(self, req_ids: set[str]) -> None:
         if not req_ids:
             return
-        self.drafts_first_ready = deque(
-            output
-            for output in self.drafts_first_ready
-            if not self._scheduler_output_intersects_req_ids(output, req_ids)
-        )
+        # Aligned with the model runner's deferred-draft policy: a draft
+        # batch is dropped only when EVERY request it covers has finished.
+        # Partial finishes keep the draft — the cloud-side cached
+        # attention metadata is whole-batch and cannot be re-sliced.
+        # Dropped task ids are reported to the runner (which may still
+        # hold the enqueued context) via take_dropped_draft_task_ids().
+        kept_first: deque[SchedulerOutput] = deque()
+        for output in self.drafts_first_ready:
+            output_req_ids = set(output.num_scheduled_tokens)
+            if output.parent_req_id is not None:
+                output_req_ids.add(output.parent_req_id)
+            if (
+                output_req_ids.intersection(req_ids)
+                and self._scheduler_output_all_requests_finished(output)
+            ):
+                if output.draft_task_id is not None:
+                    self._dropped_draft_task_ids_to_report.append(
+                        output.draft_task_id
+                    )
+            else:
+                kept_first.append(output)
+        self.drafts_first_ready = kept_first
         kept_last: deque[SchedulerOutput] = deque()
         dropped_last = 0
         for output in self.drafts_last_ready:
-            if self._scheduler_output_intersects_req_ids(output, req_ids):
+            output_req_ids = set(output.num_scheduled_tokens)
+            if output.parent_req_id is not None:
+                output_req_ids.add(output.parent_req_id)
+            if (
+                output_req_ids.intersection(req_ids)
+                and self._scheduler_output_all_requests_finished(output)
+            ):
                 dropped_last += 1
+                if output.draft_task_id is not None:
+                    self._dropped_draft_task_ids_to_report.append(
+                        output.draft_task_id
+                    )
             else:
                 kept_last.append(output)
         self.drafts_last_ready = kept_last
@@ -1161,15 +1346,17 @@ class PDSeparatedScheduler(Scheduler):
             0, self.draft_remote_pending_count - dropped_last
         )
 
+    def take_dropped_draft_task_ids(self) -> list[str]:
+        """Drain draft task ids dropped from the ready queues since the
+        last call (EngineCore patch forwards them to the runner)."""
+        dropped = self._dropped_draft_task_ids_to_report
+        self._dropped_draft_task_ids_to_report = []
+        return dropped
+
     def _is_stale_draft_output(
         self, scheduler_output: SchedulerOutput
     ) -> bool:
-        req_ids = set(scheduler_output.num_scheduled_tokens)
-        if scheduler_output.parent_req_id:
-            req_ids.add(scheduler_output.parent_req_id)
-        return bool(req_ids) and all(
-            req_id not in self.requests for req_id in req_ids
-        )
+        return self._scheduler_output_all_requests_finished(scheduler_output)
 
     def _pick_decode_last_batch(self) -> SchedulerOutput:
         if not self.decodes_last_ready:

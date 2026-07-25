@@ -361,7 +361,6 @@ def _finish_empty_batch(self, scheduler_output: SchedulerOutput):
     """Complete an EMPTY SchedulerOutput without broadcasting to workers."""
     self._stash_empty_worker_cleanup(scheduler_output)
     self._process_aborts_queue()
-    self._clear_pending_edge_cloud_draft_for_finished_requests()
     with (
         self.log_error_detail(scheduler_output),
         self.log_iteration_details(scheduler_output),
@@ -369,7 +368,7 @@ def _finish_empty_batch(self, scheduler_output: SchedulerOutput):
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, EMPTY_MODEL_RUNNER_OUTPUT
         )
-    self._clear_pending_edge_cloud_draft_for_finished_requests()
+    self._enqueue_pending_edge_cloud_draft_if_ready()
     return engine_core_outputs, False
 
 
@@ -390,7 +389,7 @@ def _pop_deferred_empty_batch(self) -> SchedulerOutput | None:
 
 
 def _enqueue_pending_edge_cloud_draft_if_ready(self) -> None:
-    """Move completed/new edge-cloud draft work across the executor boundary."""
+    """Move draft work and lifecycle events across the executor boundary."""
     if not getattr(self, "use_spec_decode", False):
         return
     ready_queue = getattr(self.scheduler, "drafts_first_ready", None)
@@ -403,8 +402,17 @@ def _enqueue_pending_edge_cloud_draft_if_ready(self) -> None:
     if take_completed is not None:
         completed = take_completed()
         if completed is not None:
-            draft_token_ids, _parent_scheduler_output = completed
+            draft_token_ids, parent_scheduler_output = completed
             self.scheduler.update_draft_token_ids(draft_token_ids)
+            # The draft chain has fully executed on the cloud; release
+            # the KV blocks retained for requests that finished while
+            # the chain was in flight.
+            release = getattr(
+                self.scheduler, "release_draft_retained_blocks", None
+            )
+            task_id = getattr(parent_scheduler_output, "head_token", None)
+            if release is not None and task_id:
+                release(task_id)
 
     take_pending = getattr(
         self.model_executor,
@@ -413,7 +421,32 @@ def _enqueue_pending_edge_cloud_draft_if_ready(self) -> None:
     )
     if take_pending is None:
         return
-    scheduler_output = take_pending()
+    finished_req_ids = set(
+        getattr(self.scheduler, "finished_req_ids", set()) or ()
+    )
+    take_sched_dropped = getattr(
+        self.scheduler, "take_dropped_draft_task_ids", None
+    )
+    sched_dropped = (
+        take_sched_dropped() if take_sched_dropped is not None else []
+    )
+    scheduler_output, runner_dropped = take_pending(
+        finished_req_ids, sched_dropped
+    )
+    dropped_task_ids = list(
+        dict.fromkeys([*sched_dropped, *runner_dropped])
+    )
+    release = getattr(
+        self.scheduler, "release_draft_retained_blocks", None
+    )
+    if release is not None:
+        for task_id in dropped_task_ids:
+            release(task_id)
+    invalidate = getattr(
+        self.scheduler, "invalidate_cloud_draft_tasks", None
+    )
+    if invalidate is not None:
+        invalidate(dropped_task_ids)
     if scheduler_output is None:
         return
     if scheduler_output.batch_type != BatchType.DRAFT_FIRST:
@@ -424,21 +457,31 @@ def _enqueue_pending_edge_cloud_draft_if_ready(self) -> None:
     ready_queue.append(scheduler_output)
 
 
-def _clear_pending_edge_cloud_draft_for_finished_requests(self) -> None:
+def _register_edge_cloud_draft_parent(
+    self, scheduler_output: SchedulerOutput
+) -> None:
+    """Register a deferred draft locally before applying its parent output."""
     if not getattr(self, "use_spec_decode", False):
         return
-    finished_req_ids = set(
-        getattr(self.scheduler, "finished_req_ids", set()) or ()
-    )
-    if not finished_req_ids:
+    if not self._uses_scheduled_edge_cloud_draft():
         return
-    clear_pending = getattr(
-        self.model_executor,
-        "clear_pending_edge_cloud_draft_for_req_ids",
-        None,
+    if scheduler_output.batch_type not in (
+        BatchType.PREFILL_LAST,
+        BatchType.DECODE_LAST,
+    ):
+        return
+    if (
+        scheduler_output.batch_type == BatchType.PREFILL_LAST
+        and not getattr(scheduler_output, "is_last_prefill_chunk", True)
+    ):
+        return
+    task_id = getattr(scheduler_output, "head_token", None)
+    req_ids = set(scheduler_output.num_scheduled_tokens)
+    register = getattr(
+        self.scheduler, "register_edge_cloud_draft_task", None
     )
-    if clear_pending is not None:
-        clear_pending(finished_req_ids)
+    if register is not None and task_id and req_ids:
+        register(task_id, req_ids)
 
 
 def _uses_scheduled_edge_cloud_draft(self) -> bool:
@@ -521,12 +564,13 @@ def _patched_step(self):
 
     # Before processing the model output, process any aborts that happened
     # during the model execution.
+    # Register the deferred draft before abort/model completion can free
+    # requests referenced by this parent batch.
+    self._register_edge_cloud_draft_parent(scheduler_output)
     self._process_aborts_queue()
-    self._clear_pending_edge_cloud_draft_for_finished_requests()
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output
     )
-    self._clear_pending_edge_cloud_draft_for_finished_requests()
     self._enqueue_pending_edge_cloud_draft_if_ready()
 
     return (
@@ -658,12 +702,13 @@ def _patched_step_with_batch_queue(self):
             exec_model_fut.result()
             raise RuntimeError("unexpected error")
 
+    # Register the deferred draft before abort/model completion can free
+    # requests referenced by this parent batch.
+    self._register_edge_cloud_draft_parent(scheduler_output)
     self._process_aborts_queue()
-    self._clear_pending_edge_cloud_draft_for_finished_requests()
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output
     )
-    self._clear_pending_edge_cloud_draft_for_finished_requests()
     self._enqueue_pending_edge_cloud_draft_if_ready()
 
     if deferred_empty_batch := self._pop_deferred_empty_batch():
@@ -821,8 +866,8 @@ def install() -> None:
     EngineCore._enqueue_pending_edge_cloud_draft_if_ready = (
         _enqueue_pending_edge_cloud_draft_if_ready
     )
-    EngineCore._clear_pending_edge_cloud_draft_for_finished_requests = (
-        _clear_pending_edge_cloud_draft_for_finished_requests
+    EngineCore._register_edge_cloud_draft_parent = (
+        _register_edge_cloud_draft_parent
     )
     EngineCore._uses_scheduled_edge_cloud_draft = (
         _uses_scheduled_edge_cloud_draft

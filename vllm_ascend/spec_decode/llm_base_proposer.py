@@ -2137,7 +2137,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 )
             )
 
-            # Edge last segment: compute logits (Eagle3) or final norm (MTP).
+            # Edge last segment: compute logits (Eagle3); for MTP the final
+            # norm already ran on the cloud, so this is a pass-through.
             model_kwargs["intermediate_tensors"] = intermediate
             for key in ("input_ids", "inputs_embeds", "hidden_states", "spec_step_idx"):
                 model_kwargs.pop(key, None)

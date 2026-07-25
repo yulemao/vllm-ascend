@@ -1327,10 +1327,15 @@ class NPUModelRunner(GPUModelRunner):
             if predictor is None:
                 logger.warning("[EdgeCloud] Cannot find MTP predictor for sharding")
                 return
+            # NOTE: "norm" is deliberately NOT stripped on the cloud.  The
+            # cloud applies the MTP final norm right after its decoder layer
+            # and ships only the normed hidden states back to the edge, which
+            # eliminates the residual transfer (halving the cloud->edge
+            # payload).  The edge keeps its own norm weights as a fallback for
+            # payloads that still carry a pre-norm residual.
             edge_only_modules = (
                 "embed_tokens",
                 "fc",
-                "norm",
                 "pre_fc_norm_hidden",
                 "pre_fc_norm_embedding",
             )
@@ -3079,7 +3084,8 @@ class NPUModelRunner(GPUModelRunner):
             # Match the warmup trace signature exactly (guards are skipped,
             # see _run_mtp_edge_first_segment): warmup calls segment "e"
             # with only positions + intermediate_tensors, and the last
-            # segment (final norm) does not consume spec_step_idx anyway.
+            # segment (pass-through; the final norm runs on the cloud) does
+            # not consume spec_step_idx anyway.
             segment_output = segment(
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,

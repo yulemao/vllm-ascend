@@ -290,8 +290,13 @@ def _forward_edge_cloud_segment_qwen3_5_mtp(
     **extra_layer_kwargs: Any,
 ) -> torch.Tensor | IntermediateTensors:
     # All MTP decoder layers run on the cloud side; edge only handles
-    # embed+fc (first segment) and norm (last segment).  start_layer/end_layer
-    # are kept in the signature for backward compatibility but ignored here.
+    # embed+fc (first segment).  The final norm also runs on the cloud right
+    # after the decoder layer, so only the normed hidden states cross back to
+    # the edge and no residual is transferred.  The edge tail segment is then
+    # a pass-through (it still applies the norm itself when the incoming
+    # payload carries a pre-norm residual, e.g. from a peer that has not
+    # moved the norm to the cloud).  start_layer/end_layer are kept in the
+    # signature for backward compatibility but ignored here.
     num_layers = len(self.layers)
 
     if is_first_segment is None:
@@ -314,7 +319,9 @@ def _forward_edge_cloud_segment_qwen3_5_mtp(
             "check that all TP ranks receive tensors correctly."
         )
         hidden_states = intermediate_tensors["hidden_states"]
-        residual = intermediate_tensors["residual"]
+        # The cloud norms before sending, so the payload normally carries no
+        # residual at all; tolerate its absence.
+        residual = intermediate_tensors.tensors.get("residual")
 
     # Cloud segment: execute exactly one decoder layer selected by spec_step_idx.
     if not is_first_segment and not is_last_segment:
@@ -324,13 +331,19 @@ def _forward_edge_cloud_segment_qwen3_5_mtp(
             hidden_states=hidden_states,
             residual=residual,
         )
+        # Final norm on the cloud: the edge tail then only needs the normed
+        # hidden states, halving the cloud->edge payload (no residual).
+        hidden_states, _ = self.norm(hidden_states, residual)
+        residual = None
 
     if not is_last_segment:
-        return IntermediateTensors(
-            {"hidden_states": hidden_states, "residual": residual}
-        )
+        tensors: dict[str, Any] = {"hidden_states": hidden_states}
+        if residual is not None:
+            tensors["residual"] = residual
+        return IntermediateTensors(tensors)
 
-    hidden_states, _ = self.norm(hidden_states, residual)
+    if residual is not None:
+        hidden_states, _ = self.norm(hidden_states, residual)
     return hidden_states
 
 

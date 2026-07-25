@@ -53,6 +53,8 @@ def _vllm_pd_scheduler_schema_available() -> bool:
             "parent_req_id",
             "draft_task_id",
             "draft_step_idx",
+            "num_accepted_tokens",
+            "valid_sampled_token_count",
         )
     )
 

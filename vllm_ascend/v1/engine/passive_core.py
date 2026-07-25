@@ -780,7 +780,10 @@ class PassiveEngineCoreProc:
             return
         elif bt == BatchType.DRAFT_FIRST:
             tail = replace(
-                scheduler_output, batch_type=BatchType.DRAFT_LAST
+                scheduler_output,
+                batch_type=BatchType.DRAFT_LAST,
+                num_accepted_tokens=None,
+                valid_sampled_token_count=None,
             )
             if not tail.head_token:
                 raise RuntimeError("DRAFT_LAST POST_OUT missing head_token")

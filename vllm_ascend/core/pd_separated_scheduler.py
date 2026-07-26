@@ -4,7 +4,7 @@ import enum
 import os
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 from collections.abc import Iterable
@@ -1175,6 +1175,22 @@ class PDSeparatedScheduler(Scheduler):
         if scheduler_output.head_token is None:
             scheduler_output.head_token = uuid4().hex
         scheduler_output.hidden_channel = HiddenChannelType.DECODE
+        # Draft-first self-posting mirrors the decode path below. Every
+        # field needed by DRAFT_LAST is already known on the edge; the cloud
+        # used to echo the same SchedulerOutput back through POST_OUT only
+        # after its worker acked DRAFT_FIRST. Pre-generating the tail here
+        # removes that per-draft-step control-plane round trip and lets the
+        # edge post the matching receive as soon as DRAFT_FIRST has completed
+        # locally. Worker FIFO ordering plus the per-channel send-work wait
+        # preserves DRAFT_FIRST -> DRAFT_LAST data-plane ordering.
+        draft_last = replace(
+            scheduler_output,
+            batch_type=BatchType.DRAFT_LAST,
+            num_accepted_tokens=None,
+            valid_sampled_token_count=None,
+        )
+        self._validate_draft_tail_channel(draft_last)
+        self.drafts_last_ready.append(draft_last)
         self.draft_inflight_count += 1
         self.draft_remote_pending_count += 1
         logger.info(
@@ -1346,7 +1362,6 @@ class PDSeparatedScheduler(Scheduler):
                     # that scheduling DECODE_LAST needs no round-trip
                     # through POST_OUT.  The cloud unconditionally skips
                     # POST_OUT for all DECODE_FIRST batches.
-                    from dataclasses import replace
                     decode_last = replace(
                         scheduler_output,
                         batch_type=BatchType.DECODE_LAST,

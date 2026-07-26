@@ -1082,11 +1082,9 @@ class NPUWorker(WorkerBase):
         Owns the cross-PP edge-cloud communication, mirroring
         ``_execute_model_cloud``: recv the edge->cloud draft payload, run
         the cloud target/C segment forward (in the model_runner), then send
-        the cloud->edge result.  The send is recorded (not waited): the edge
-        posts the matching tail recv (DRAFT_LAST) only after this worker's
-        ack lets the cloud EngineCore publish the tail SchedulerOutput;
-        waiting before the next DECODE-channel reuse circular-deadlocks edge
-        and cloud.
+        the cloud->edge result. The send is recorded (not waited); the edge
+        self-posts DRAFT_LAST when it schedules DRAFT_FIRST, so its matching
+        receive can be posted without a worker-ack/POST_OUT round trip.
         """
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
         tensor_dict, comm_handles, comm_postprocess = (

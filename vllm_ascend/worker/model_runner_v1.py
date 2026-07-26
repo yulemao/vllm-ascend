@@ -4871,11 +4871,10 @@ class NPUModelRunner(GPUModelRunner):
         communication stays in the worker layer, consistent with the
         non-draft ``_execute_model_cloud`` path.
 
-        The matching edge tail recv (DRAFT_LAST) is only posted after the
-        cloud EngineCore publishes the tail SchedulerOutput, which is gated
-        on the cloud worker's completion ack, so the worker records (rather
-        than waits) the cloud->edge send -- exactly like
-        ``_execute_model_cloud``.
+        The edge self-posts DRAFT_LAST together with DRAFT_FIRST, so the
+        matching receive does not depend on a cloud worker ack or POST_OUT.
+        The worker records (rather than waits for) the cloud->edge send,
+        exactly like ``_execute_model_cloud``.
         """
         spec_step_idx = int(scheduler_output.draft_step_idx or 0)
         # The edge carries rejection-corrected sampling state on the step-0

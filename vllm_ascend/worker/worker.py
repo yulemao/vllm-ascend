@@ -69,6 +69,8 @@ from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import (
+    ScheduledDraftTensorMeta,
+    build_scheduled_draft_tensor_meta,
     edge_cloud_broadcast_recv,
     edge_cloud_broadcast_recv_scheduled_draft,
     edge_cloud_send_tensor_dict,
@@ -840,6 +842,45 @@ class NPUWorker(WorkerBase):
             return HiddenChannelType.DECODE
         raise RuntimeError(f"No hidden channel for batch_type={bt}")
 
+    def _scheduled_draft_tensor_meta(
+        self,
+        scheduler_output: "SchedulerOutput",
+        direction: str,
+    ) -> ScheduledDraftTensorMeta | None:
+        """Derive the scheduled draft wire schema on both peers.
+
+        Sequence-parallel draft tensors currently retain their dynamic
+        sender-side shard shapes, which can differ between heterogeneous edge
+        and cloud TP groups. Keep that configuration on the compatibility path
+        until draft transfer mirrors the main model's all-gather/re-chunk flow.
+        """
+        if enable_sp():
+            return None
+
+        speculative_config = self.model_runner.speculative_config
+        drafter = self.model_runner.drafter
+        if (
+            speculative_config is None
+            or speculative_config.method is None
+            or drafter is None
+        ):
+            return None
+
+        draft_step_idx = int(scheduler_output.draft_step_idx or 0)
+        num_tokens = (
+            scheduler_output.total_num_scheduled_tokens
+            if draft_step_idx == 0
+            else len(scheduler_output.num_scheduled_tokens)
+        )
+        return build_scheduled_draft_tensor_meta(
+            method=speculative_config.method,
+            direction=direction,
+            draft_step_idx=draft_step_idx,
+            num_tokens=num_tokens,
+            hidden_size=drafter.hidden_size,
+            dtype=self.model_runner.dtype,
+        )
+
     def _execute_model_edge_head(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1087,8 +1128,14 @@ class NPUWorker(WorkerBase):
         receive can be posted without a worker-ack/POST_OUT round trip.
         """
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
+        recv_tensor_meta = self._scheduled_draft_tensor_meta(
+            scheduler_output,
+            "e2c",
+        )
         tensor_dict, comm_handles, comm_postprocess = (
-            edge_cloud_broadcast_recv_scheduled_draft()
+            edge_cloud_broadcast_recv_scheduled_draft(
+                tensor_meta=recv_tensor_meta,
+            )
         )
         for handle in comm_handles:
             handle.wait()
@@ -1106,8 +1153,15 @@ class NPUWorker(WorkerBase):
                 for key, value in output.items()
             }
             # Async send only -- record, do NOT wait.  See method docstring.
+            send_tensor_meta = self._scheduled_draft_tensor_meta(
+                scheduler_output,
+                "c2e",
+            )
             self._record_pp_send_work(
-                edge_cloud_send_tensor_dict_scheduled_draft(out_tensor_dict),
+                edge_cloud_send_tensor_dict_scheduled_draft(
+                    out_tensor_dict,
+                    tensor_meta=send_tensor_meta,
+                ),
                 channel=HiddenChannelType.DECODE,
             )
             logger.info(
@@ -1140,8 +1194,15 @@ class NPUWorker(WorkerBase):
                 else value
                 for key, value in output.items()
             }
+            send_tensor_meta = self._scheduled_draft_tensor_meta(
+                scheduler_output,
+                "e2c",
+            )
             self._record_pp_send_work(
-                edge_cloud_send_tensor_dict_scheduled_draft(tensor_dict),
+                edge_cloud_send_tensor_dict_scheduled_draft(
+                    tensor_dict,
+                    tensor_meta=send_tensor_meta,
+                ),
                 channel=HiddenChannelType.DECODE,
             )
             logger.info(
@@ -1159,8 +1220,14 @@ class NPUWorker(WorkerBase):
     ) -> ModelRunnerOutput:
         """Receive and finish one edge-side scheduled draft step."""
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
+        recv_tensor_meta = self._scheduled_draft_tensor_meta(
+            scheduler_output,
+            "c2e",
+        )
         tensor_dict, comm_handles, comm_postprocess = (
-            edge_cloud_broadcast_recv_scheduled_draft()
+            edge_cloud_broadcast_recv_scheduled_draft(
+                tensor_meta=recv_tensor_meta,
+            )
         )
         for handle in comm_handles:
             handle.wait()

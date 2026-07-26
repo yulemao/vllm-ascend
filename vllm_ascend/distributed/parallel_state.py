@@ -154,6 +154,85 @@ class EdgeCloudTensorMeta:
     send_tensor_keys: list[str] | None = None
 
 
+@dataclass(frozen=True)
+class ScheduledDraftTensorMeta:
+    """Locally-derived schema for one scheduled draft transfer.
+
+    Unlike ``EdgeCloudTensorMeta``, this schema is built per draft step because
+    Eagle3's edge-to-cloud payload changes after step 0. Both peers receive the
+    same ``SchedulerOutput``, so they can construct this object independently
+    and transfer only tensor bodies over the device process group.
+    """
+
+    metadata_list: tuple[tuple[str, Any], ...]
+    send_tensor_keys: tuple[str, ...]
+
+
+def build_scheduled_draft_tensor_meta(
+    *,
+    method: str,
+    direction: str,
+    draft_step_idx: int,
+    num_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    device: str = "npu",
+) -> ScheduledDraftTensorMeta | None:
+    """Build a metadata-free scheduled draft wire schema.
+
+    Returns ``None`` for an unknown method/direction so callers can retain the
+    dynamic tensor-dict transport as a compatibility fallback.
+    """
+    if direction not in ("e2c", "c2e"):
+        return None
+
+    tensor_meta = TensorMetadata(
+        device,
+        dtype,
+        (num_tokens, hidden_size),
+    )
+    if method in ("mtp", "qwen_mtp", "qwen3_5_mtp"):
+        return ScheduledDraftTensorMeta(
+            metadata_list=(("hidden_states", tensor_meta),),
+            send_tensor_keys=("hidden_states",),
+        )
+
+    if method != "eagle3":
+        return None
+
+    if direction == "c2e":
+        return ScheduledDraftTensorMeta(
+            metadata_list=(
+                ("hidden_states", tensor_meta),
+                ("residual", tensor_meta),
+            ),
+            send_tensor_keys=("hidden_states", "residual"),
+        )
+
+    if draft_step_idx == 0:
+        # Eagle3 step 0 only transmits token embeddings. The cloud constructs
+        # hidden_states from its cached target auxiliaries; retain the empty
+        # placeholder and residual=None expected by the segmented model.
+        empty_hidden_meta = TensorMetadata(device, dtype, (0,))
+        return ScheduledDraftTensorMeta(
+            metadata_list=(
+                ("input_embeds", tensor_meta),
+                ("hidden_states", empty_hidden_meta),
+                ("residual", None),
+            ),
+            send_tensor_keys=("input_embeds",),
+        )
+
+    return ScheduledDraftTensorMeta(
+        metadata_list=(
+            ("input_embeds", tensor_meta),
+            ("hidden_states", tensor_meta),
+            ("residual", None),
+        ),
+        send_tensor_keys=("input_embeds", "hidden_states"),
+    )
+
+
 def _build_edge_cloud_tensor_meta(
     hidden_size: int,
     hidden_dtype: torch.dtype,
@@ -1417,9 +1496,69 @@ def edge_cloud_send_tensor_dict(
 def edge_cloud_send_tensor_dict_scheduled_draft(
     tensor_dict: dict[str, torch.Tensor | Any],
     channel: HiddenChannelType = HiddenChannelType.DECODE,
+    tensor_meta: ScheduledDraftTensorMeta | None = None,
 ) -> list[Handle]:
-    """Send a dynamically-shaped scheduled draft payload."""
+    """Send a scheduled draft payload, avoiding metadata sync when possible."""
     pp_group = get_pp_group()
+    if tensor_meta is not None:
+        if pp_group.world_size <= 1:
+            return []
+
+        dst = (pp_group.rank_in_group + 1) % pp_group.world_size
+        group = _get_edge_cloud_hidden_channel_device_group(
+            pp_group,
+            channel=channel,
+        )
+        sender_tensor_keys = [
+            key
+            for key, value in tensor_dict.items()
+            if key in tensor_meta.send_tensor_keys
+            and isinstance(value, torch.Tensor)
+            and value.numel() > 0
+        ]
+        assert sender_tensor_keys == list(tensor_meta.send_tensor_keys), (
+            "edge_cloud_send_tensor_dict_scheduled_draft: tensor key "
+            f"set/order mismatch. sender={sender_tensor_keys}, "
+            f"expected={list(tensor_meta.send_tensor_keys)}"
+        )
+
+        metadata_by_key = dict(tensor_meta.metadata_list)
+        handles: list[Handle] = []
+        for key in tensor_meta.send_tensor_keys:
+            tensor = tensor_dict[key]
+            expected = metadata_by_key[key]
+            assert isinstance(tensor, torch.Tensor)
+            assert isinstance(expected, TensorMetadata)
+            assert (
+                tuple(tensor.shape) == tuple(expected.size)
+                and tensor.dtype == expected.dtype
+                and tensor.device.type == expected.device
+            ), (
+                "edge_cloud_send_tensor_dict_scheduled_draft: tensor metadata "
+                f"mismatch for '{key}'. got=(shape={tuple(tensor.shape)}, "
+                f"dtype={tensor.dtype}, device={tensor.device.type}), "
+                f"expected=(shape={tuple(expected.size)}, "
+                f"dtype={expected.dtype}, device={expected.device})"
+            )
+            if not tensor.is_contiguous():
+                tensor = tensor.contiguous()
+            with _hidden_channel_stream_ctx(channel, wait_for_default=True):
+                handle = torch.distributed.isend(
+                    tensor,
+                    dst=pp_group.ranks[dst],
+                    group=group,
+                )
+                if tensor.is_cuda:
+                    tensor.record_stream(
+                        torch.cuda.current_stream(tensor.device)
+                    )
+                elif tensor.device.type == "npu":
+                    tensor.record_stream(
+                        torch.npu.current_stream(tensor.device)
+                    )
+            handles.append(handle)
+        return handles
+
     if hasattr(pp_group, "isend_tensor_dict_on_hidden_channel"):
         return pp_group.isend_tensor_dict_on_hidden_channel(
             tensor_dict,
@@ -1654,11 +1793,10 @@ def edge_cloud_broadcast_recv_draft() -> tuple[
     ``pp_group.irecv_tensor_dict()`` / ``tp_group.broadcast_object()`` path
     that round-trips the metadata over the wire.
 
-    The draft edge-cloud path (MTP/Eagle3) sends a per-step tensor dict whose
-    shape/keys are not fully described by the pre-computed EdgeCloudTensorMeta,
-    so it cannot use the locally-computed fast path.  Keep this old
-    implementation around — renamed — for the draft callers while the
-    non-draft edge-cloud worker path keeps the optimized one.
+    Kept as a compatibility path for draft configurations whose wire schema
+    cannot yet be derived locally, notably sequence-parallel scheduled drafts.
+    Supported non-SP Qwen MTP/Eagle3 steps use ``ScheduledDraftTensorMeta``
+    instead.
     """
     pp_group = get_pp_group()
     tp_group = get_tp_group()
@@ -1723,15 +1861,86 @@ def edge_cloud_broadcast_recv_draft() -> tuple[
 
 def edge_cloud_broadcast_recv_scheduled_draft(
     channel: HiddenChannelType = HiddenChannelType.DECODE,
+    tensor_meta: ScheduledDraftTensorMeta | None = None,
 ) -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
     list[Callable[[], None]],
 ]:
-    """Receive a dynamically-shaped scheduled draft payload."""
+    """Receive and TP-broadcast a scheduled draft payload.
+
+    A locally-derived ``tensor_meta`` skips both the cross-node Gloo metadata
+    exchange and the local TP object broadcast. ``None`` retains the dynamic
+    compatibility path.
+    """
     pp_group = get_pp_group()
     tp_group = get_tp_group()
     is_pp_npu0 = pp_group.world_size == 2
+
+    if tensor_meta is not None:
+        recv_tensor_dict: dict[str, torch.Tensor | Any] = {}
+        for key, value in tensor_meta.metadata_list:
+            if isinstance(value, TensorMetadata):
+                recv_tensor_dict[key] = torch.empty(
+                    value.size,
+                    dtype=value.dtype,
+                    device=value.device,
+                )
+            else:
+                recv_tensor_dict[key] = value
+
+        comm_handles: list[Handle] = []
+        if is_pp_npu0:
+            src = (pp_group.rank_in_group - 1) % pp_group.world_size
+            group = _get_edge_cloud_hidden_channel_device_group(
+                pp_group,
+                channel=channel,
+            )
+            with _hidden_channel_stream_ctx(channel, wait_for_default=False):
+                for key in tensor_meta.send_tensor_keys:
+                    tensor = recv_tensor_dict[key]
+                    assert isinstance(tensor, torch.Tensor)
+                    if tensor.numel() == 0:
+                        continue
+                    handle = torch.distributed.irecv(
+                        tensor,
+                        src=pp_group.ranks[src],
+                        group=group,
+                    )
+                    if tensor.is_cuda:
+                        tensor.record_stream(
+                            torch.cuda.current_stream(tensor.device)
+                        )
+                    elif tensor.device.type == "npu":
+                        tensor.record_stream(
+                            torch.npu.current_stream(tensor.device)
+                        )
+                    comm_handles.append(handle)
+
+        def broadcast_postprocess():
+            handles = []
+            for key in tensor_meta.send_tensor_keys:
+                tensor = recv_tensor_dict[key]
+                assert isinstance(tensor, torch.Tensor)
+                if tensor.numel() == 0:
+                    continue
+                group = (
+                    tp_group.cpu_group
+                    if tensor.is_cpu
+                    else tp_group.device_group
+                )
+                handles.append(
+                    torch.distributed.broadcast(
+                        tensor,
+                        src=tp_group.ranks[0],
+                        group=group,
+                        async_op=True,
+                    )
+                )
+            for handle in handles:
+                handle.wait()
+
+        return recv_tensor_dict, comm_handles, [broadcast_postprocess]
 
     if is_pp_npu0:
         if hasattr(pp_group, "irecv_tensor_dict_on_hidden_channel"):

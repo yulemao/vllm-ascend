@@ -519,7 +519,6 @@ class NPUModelRunner(GPUModelRunner):
         self._pending_edge_cloud_draft_contexts: dict[
             str, dict[str, Any]
         ] = {}
-        self._pending_edge_cloud_draft_task_ids: deque[str] = deque()
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -2727,10 +2726,6 @@ class NPUModelRunner(GPUModelRunner):
             )
         )
 
-    def _queue_pending_edge_cloud_draft_task(self, task_id: str) -> None:
-        if task_id not in self._pending_edge_cloud_draft_task_ids:
-            self._pending_edge_cloud_draft_task_ids.append(task_id)
-
     def _stash_pending_edge_cloud_draft_context(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2824,19 +2819,15 @@ class NPUModelRunner(GPUModelRunner):
             sampled_token_ids
         )
         context: dict[str, Any] = {
-            "scheduler_output": replace(scheduler_output),
-            "sampled_token_ids": frozen_sampled_token_ids,
             "positions": draft_positions,
             "hidden_states": draft_hidden_states,
             "num_scheduled_tokens": num_scheduled,
             "scheduled_token_ids": scheduled_token_ids,
             "sample_row_indices": sample_row_indices,
             "req_ids": req_ids,
-            "draft_task_id": task_id,
             "draft_step_idx": 0,
         }
         self._pending_edge_cloud_draft_contexts[task_id] = context
-        self._queue_pending_edge_cloud_draft_task(task_id)
 
         if torch.is_tensor(sampled_token_ids):
             assert self.drafter is not None
@@ -2870,108 +2861,12 @@ class NPUModelRunner(GPUModelRunner):
         self._draft_token_ids = None
         logger.info(
             "[MTP-DEBUG] pending draft context stashed: task_id=%s, "
-            "req_ids=%s, draft_step_idx=%s, pending_tasks=%d, "
-            "pending_contexts=%d",
+            "req_ids=%s, draft_step_idx=%s, pending_contexts=%d",
             task_id,
             req_ids,
             context["draft_step_idx"],
-            len(self._pending_edge_cloud_draft_task_ids),
             len(self._pending_edge_cloud_draft_contexts),
         )
-
-    def take_pending_edge_cloud_draft_scheduler_output(
-        self,
-    ) -> "SchedulerOutput | None":
-        if self._pending_edge_cloud_draft_task_ids:
-            logger.info(
-                "[MTP-DEBUG] taking pending draft task: pending_tasks=%d, "
-                "pending_contexts=%d",
-                len(self._pending_edge_cloud_draft_task_ids),
-                len(self._pending_edge_cloud_draft_contexts),
-            )
-        context = None
-        task_id = None
-        while self._pending_edge_cloud_draft_task_ids:
-            candidate_task_id = (
-                self._pending_edge_cloud_draft_task_ids.popleft()
-            )
-            candidate = self._pending_edge_cloud_draft_contexts.get(
-                candidate_task_id
-            )
-            if (
-                candidate is None
-                or candidate.get("enqueued", False)
-                or candidate.get("draft_complete", False)
-            ):
-                continue
-            context = candidate
-            task_id = candidate_task_id
-            break
-        if context is None or task_id is None:
-            return None
-
-        req_ids = tuple(context.get("req_ids") or ())
-        if not req_ids:
-            self._pending_edge_cloud_draft_contexts.pop(task_id, None)
-            return None
-        draft_step_idx = int(context.get("draft_step_idx", 0) or 0)
-        num_accepted_tokens = None
-        valid_sampled_token_count = None
-        if draft_step_idx == 0:
-            accepted_state = context.get("num_accepted_state") or {}
-            accepted = accepted_state.get("num_accepted_tokens")
-            if accepted is not None:
-                num_accepted_tokens = [int(value) for value in accepted.tolist()]
-            valid_count = accepted_state.get("valid_sampled_token_count")
-            if valid_count is not None:
-                valid_sampled_token_count = [
-                    int(value) for value in valid_count.tolist()
-                ]
-        context["enqueued"] = True
-        logger.info(
-            "[MTP-DEBUG] pending draft converted to SchedulerOutput: "
-            "task_id=%s, parent_req_id=%s, draft_step_idx=%d, "
-            "batch_type=%s, remaining_pending_tasks=%d",
-            task_id,
-            req_ids[0],
-            draft_step_idx,
-            BatchType.DRAFT_FIRST,
-            len(self._pending_edge_cloud_draft_task_ids),
-        )
-        return replace(
-            context["scheduler_output"],
-            batch_type=BatchType.DRAFT_FIRST,
-            head_token=None,
-            hidden_channel=HiddenChannelType.DECODE,
-            parent_req_id=req_ids[0],
-            draft_task_id=task_id,
-            draft_step_idx=draft_step_idx,
-            num_accepted_tokens=num_accepted_tokens,
-            valid_sampled_token_count=valid_sampled_token_count,
-        )
-
-    def take_completed_edge_cloud_draft_result(
-        self,
-    ) -> "tuple[DraftTokenIds, SchedulerOutput] | None":
-        for task_id, context in list(
-            self._pending_edge_cloud_draft_contexts.items()
-        ):
-            if not context.get("draft_complete", False):
-                continue
-            draft_steps = context.get("draft_token_id_steps") or []
-            if len(draft_steps) < self.num_spec_tokens:
-                continue
-            draft_token_tensor = torch.stack(
-                draft_steps[: self.num_spec_tokens], dim=1
-            )
-            result = DraftTokenIds(
-                list(context["req_ids"]),
-                draft_token_tensor.detach().cpu().tolist(),
-            )
-            parent_scheduler_output = context["scheduler_output"]
-            self._pending_edge_cloud_draft_contexts.pop(task_id, None)
-            return result, parent_scheduler_output
-        return None
 
     def clear_pending_edge_cloud_draft_for_req_ids(
         self, req_ids: set[str] | list[str]
@@ -2986,13 +2881,6 @@ class NPUModelRunner(GPUModelRunner):
         ]
         for task_id in stale_task_ids:
             self._pending_edge_cloud_draft_contexts.pop(task_id, None)
-        if stale_task_ids:
-            stale = set(stale_task_ids)
-            self._pending_edge_cloud_draft_task_ids = deque(
-                task_id
-                for task_id in self._pending_edge_cloud_draft_task_ids
-                if task_id not in stale
-            )
 
     def _get_pending_edge_cloud_draft_context(
         self, scheduler_output: "SchedulerOutput"
@@ -3240,22 +3128,33 @@ class NPUModelRunner(GPUModelRunner):
             )
         draft_steps.append(draft_token_ids.clone())
         next_step_idx = draft_step_idx + 1
+        completed_draft_token_ids = None
         if next_step_idx < self.num_spec_tokens:
             context["draft_step_idx"] = next_step_idx
-            context["enqueued"] = False
-            assert scheduler_output.draft_task_id is not None
-            self._queue_pending_edge_cloud_draft_task(
-                scheduler_output.draft_task_id
-            )
+            # DRAFT_LAST completion is the readiness signal for the next
+            # step. PDSeparatedScheduler derives the next DRAFT_FIRST locally
+            # from this completed SchedulerOutput, so no worker-side pending
+            # task or follow-up control RPC is needed.
         else:
-            context["draft_complete"] = True
             self._draft_token_ids = torch.stack(draft_steps, dim=1)
 
         req_ids = list(context["req_ids"])
-        return ModelRunnerOutput(
+        if next_step_idx >= self.num_spec_tokens:
+            completed_draft_token_ids = DraftTokenIds(
+                req_ids,
+                self._draft_token_ids.detach().cpu().tolist(),
+            )
+            task_id = scheduler_output.draft_task_id
+            assert task_id is not None
+            self._pending_edge_cloud_draft_contexts.pop(task_id, None)
+
+        output = ModelRunnerOutput(
             req_ids=req_ids,
             req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
         )
+        if completed_draft_token_ids is not None:
+            output.edge_cloud_draft_token_ids = completed_draft_token_ids
+        return output
 
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
@@ -4245,6 +4144,7 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_metadata,
         )
 
+        edge_cloud_draft_state: dict[str, Any] | None = None
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
                 use_padded_batch = (
@@ -4323,19 +4223,39 @@ class NPUModelRunner(GPUModelRunner):
                         self.valid_sampled_token_count_gpu.cpu()
                     )
                 if self._should_defer_edge_cloud_draft(scheduler_output):
-                    # Deferred edge-cloud draft: do NOT send here.
-                    # Store the sampling state in the pending context so
-                    # take_pending_edge_cloud_draft_scheduler_output can put
-                    # it on the step-0 DRAFT_FIRST control message.
-                    context = self._pending_edge_cloud_draft_contexts.get(
-                        scheduler_output.head_token
+                    # Deferred edge-cloud draft: carry the small CPU state on
+                    # the ModelRunnerOutput already returning to EngineCore.
+                    # The scheduler can then create step-0 DRAFT_FIRST without
+                    # a second executor RPC.
+                    task_id = scheduler_output.head_token
+                    context = (
+                        self._pending_edge_cloud_draft_contexts.get(task_id)
+                        if task_id is not None
+                        else None
                     )
                     if context is None:
                         raise RuntimeError(
                             "Deferred edge-cloud draft context missing for "
-                            f"head_token={scheduler_output.head_token}"
+                            f"head_token={task_id}"
                         )
-                    context["num_accepted_state"] = tensor_dict_to_send
+                    valid_count = tensor_dict_to_send.get(
+                        "valid_sampled_token_count"
+                    )
+                    edge_cloud_draft_state = {
+                        "draft_task_id": task_id,
+                        "draft_step_idx": 0,
+                        "num_accepted_tokens": [
+                            int(value) for value in num_accepted.tolist()
+                        ],
+                        "valid_sampled_token_count": (
+                            [
+                                int(value)
+                                for value in valid_count.tolist()
+                            ]
+                            if valid_count is not None
+                            else None
+                        ),
+                    }
                 elif get_pp_group().world_size == 2:
                     send_work = get_pp_group().isend_tensor_dict(tensor_dict_to_send)
                     for handle in send_work:
@@ -4381,6 +4301,10 @@ class NPUModelRunner(GPUModelRunner):
                 {} if vllm_version_is("0.20.2") else {"routed_experts": routed_experts_lists}
             ),
         )
+        if edge_cloud_draft_state is not None:
+            model_runner_output.edge_cloud_draft_state = (
+                edge_cloud_draft_state
+            )
         if self.ascend_config.profiling_chunk_config.need_timing and hasattr(self, '_execution_start_time'):
             self._sync_device()
             model_runner_output.execution_time_ms = (time.perf_counter() - self._execution_start_time) * 1000.0

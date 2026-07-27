@@ -1207,6 +1207,59 @@ class PDSeparatedScheduler(Scheduler):
         )
         return scheduler_output
 
+    def enqueue_draft_first(
+        self,
+        source: SchedulerOutput,
+        *,
+        draft_task_id: str,
+        draft_step_idx: int,
+        num_accepted_tokens: list[int] | None = None,
+        valid_sampled_token_count: list[int] | None = None,
+    ) -> bool:
+        """Generate a draft head locally, mirroring decode head generation.
+
+        The worker owns the mutable draft tensors, but the scheduler owns all
+        draft control-plane SchedulerOutputs. The initial step receives only
+        the rejection-corrected scalar state from the worker; follow-up steps
+        are derived directly from the completed DRAFT_LAST.
+        """
+        req_ids = list(source.num_scheduled_tokens)
+        # Worker draft contexts are batch-scoped and are cleared as a whole
+        # when any member request finishes or is aborted.
+        if not req_ids or any(
+            req_id not in self.requests for req_id in req_ids
+        ):
+            return False
+
+        draft_first = replace(
+            source,
+            batch_type=BatchType.DRAFT_FIRST,
+            head_token=None,
+            hidden_channel=HiddenChannelType.DECODE,
+            parent_req_id=req_ids[0],
+            draft_task_id=draft_task_id,
+            draft_step_idx=draft_step_idx,
+            num_accepted_tokens=num_accepted_tokens,
+            valid_sampled_token_count=valid_sampled_token_count,
+        )
+        self.drafts_first_ready.append(draft_first)
+        return True
+
+    def _enqueue_next_draft_first(
+        self, draft_last: SchedulerOutput
+    ) -> bool:
+        draft_step_idx = int(draft_last.draft_step_idx or 0)
+        next_step_idx = draft_step_idx + 1
+        if next_step_idx >= self.num_spec_tokens:
+            return False
+        if draft_last.draft_task_id is None:
+            raise RuntimeError("DRAFT_LAST missing draft_task_id")
+        return self.enqueue_draft_first(
+            draft_last,
+            draft_task_id=draft_last.draft_task_id,
+            draft_step_idx=next_step_idx,
+        )
+
     def _pick_draft_last_batch(self) -> SchedulerOutput:
         while self.drafts_last_ready:
             scheduler_output = self.drafts_last_ready.popleft()
@@ -1610,14 +1663,12 @@ class PDSeparatedScheduler(Scheduler):
                 self.draft_inflight_count,
                 self.draft_inflight_limit,
             )
-        if scheduler_output.batch_type == BatchType.DRAFT_LAST:
+        enqueue_next_draft = (
+            scheduler_output.batch_type == BatchType.DRAFT_LAST
+        )
+        if enqueue_next_draft:
             self.draft_remote_pending_count = max(
                 0, self.draft_remote_pending_count - 1
-            )
-            logger.info(
-                "[PD] update_from_output DRAFT_LAST done, "
-                "draft_remote_pending: %d",
-                self.draft_remote_pending_count,
             )
         if scheduler_output.batch_type == BatchType.DECODE_LAST:
             # decode_inflight_count 已在 DECODE_FIRST 的 update_from_output
@@ -1627,6 +1678,16 @@ class PDSeparatedScheduler(Scheduler):
                 f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}",
             )
         outputs = super().update_from_output(scheduler_output, model_runner_output)
+        if enqueue_next_draft:
+            next_draft_ready = self._enqueue_next_draft_first(
+                scheduler_output
+            )
+            logger.info(
+                "[PD] update_from_output DRAFT_LAST done, "
+                "draft_remote_pending: %d, next_draft_ready: %s",
+                self.draft_remote_pending_count,
+                next_draft_ready,
+            )
         self.chunk_prefill_first = [
             req for req in self.chunk_prefill_first if not req.is_finished()
         ]

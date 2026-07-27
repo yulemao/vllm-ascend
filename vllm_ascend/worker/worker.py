@@ -1632,18 +1632,6 @@ class NPUWorker(WorkerBase):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
 
-    def take_pending_edge_cloud_draft_scheduler_output(
-        self,
-    ) -> SchedulerOutput | None:
-        return (
-            self.model_runner.take_pending_edge_cloud_draft_scheduler_output()
-        )
-
-    def take_completed_edge_cloud_draft_result(
-        self,
-    ) -> tuple[DraftTokenIds, SchedulerOutput] | None:
-        return self.model_runner.take_completed_edge_cloud_draft_result()
-
     def clear_pending_edge_cloud_draft_for_req_ids(
         self, req_ids: set[str] | list[str]
     ) -> None:

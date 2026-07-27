@@ -1589,19 +1589,20 @@ class NPUWorker(WorkerBase):
 
     def take_pending_edge_cloud_draft_scheduler_output(
         self,
-        finished_req_ids: set[str] | list[str] = (),
-        force_drop_task_ids: set[str] | list[str] = (),
-    ) -> tuple[SchedulerOutput | None, list[str]]:
+    ) -> SchedulerOutput | None:
         return (
-            self.model_runner.take_pending_edge_cloud_draft_scheduler_output(
-                finished_req_ids, force_drop_task_ids
-            )
+            self.model_runner.take_pending_edge_cloud_draft_scheduler_output()
         )
 
     def take_completed_edge_cloud_draft_result(
         self,
     ) -> tuple[DraftTokenIds, SchedulerOutput] | None:
         return self.model_runner.take_completed_edge_cloud_draft_result()
+
+    def clear_pending_edge_cloud_draft_for_req_ids(
+        self, req_ids: set[str] | list[str]
+    ) -> None:
+        self.model_runner.clear_pending_edge_cloud_draft_for_req_ids(req_ids)
 
     def check_health(self) -> None:
         import subprocess

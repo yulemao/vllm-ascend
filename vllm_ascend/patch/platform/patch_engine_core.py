@@ -625,12 +625,18 @@ def _patched_step(self):
     # Before processing the model output, process any aborts that happened
     # during the model execution.
     self._process_aborts_queue()
-    self._clear_pending_edge_cloud_draft_for_finished_requests()
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output
     )
-    self._clear_pending_edge_cloud_draft_for_finished_requests()
+    # Advance draft state BEFORE the blocking cleanup RPC below: for a
+    # completed DECODE_LAST this publishes the deferred pre-generated
+    # DRAFT_FIRST to the cloud, and edge workers may already be blocked in
+    # DRAFT_LAST waiting for the cloud hidden states that this publish
+    # unlocks.  A blocking worker RPC issued first would sit behind the
+    # stalled DRAFT_LAST in the worker queue and never be serviced
+    # (engine -> worker -> cloud -> engine circular wait).
     self._advance_edge_cloud_draft(scheduler_output, model_output)
+    self._clear_pending_edge_cloud_draft_for_finished_requests()
 
     return (
         engine_core_outputs,
@@ -762,12 +768,18 @@ def _patched_step_with_batch_queue(self):
             raise RuntimeError("unexpected error")
 
     self._process_aborts_queue()
-    self._clear_pending_edge_cloud_draft_for_finished_requests()
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output
     )
-    self._clear_pending_edge_cloud_draft_for_finished_requests()
+    # Advance draft state BEFORE the blocking cleanup RPC below: for a
+    # completed DECODE_LAST this publishes the deferred pre-generated
+    # DRAFT_FIRST to the cloud, and edge workers may already be blocked in
+    # DRAFT_LAST waiting for the cloud hidden states that this publish
+    # unlocks.  A blocking worker RPC issued first would sit behind the
+    # stalled DRAFT_LAST in the worker queue and never be serviced
+    # (engine -> worker -> cloud -> engine circular wait).
     self._advance_edge_cloud_draft(scheduler_output, model_output)
+    self._clear_pending_edge_cloud_draft_for_finished_requests()
 
     if deferred_empty_batch := self._pop_deferred_empty_batch():
         empty_outputs, _ = self._finish_empty_batch(deferred_empty_batch)

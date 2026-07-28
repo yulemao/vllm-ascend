@@ -193,6 +193,33 @@ def _drain_pd_channel_inbox(self) -> None:
             )
 
 
+def _is_deferred_draft_first_publish(
+    self, scheduler_output: SchedulerOutput
+) -> bool:
+    """True when this DRAFT_FIRST must NOT be published to the cloud yet.
+
+    The scheduler pre-generates the whole draft chain when the parent
+    DECODE_LAST is picked (PDSeparatedScheduler._pregenerate_draft_chain)
+    so the edge worker can run draft head batches back-to-back behind the
+    tail.  The step-0 copy is missing its sampling scalars
+    (num_accepted_tokens / valid_sampled_token_count), which only the
+    cloud draft middle consumes; its cloud publish is deferred until the
+    tail completes and _advance_edge_cloud_draft patches them in.
+
+    Discriminator: the exact pending SO object with scalars still None.
+    Legacy completion-time enqueued DRAFT_FIRST batches always carry their
+    scalars already, so they publish immediately as before.
+    """
+    if (scheduler_output.draft_step_idx or 0) != 0:
+        return False
+    if scheduler_output.num_accepted_tokens is not None:
+        return False
+    pending = getattr(
+        self.scheduler, "_draft_first_cloud_publish_pending", None
+    )
+    return scheduler_output is pending
+
+
 def _maybe_publish_pre_out(
     self, scheduler_output: SchedulerOutput
 ) -> None:
@@ -210,11 +237,24 @@ def _maybe_publish_pre_out(
     delays the ZMQ notification until the prefill head segment becomes the
     next batch to execute, preventing the cloud from blocking on irecv while
     the edge prefill is still queued behind other batches.
+
+    A pre-generated step-0 DRAFT_FIRST is the exception: its cloud copy is
+    published when the parent DECODE_LAST completes, with the sampling
+    scalars patched in (see _is_deferred_draft_first_publish).
     """
     if getattr(self, "_pp_pd_channel", None) is None:
         return
     bt = scheduler_output.batch_type
     if bt in (BatchType.DECODE_FIRST, BatchType.DRAFT_FIRST):
+        if bt == BatchType.DRAFT_FIRST and self._is_deferred_draft_first_publish(
+            scheduler_output
+        ):
+            logger.debug(
+                "[PRE_OUT] Deferring DRAFT_FIRST step-0 publish until parent "
+                "tail completes (draft_task_id=%s)",
+                scheduler_output.draft_task_id,
+            )
+            return
         self._pp_pd_channel.publish(scheduler_output)
     elif bt in (
         BatchType.EMPTY,
@@ -418,7 +458,46 @@ def _advance_edge_cloud_draft(
     )
     if is_target_tail:
         state = getattr(model_output, "edge_cloud_draft_state", None)
+        pending = getattr(
+            self.scheduler, "_draft_first_cloud_publish_pending", None
+        )
         if state is None:
+            if pending is not None:
+                # The pre-generated step-0 DRAFT_FIRST may already be
+                # dispatched to the edge worker; without the scalars the
+                # cloud copy can never be published and the channel would
+                # deadlock on the unmatched isend.  Fail loudly instead.
+                raise RuntimeError(
+                    "DECODE_LAST completed without edge_cloud_draft_state "
+                    "while a pre-generated DRAFT_FIRST is pending; cannot "
+                    "publish its cloud copy (draft_task_id="
+                    f"{pending.draft_task_id})"
+                )
+            return
+        if batch_type == BatchType.DECODE_LAST and pending is not None:
+            # Pre-generated draft chain: patch the sampling scalars into
+            # the step-0 copy and publish it now.  The edge worker copy
+            # (already dispatched, serialized at MQ enqueue) is unaffected;
+            # the cloud sees this batch no later than with the legacy
+            # completion-time enqueue path.
+            finalize = getattr(
+                self.scheduler, "finalize_pre_generated_draft_first", None
+            )
+            so_to_publish = finalize(
+                num_accepted_tokens=state.get("num_accepted_tokens"),
+                valid_sampled_token_count=state.get(
+                    "valid_sampled_token_count"
+                ),
+            )
+            if so_to_publish is not None:
+                channel = getattr(self, "_pp_pd_channel", None)
+                if channel is not None:
+                    channel.publish(so_to_publish)
+                    logger.info(
+                        "[PRE_OUT] Published deferred DRAFT_FIRST step-0 "
+                        "(draft_task_id=%s) after parent tail completed",
+                        so_to_publish.draft_task_id,
+                    )
             return
         enqueue_draft_first(
             completed_scheduler_output,
@@ -476,15 +555,23 @@ def _uses_scheduled_edge_cloud_draft(self) -> bool:
 
 
 def _has_unresolved_edge_cloud_draft_parent(self) -> bool:
-    """Keep async scheduling behind a tail that still has to create draft work."""
+    """Keep async scheduling behind a prefill tail that still has to create
+    draft work.
+
+    DECODE_LAST no longer blocks scheduling: its draft chain is
+    pre-generated when the tail is picked
+    (PDSeparatedScheduler._pregenerate_draft_chain), so follow-on
+    DRAFT_FIRST/DRAFT_LAST batches queue behind it and the edge worker runs
+    the whole decode->draft round without an engine round trip.
+    PREFILL_LAST still creates its step-0 draft only at completion time, so
+    scheduling must not run ahead of it.
+    """
     if not self._uses_scheduled_edge_cloud_draft():
         return False
     batch_queue = getattr(self, "batch_queue", None)
     if not batch_queue:
         return False
     for _future, scheduler_output, _exec_future in batch_queue:
-        if scheduler_output.batch_type == BatchType.DECODE_LAST:
-            return True
         if (
             scheduler_output.batch_type == BatchType.PREFILL_LAST
             and getattr(scheduler_output, "is_last_prefill_chunk", True)
@@ -765,6 +852,33 @@ _patched_run_engine_core.__qualname__ = "_patched_run_engine_core"
 # module's top-level namespace.
 import queue as _queue_mod  # noqa: E402
 from logging import DEBUG as _DEBUG  # noqa: E402
+import time as _time  # noqa: E402
+
+
+def _patched_process_engine_step(self) -> bool:
+    """Mirror upstream EngineCoreProc._process_engine_step, but skip the
+    1 ms GIL-yield sleep while the batch queue still holds in-flight work.
+
+    Upstream sleeps whenever a step executed no model work so background
+    threads are not starved by the polling loop.  In PD-separated mode
+    many steps only pop a completed batch and advance draft control state
+    without dispatching a new one (the next batch becomes schedulable only
+    after that pop); sleeping 1 ms there directly extends the
+    DRAFT_LAST -> next-DECODE_FIRST bubble once per pop-only step.  A
+    non-empty batch queue means the model is executing on the worker, so
+    the starvation concern the sleep addresses does not apply.
+    """
+    outputs, model_executed = self.step_fn()
+    for output in outputs.items() if outputs else ():
+        self.output_queue.put_nowait(output)
+    self.post_step(model_executed)
+    if (
+        not model_executed
+        and self.scheduler.has_unfinished_requests()
+        and not self.batch_queue
+    ):
+        _time.sleep(0.001)
+    return model_executed
 
 
 def _patched_process_input_queue(self):
@@ -841,6 +955,9 @@ def install() -> None:
     EngineCore._uses_scheduled_edge_cloud_draft = (
         _uses_scheduled_edge_cloud_draft
     )
+    EngineCore._is_deferred_draft_first_publish = (
+        _is_deferred_draft_first_publish
+    )
     EngineCore._has_unresolved_edge_cloud_draft_parent = (
         _has_unresolved_edge_cloud_draft_parent
     )
@@ -850,6 +967,7 @@ def install() -> None:
 
     EngineCoreProc.run_engine_core = staticmethod(_patched_run_engine_core)
     EngineCoreProc._process_input_queue = _patched_process_input_queue
+    EngineCoreProc._process_engine_step = _patched_process_engine_step
 
     setattr(EngineCore, _INSTALLED_FLAG, True)
     logger.info(

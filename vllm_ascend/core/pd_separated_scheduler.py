@@ -255,6 +255,40 @@ class PDSeparatedScheduler(Scheduler):
         self._decode_first_only_start_ts: float | None = None
         self._decode_first_only_window_ms: int = 10
 
+        # ------------------------------------------------------------------ #
+        # Pre-generated draft chain (decode/draft pipelining)                 #
+        # ------------------------------------------------------------------ #
+        # When a DECODE_LAST is picked, the whole DRAFT_FIRST chain for the
+        # next speculative round is already determined by the tail's
+        # SchedulerOutput, except the step-0 sampling scalars
+        # (num_accepted_tokens / valid_sampled_token_count) which only the
+        # cloud draft middle consumes.  The chain is therefore enqueued at
+        # tail-pick time (see _pregenerate_draft_chain) so draft batches can
+        # be dispatched back-to-back behind the tail without an engine round
+        # trip per step; the engine patches the scalars into the step-0 copy
+        # and publishes it to the cloud when the tail completes.
+        #
+        # _draft_first_cloud_publish_pending: the pre-generated step-0
+        #   DRAFT_FIRST awaiting its cloud publish (scalars not yet known).
+        # _draft_first_scalars_patched: finalize already merged the scalars
+        #   into the pending SO (sync-step mode publishes at pick time).
+        # _draft_first_dispatched: the pending SO has been picked and
+        #   dispatched to the edge worker; the cloud copy must then be
+        #   published even if the request finished, so the cloud posts the
+        #   matching recv for the already-issued edge isend.
+        self._draft_first_cloud_publish_pending: SchedulerOutput | None = None
+        self._draft_first_scalars_patched: bool = False
+        self._draft_first_dispatched: bool = False
+        # draft_task_ids whose chain was pre-generated; guards
+        # _enqueue_next_draft_first from re-enqueuing chain links.
+        self._pregenerated_draft_task_ids: set[str] = set()
+        # Max DRAFT_FIRST heads whose DRAFT_LAST has not yet completed.
+        # Worker and cloud dispatch strictly in order and every DRAFT_LAST
+        # is picked before the next DRAFT_FIRST (drafts_last has priority in
+        # _pick_by_state), so at most two links are ever outstanding: the
+        # DRL queued behind the DRF being picked.
+        self._draft_remote_pending_limit: int = 2
+
     # ------------------------------------------------------------------ #
     # Chunk-prefill-prior helpers                                         #
     # ------------------------------------------------------------------ #
@@ -627,15 +661,19 @@ class PDSeparatedScheduler(Scheduler):
 
     def _can_schedule_draft_first(self) -> bool:
         # Scheduled draft head/tail payloads share the DECODE channel.
-        # Do not start another head while an earlier head is still remote or
-        # its tail is ready locally: otherwise edge and cloud can each wait
-        # for the opposite-direction send before posting the matching recv.
+        # Ordering on the channel is preserved without serialising against
+        # DECODE_FIRST / remote drafts because both workers dispatch in
+        # strict FIFO order (edge: DF isend, DL recv, DRF isend, DRL recv;
+        # cloud mirrors it) and every DRAFT_LAST is picked before the next
+        # DRAFT_FIRST (drafts_last has priority in _pick_by_state), so
+        # send/recv pairs stay matched.  draft_remote_pending_count is only
+        # capped to bound the in-flight chain length.
         return bool(
             self.drafts_first_ready
             and self.draft_inflight_count < self.draft_inflight_limit
-            and self.draft_remote_pending_count == 0
+            and self.draft_remote_pending_count
+            < self._draft_remote_pending_limit
             and not self.drafts_last_ready
-            and self.decode_inflight_count == 0
             and not self._force_decode_last
         )
 
@@ -1100,6 +1138,17 @@ class PDSeparatedScheduler(Scheduler):
         if not self.drafts_first_ready:
             return self._make_empty_batch()
         scheduler_output = self.drafts_first_ready.popleft()
+        if scheduler_output is self._draft_first_cloud_publish_pending:
+            # Track dispatch of the pre-generated step-0 copy so finalize
+            # knows the edge isend will be issued (and the cloud copy must
+            # be published even if the request finishes in between).
+            self._draft_first_dispatched = True
+            if self._draft_first_scalars_patched:
+                # Sync-step mode: the tail completed before this pick, so
+                # the scalars are already on the SO and the engine
+                # publishes it right away; nothing left to defer.
+                self._draft_first_cloud_publish_pending = None
+                self._draft_first_scalars_patched = False
         scheduler_output.batch_type = BatchType.DRAFT_FIRST
         if scheduler_output.head_token is None:
             scheduler_output.head_token = uuid4().hex
@@ -1167,13 +1216,20 @@ class PDSeparatedScheduler(Scheduler):
     ) -> bool:
         draft_step_idx = int(draft_last.draft_step_idx or 0)
         next_step_idx = draft_step_idx + 1
+        task_id = draft_last.draft_task_id
+        if task_id in self._pregenerated_draft_task_ids:
+            # The chain was pre-generated at tail-pick time; the next
+            # DRAFT_FIRST is already queued.  Clean up when it completes.
+            if next_step_idx >= self.num_spec_tokens:
+                self._pregenerated_draft_task_ids.discard(task_id)
+            return False
         if next_step_idx >= self.num_spec_tokens:
             return False
-        if draft_last.draft_task_id is None:
+        if task_id is None:
             raise RuntimeError("DRAFT_LAST missing draft_task_id")
         return self.enqueue_draft_first(
             draft_last,
-            draft_task_id=draft_last.draft_task_id,
+            draft_task_id=task_id,
             draft_step_idx=next_step_idx,
         )
 
@@ -1213,11 +1269,29 @@ class PDSeparatedScheduler(Scheduler):
     def _drop_stale_drafts_for_req_ids(self, req_ids: set[str]) -> None:
         if not req_ids:
             return
-        self.drafts_first_ready = deque(
-            output
-            for output in self.drafts_first_ready
-            if not self._scheduler_output_intersects_req_ids(output, req_ids)
-        )
+        kept_first: deque[SchedulerOutput] = deque()
+        for output in self.drafts_first_ready:
+            if self._scheduler_output_intersects_req_ids(output, req_ids):
+                if output.draft_task_id:
+                    self._pregenerated_draft_task_ids.discard(
+                        output.draft_task_id
+                    )
+            else:
+                kept_first.append(output)
+        self.drafts_first_ready = kept_first
+        pending = self._draft_first_cloud_publish_pending
+        if (
+            pending is not None
+            and not self._draft_first_dispatched
+            and self._scheduler_output_intersects_req_ids(pending, req_ids)
+        ):
+            # The pre-generated step-0 copy was dropped before dispatch;
+            # it must never be published to the cloud (the edge will not
+            # issue the matching isend).  A dispatched copy is kept so
+            # finalize can still publish it and the cloud posts the recv
+            # that pairs the already-issued edge isend.
+            self._draft_first_cloud_publish_pending = None
+            self._draft_first_scalars_patched = False
         kept_last: deque[SchedulerOutput] = deque()
         dropped_last = 0
         for output in self.drafts_last_ready:
@@ -1250,7 +1324,114 @@ class PDSeparatedScheduler(Scheduler):
         self._validate_decode_tail_channel(so)
         self._start_decode_first_only_window()
         self._force_decode_last = False
+        self._pregenerate_draft_chain(so)
         return so
+
+    # ------------------------------------------------------------------ #
+    # Pre-generated draft chain                                           #
+    # ------------------------------------------------------------------ #
+    def _uses_scheduled_draft_pregen(self) -> bool:
+        """True when the draft chain can be pre-generated at tail-pick time.
+
+        Limited to the MTP family: eagle3's cloud draft middle consumes
+        extra per-task state that has not been validated against early
+        dispatch, so eagle3 stays on the legacy completion-time enqueue
+        path (enqueue_draft_first with scalars already attached).
+        """
+        speculative_config = self.vllm_config.speculative_config
+        if speculative_config is None or self.num_spec_tokens <= 0:
+            return False
+        method = getattr(speculative_config, "method", None)
+        if method in ("qwen3_5_mtp", "qwen_mtp"):
+            return True
+        if method != "mtp":
+            return False
+        hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
+        return "qwen" in str(getattr(hf_config, "model_type", "")).lower()
+
+    def _pregenerate_draft_chain(self, tail_so: SchedulerOutput) -> None:
+        """Pre-generate the DRAFT_FIRST chain when a target tail is picked.
+
+        Every field on a draft SchedulerOutput is already known when its
+        parent DECODE_LAST is picked, except the step-0 sampling scalars
+        (num_accepted_tokens / valid_sampled_token_count), which only the
+        cloud draft middle consumes -- the edge worker derives all draft
+        inputs from its stashed draft context.  Enqueueing the whole chain
+        now lets DRAFT_FIRST batches be dispatched back-to-back behind the
+        tail instead of waiting for an engine round trip per step.  The
+        engine defers the step-0 cloud publish and patches the scalars in
+        when the tail completes (finalize_pre_generated_draft_first).
+        """
+        if not self._uses_scheduled_draft_pregen():
+            return
+        if (
+            self.drafts_first_ready
+            or self._draft_first_cloud_publish_pending is not None
+        ):
+            # A previous chain has not drained; the completion-time enqueue
+            # path (enqueue_draft_first) will handle this tail instead.
+            return
+        req_ids = list(tail_so.num_scheduled_tokens)
+        if not req_ids or any(
+            req_id not in self.requests for req_id in req_ids
+        ):
+            return
+        task_id = tail_so.head_token
+        if not task_id:
+            return
+        for step_idx in range(self.num_spec_tokens):
+            draft_first = replace(
+                tail_so,
+                batch_type=BatchType.DRAFT_FIRST,
+                head_token=None,
+                hidden_channel=HiddenChannelType.DECODE,
+                parent_req_id=req_ids[0],
+                draft_task_id=task_id,
+                draft_step_idx=step_idx,
+                num_accepted_tokens=None,
+                valid_sampled_token_count=None,
+            )
+            self.drafts_first_ready.append(draft_first)
+            if step_idx == 0:
+                self._draft_first_cloud_publish_pending = draft_first
+                self._draft_first_scalars_patched = False
+                self._draft_first_dispatched = False
+        self._pregenerated_draft_task_ids.add(task_id)
+        logger.info(
+            "[PD] Pre-generated draft chain: task_id=%s steps=%d parent=%s",
+            task_id,
+            self.num_spec_tokens,
+            req_ids[0],
+        )
+
+    def finalize_pre_generated_draft_first(
+        self,
+        *,
+        num_accepted_tokens: list[int] | None,
+        valid_sampled_token_count: list[int] | None,
+    ) -> SchedulerOutput | None:
+        """Patch the sampling scalars into the pre-generated step-0
+        DRAFT_FIRST once its parent tail has completed sampling.
+
+        Returns the SO for immediate cloud publish when it has already been
+        dispatched to the edge worker (batch-queue mode): the cloud copy
+        must go out even if the request just finished, because the edge
+        isend is already issued and the cloud must post the matching recv.
+        Returns None when the SO has not been dispatched yet (sync-step
+        mode: the engine publishes it at pick time, scalars already
+        patched) or when there is no pending pre-generated copy.
+        """
+        pending = self._draft_first_cloud_publish_pending
+        if pending is None:
+            return None
+        pending.num_accepted_tokens = num_accepted_tokens
+        pending.valid_sampled_token_count = valid_sampled_token_count
+        if not self._draft_first_dispatched:
+            self._draft_first_scalars_patched = True
+            return None
+        self._draft_first_cloud_publish_pending = None
+        self._draft_first_scalars_patched = False
+        return pending
 
     def _ensure_cached_all_token_ids(
         self, scheduler_output: SchedulerOutput,

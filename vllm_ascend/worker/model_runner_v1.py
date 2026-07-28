@@ -3058,10 +3058,16 @@ class NPUModelRunner(GPUModelRunner):
 
         req_ids = list(context["req_ids"])
         if next_step_idx >= self.num_spec_tokens:
-            completed_draft_token_ids = DraftTokenIds(
-                req_ids,
-                self._draft_token_ids.detach().cpu().tolist(),
-            )
+            # Native async spec-decode semantics: keep the real draft token
+            # IDs in the worker.  The already queued next target batch carries
+            # fixed-length placeholders and _prepare_input_ids scatters this
+            # tensor into the actual verify inputs after this DRL executes.
+            # Avoid the device->CPU->EngineCore->scheduler round trip entirely.
+            if not self.use_async_scheduling:
+                completed_draft_token_ids = DraftTokenIds(
+                    req_ids,
+                    self._draft_token_ids.detach().cpu().tolist(),
+                )
             task_id = scheduler_output.draft_task_id
             assert task_id is not None
             self._pending_edge_cloud_draft_contexts.pop(task_id, None)
@@ -4106,21 +4112,12 @@ class NPUModelRunner(GPUModelRunner):
                     or self._uses_scheduled_edge_cloud_draft()
                 )
             ):
-                num_reqs = sampler_output.sampled_token_ids.size(0)
-                num_accepted = (sampler_output.sampled_token_ids != -1).sum(dim=1).cpu()
-                tensor_dict_to_send = {"num_accepted_tokens": num_accepted}
-                if (
-                    self._uses_scheduled_edge_cloud_draft()
-                    and self.valid_sampled_token_count_gpu is not None
-                ):
-                    tensor_dict_to_send["valid_sampled_token_count"] = (
-                        self.valid_sampled_token_count_gpu.cpu()
-                    )
                 if self._should_defer_edge_cloud_draft(scheduler_output):
-                    # Deferred edge-cloud draft: carry the small CPU state on
-                    # the ModelRunnerOutput already returning to EngineCore.
-                    # The scheduler can then create step-0 DRAFT_FIRST without
-                    # a second executor RPC.
+                    # The async output already copies sampled_token_ids to the
+                    # host. EngineCore derives both accepted-count fields from
+                    # that existing result. Do not add another synchronous
+                    # D2H here: the edge does not consume these cloud-only
+                    # scalars, and the next local DRAFT_FIRST is already queued.
                     task_id = scheduler_output.head_token
                     context = (
                         self._pending_edge_cloud_draft_contexts.get(task_id)
@@ -4132,25 +4129,19 @@ class NPUModelRunner(GPUModelRunner):
                             "Deferred edge-cloud draft context missing for "
                             f"head_token={task_id}"
                         )
-                    valid_count = tensor_dict_to_send.get(
-                        "valid_sampled_token_count"
-                    )
                     edge_cloud_draft_state = {
                         "draft_task_id": task_id,
                         "draft_step_idx": 0,
-                        "num_accepted_tokens": [
-                            int(value) for value in num_accepted.tolist()
-                        ],
-                        "valid_sampled_token_count": (
-                            [
-                                int(value)
-                                for value in valid_count.tolist()
-                            ]
-                            if valid_count is not None
-                            else None
-                        ),
                     }
                 elif get_pp_group().world_size == 2:
+                    num_accepted = (
+                        (sampler_output.sampled_token_ids != -1)
+                        .sum(dim=1)
+                        .cpu()
+                    )
+                    tensor_dict_to_send = {
+                        "num_accepted_tokens": num_accepted
+                    }
                     send_work = get_pp_group().isend_tensor_dict(tensor_dict_to_send)
                     for handle in send_work:
                         handle.wait()

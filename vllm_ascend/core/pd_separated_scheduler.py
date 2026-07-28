@@ -1135,9 +1135,32 @@ class PDSeparatedScheduler(Scheduler):
             )
 
     def _pick_draft_first_batch(self) -> SchedulerOutput:
-        if not self.drafts_first_ready:
+        while self.drafts_first_ready:
+            scheduler_output = self.drafts_first_ready.popleft()
+            if self._is_stale_draft_output(scheduler_output):
+                # The parent request finished after the chain was
+                # pre-generated; the worker-side draft context is already
+                # gone (cleared once finished_req_ids is attached to a
+                # batch), so dispatching this link would crash the worker.
+                if scheduler_output.draft_task_id:
+                    self._pregenerated_draft_task_ids.discard(
+                        scheduler_output.draft_task_id
+                    )
+                if scheduler_output is self._draft_first_cloud_publish_pending:
+                    # Still queued means never dispatched: the edge issued
+                    # no isend, so the deferred cloud copy must never be
+                    # published either.
+                    self._draft_first_cloud_publish_pending = None
+                    self._draft_first_scalars_patched = False
+                logger.info(
+                    "[PD] drop stale DRAFT_FIRST task_id=%s step=%s",
+                    scheduler_output.draft_task_id,
+                    scheduler_output.draft_step_idx,
+                )
+                continue
+            break
+        else:
             return self._make_empty_batch()
-        scheduler_output = self.drafts_first_ready.popleft()
         if scheduler_output is self._draft_first_cloud_publish_pending:
             # Track dispatch of the pre-generated step-0 copy so finalize
             # knows the edge isend will be issued (and the cloud copy must
@@ -1776,6 +1799,16 @@ class PDSeparatedScheduler(Scheduler):
                 f"decode_inflight: {self.decode_inflight_count}/{self.decode_inflight_limit}",
             )
         outputs = super().update_from_output(scheduler_output, model_runner_output)
+        if self.finished_req_ids:
+            # Natural finishes (stop token / max_tokens) free the request
+            # via _free_request inside super().update_from_output WITHOUT
+            # going through finish_requests, so the abort-path stale-draft
+            # drop never runs for them.  Mirror it here: remaining
+            # pre-generated draft links of a finished request must never be
+            # dispatched -- finished_req_ids triggers the worker-side draft
+            # context cleanup, and dispatching would crash the worker with
+            # "no pending draft context".
+            self._drop_stale_drafts_for_req_ids(self.finished_req_ids)
         if enqueue_next_draft:
             next_draft_ready = self._enqueue_next_draft_first(
                 scheduler_output

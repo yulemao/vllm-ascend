@@ -528,6 +528,18 @@ class NPUModelRunner(GPUModelRunner):
         self._verified_draft_token_ids_by_head: dict[
             str, tuple[list[str] | None, torch.Tensor]
         ] = {}
+        # Latest completed draft token IDs per request (one row of
+        # _draft_token_ids each), recorded at DRAFT-OUT time.  This is the
+        # authoritative source for the verify-time scatter in
+        # _prepare_inputs: the global self._draft_token_ids can be
+        # overwritten by another request's draft chain before this
+        # request's verify executes, and the native _prepare_input_ids
+        # scatter cannot cover requests that were absent from the previous
+        # execute_model batch (prev_positions < 0, e.g. when another
+        # request's PREFILL_FIRST ran between this request's PREFILL_LAST
+        # and its first DECODE_FIRST).  Rows are views into the producing
+        # chain's tensor, so later global overwrites do not corrupt them.
+        self._worker_draft_token_ids_by_req: dict[str, torch.Tensor] = {}
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -1851,6 +1863,13 @@ class NPUModelRunner(GPUModelRunner):
                 getattr(self, "_draft_token_ids_req_ids", None),
                 self._draft_token_ids,
             )
+        # Repair placeholder spec rows the native scatter in
+        # _prepare_input_ids could not cover (request absent from the
+        # previous execute_model batch, or the global _draft_token_ids was
+        # overwritten by another request's draft chain).
+        self._scatter_worker_draft_tokens_for_verify(
+            scheduler_output, num_reqs, cu_num_tokens
+        )
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -2653,6 +2672,67 @@ class NPUModelRunner(GPUModelRunner):
 
         return draft_token_ids
 
+    def _scatter_worker_draft_tokens_for_verify(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+        cu_num_tokens: np.ndarray,
+    ) -> None:
+        """Patch the spec region of input_ids.gpu with worker-local draft
+        token IDs, keyed by req_id.
+
+        Native vLLM repairs the placeholder spec tokens of an async verify
+        batch on the GPU side in _prepare_input_ids, but only for requests
+        that were present in the previous execute_model batch
+        (prev_positions >= 0): it indexes self._draft_token_ids by the
+        request's *previous* batch position.  Two edge-cloud scheduled-MTP
+        situations defeat that scatter:
+
+        1. Another request's batch (e.g. a PREFILL_FIRST) executed between
+           this request's PREFILL_LAST and its first DECODE_FIRST, wiping
+           prev_req_id_to_index, so the request re-enters as "new" and the
+           native scatter silently skips it, leaving -1 placeholders in
+           input_ids.gpu.  The verify forward then embeds zero-masked
+           placeholder rows instead of the real draft tokens, every draft
+           is rejected, and the acceptance rate collapses (while the
+           output text stays correct via the bonus token).
+        2. With several request groups in flight, another draft chain can
+           overwrite the global self._draft_token_ids before this verify
+           runs, so even a covered request gets a *different* request's
+           drafts scattered into its spec rows.
+
+        Both are fixed here by writing each request's spec rows from
+        _worker_draft_token_ids_by_req, which is recorded per request when
+        its draft chain completes and is immune to both effects.  Requests
+        without an entry keep the native behavior (placeholders included),
+        so non-edge-cloud async flows are unaffected.
+        """
+        if not self.use_async_scheduling:
+            return
+        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if not scheduled_spec_tokens:
+            return
+        drafts_by_req = self._worker_draft_token_ids_by_req
+        if not drafts_by_req:
+            return
+        for cur_index in range(num_reqs):
+            req_id = self.input_batch.req_ids[cur_index]
+            draft_len = len(scheduled_spec_tokens.get(req_id, ()))
+            if draft_len <= 0:
+                continue
+            entry = drafts_by_req.get(req_id)
+            if entry is None:
+                continue
+            # Spec tokens occupy the last draft_len positions of the
+            # request's scheduled tokens (mirrors the upstream scatter).
+            end = int(cu_num_tokens[cur_index])
+            take = min(draft_len, entry.shape[0])
+            if take <= 0:
+                continue
+            self.input_ids.gpu[end - take:end] = entry[:take].to(
+                dtype=torch.int32
+            )
+
     def _uses_scheduled_edge_cloud_draft(self) -> bool:
         speculative_config = self.speculative_config
         if speculative_config is None:
@@ -2878,6 +2958,8 @@ class NPUModelRunner(GPUModelRunner):
         self, req_ids: set[str] | list[str]
     ) -> None:
         req_id_set = set(req_ids)
+        for req_id in req_id_set:
+            self._worker_draft_token_ids_by_req.pop(req_id, None)
         stale_task_ids = [
             task_id
             for task_id, context in (
@@ -3147,6 +3229,14 @@ class NPUModelRunner(GPUModelRunner):
             # remember it so the deferred-draft context stash can map rows
             # back to requests even if the input batch was re-indexed since.
             self._draft_token_ids_req_ids = list(context["req_ids"])
+            # Also record the rows per request: this is the authoritative
+            # source for the verify-time spec scatter in _prepare_inputs,
+            # which must survive both input-batch re-indexing and later
+            # chains overwriting the global above.
+            for row, req_id in enumerate(self._draft_token_ids_req_ids):
+                self._worker_draft_token_ids_by_req[req_id] = (
+                    self._draft_token_ids[row]
+                )
 
         req_ids = list(context["req_ids"])
         if next_step_idx >= self.num_spec_tokens:

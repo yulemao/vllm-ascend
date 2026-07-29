@@ -1822,6 +1822,14 @@ class NPUModelRunner(GPUModelRunner):
 
         # Copy the tensors to the NPU.
         self._prepare_input_ids(scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens)
+        if scheduler_output.scheduled_spec_decode_tokens:
+            logger.info(
+                "[VERIFY-IN] batch=%s head=%s spec_tokens=%s input_ids=%s",
+                scheduler_output.batch_type,
+                scheduler_output.head_token,
+                dict(scheduler_output.scheduled_spec_decode_tokens),
+                self.input_ids.gpu[:total_num_scheduled_tokens].tolist(),
+            )
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -2876,6 +2884,15 @@ class NPUModelRunner(GPUModelRunner):
         input_ids, positions, hidden_states, draft_step_idx = (
             self._prepare_edge_cloud_draft_step_inputs(scheduler_output)
         )
+        logger.info(
+            "[DRAFT-IN] task=%s step=%d input_ids=%s positions=%s "
+            "hidden_sum=%.6f",
+            scheduler_output.draft_task_id,
+            draft_step_idx,
+            input_ids.tolist(),
+            positions.reshape(-1).tolist(),
+            float(hidden_states.float().sum()),
+        )
         num_tokens = positions.shape[-1] if self.uses_mrope else positions.shape[0]
         segment = self._edge_cloud_draft_segments["a"]
         # Independently scheduled draft batches do not enter
@@ -3055,6 +3072,11 @@ class NPUModelRunner(GPUModelRunner):
             # task or follow-up control RPC is needed.
         else:
             self._draft_token_ids = torch.stack(draft_steps, dim=1)
+            logger.info(
+                "[DRAFT-OUT] task=%s drafts=%s",
+                scheduler_output.draft_task_id,
+                self._draft_token_ids.tolist(),
+            )
 
         req_ids = list(context["req_ids"])
         if next_step_idx >= self.num_spec_tokens:
@@ -4401,6 +4423,14 @@ class NPUModelRunner(GPUModelRunner):
             )
             state.base_positions = target_positions.index_select(
                 -1, row_indices
+            )
+            logger.info(
+                "[CLOUD-DRAFT] task=%s accepted_counts=%s sample_rows=%s "
+                "base_pos=%s",
+                task_id,
+                accepted_counts,
+                sample_rows,
+                state.base_positions.reshape(-1).tolist(),
             )
             return target_positions
 

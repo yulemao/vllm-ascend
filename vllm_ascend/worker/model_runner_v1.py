@@ -2815,6 +2815,45 @@ class NPUModelRunner(GPUModelRunner):
             sample_row_indices[req_idx] = end - 1 - num_rejected[req_idx]
             start = end
 
+        # Async scheduled MTP: the scheduler only sent fixed-length -1
+        # placeholder spec tokens, so the spec region of token_ids_cpu read
+        # above holds placeholders (native vLLM only ever repairs them on
+        # the GPU side in _prepare_input_ids).  The real draft token ids are
+        # worker-local in self._draft_token_ids -- the same tensor that was
+        # scattered into input_ids.gpu for this verify forward.  Patch the
+        # spec rows here so the first draft step embeds the true verified
+        # draft tokens instead of placeholder embeddings; otherwise the
+        # draft hidden states/KV diverge from the non-placeholder semantics
+        # and the acceptance pattern changes even though the target verify
+        # (and thus the output text) is unaffected.
+        scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        worker_draft_token_ids = self._draft_token_ids
+        if (
+            self.use_async_scheduling
+            and scheduled_spec_tokens
+            and torch.is_tensor(worker_draft_token_ids)
+        ):
+            draft_req_ids = getattr(self, "_draft_token_ids_req_ids", None)
+            worker_draft_cpu = worker_draft_token_ids.detach().cpu()
+            start = 0
+            for req_idx, n in enumerate(num_scheduled):
+                end = start + n
+                draft_len = len(scheduled_spec_tokens.get(req_ids[req_idx], ()))
+                if 0 < draft_len <= n:
+                    row = req_idx
+                    if draft_req_ids is not None:
+                        try:
+                            row = draft_req_ids.index(req_ids[req_idx])
+                        except ValueError:
+                            start = end
+                            continue
+                    if row < worker_draft_cpu.shape[0]:
+                        take = min(draft_len, worker_draft_cpu.shape[1])
+                        scheduled_token_ids[end - take : end] = (
+                            worker_draft_cpu[row, :take].to(torch.long)
+                        )
+                start = end
+
         frozen_sampled_token_ids = _freeze_scheduled_state(
             sampled_token_ids
         )
@@ -2867,6 +2906,7 @@ class NPUModelRunner(GPUModelRunner):
             context["draft_step_idx"],
             len(self._pending_edge_cloud_draft_contexts),
         )
+        self._draft_token_ids_req_ids = None
 
     def clear_pending_edge_cloud_draft_for_req_ids(
         self, req_ids: set[str] | list[str]
@@ -3137,6 +3177,15 @@ class NPUModelRunner(GPUModelRunner):
             # task or follow-up control RPC is needed.
         else:
             self._draft_token_ids = torch.stack(draft_steps, dim=1)
+            # Rows of _draft_token_ids follow this context's request order;
+            # remember it so the deferred-draft context stash can map rows
+            # back to requests even if the input batch was re-indexed since.
+            self._draft_token_ids_req_ids = list(context["req_ids"])
+            logger.info(
+                "[DRAFT-OUT] task=%s drafts=%s",
+                scheduler_output.draft_task_id,
+                self._draft_token_ids.tolist(),
+            )
 
         req_ids = list(context["req_ids"])
         if next_step_idx >= self.num_spec_tokens:

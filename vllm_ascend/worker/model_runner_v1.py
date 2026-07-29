@@ -519,6 +519,15 @@ class NPUModelRunner(GPUModelRunner):
         self._pending_edge_cloud_draft_contexts: dict[
             str, dict[str, Any]
         ] = {}
+        # Draft token IDs consumed by each in-flight async verify batch,
+        # keyed by the verify head_token (shared by the DF head segment and
+        # the DL tail segment).  With several request groups in flight,
+        # another draft chain can overwrite the global self._draft_token_ids
+        # before this verify's tail executes, so the deferred-draft stash
+        # must look the tokens up per verify instead of reading the global.
+        self._verified_draft_token_ids_by_head: dict[
+            str, tuple[list[str] | None, torch.Tensor]
+        ] = {}
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -1896,6 +1905,26 @@ class NPUModelRunner(GPUModelRunner):
 
         # Copy the tensors to the NPU.
         self._prepare_input_ids(scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens)
+        if (
+            self.use_async_scheduling
+            and scheduler_output.head_token
+            and scheduler_output.scheduled_spec_decode_tokens
+            and torch.is_tensor(self._draft_token_ids)
+        ):
+            # Snapshot the worker-local draft token IDs this verify batch
+            # just consumed (they were scattered into input_ids.gpu above).
+            # The matching DECODE_LAST tail shares this head_token and can
+            # execute after another draft chain overwrote the global
+            # self._draft_token_ids, so the deferred-draft stash must use
+            # this per-verify entry instead of the global.
+            verified_by_head = self._verified_draft_token_ids_by_head
+            while len(verified_by_head) >= 8:
+                # Bound the map; entries are popped by their tail batch.
+                verified_by_head.pop(next(iter(verified_by_head)))
+            verified_by_head[scheduler_output.head_token] = (
+                getattr(self, "_draft_token_ids_req_ids", None),
+                self._draft_token_ids,
+            )
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -2819,21 +2848,31 @@ class NPUModelRunner(GPUModelRunner):
         # placeholder spec tokens, so the spec region of token_ids_cpu read
         # above holds placeholders (native vLLM only ever repairs them on
         # the GPU side in _prepare_input_ids).  The real draft token ids are
-        # worker-local in self._draft_token_ids -- the same tensor that was
-        # scattered into input_ids.gpu for this verify forward.  Patch the
-        # spec rows here so the first draft step embeds the true verified
-        # draft tokens instead of placeholder embeddings; otherwise the
-        # draft hidden states/KV diverge from the non-placeholder semantics
-        # and the acceptance pattern changes even though the target verify
-        # (and thus the output text) is unaffected.
+        # worker-local -- the same tensor that was scattered into
+        # input_ids.gpu for this verify forward.  Patch the spec rows here
+        # so the first draft step embeds the true verified draft tokens
+        # instead of placeholder embeddings; otherwise the draft hidden
+        # states/KV diverge from the non-placeholder semantics and the
+        # acceptance pattern changes even though the target verify (and
+        # thus the output text) is unaffected.
+        #
+        # Prefer the per-verify snapshot recorded when this batch's head
+        # segment consumed the drafts: with several request groups in
+        # flight, another draft chain may have overwritten the global
+        # self._draft_token_ids before this tail batch executes.
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         worker_draft_token_ids = self._draft_token_ids
+        draft_req_ids = getattr(self, "_draft_token_ids_req_ids", None)
+        verified_entry = self._verified_draft_token_ids_by_head.pop(
+            task_id, None
+        )
+        if verified_entry is not None:
+            draft_req_ids, worker_draft_token_ids = verified_entry
         if (
             self.use_async_scheduling
             and scheduled_spec_tokens
             and torch.is_tensor(worker_draft_token_ids)
         ):
-            draft_req_ids = getattr(self, "_draft_token_ids_req_ids", None)
             worker_draft_cpu = worker_draft_token_ids.detach().cpu()
             start = 0
             for req_idx, n in enumerate(num_scheduled):
@@ -2897,7 +2936,6 @@ class NPUModelRunner(GPUModelRunner):
             context["next_token_ids"] = torch.tensor(
                 next_token_list, dtype=torch.long
             )
-        self._draft_token_ids = None
         logger.info(
             "[MTP-DEBUG] pending draft context stashed: task_id=%s, "
             "req_ids=%s, draft_step_idx=%s, pending_contexts=%d",
@@ -2906,7 +2944,17 @@ class NPUModelRunner(GPUModelRunner):
             context["draft_step_idx"],
             len(self._pending_edge_cloud_draft_contexts),
         )
-        self._draft_token_ids_req_ids = None
+        # Only clear the global draft-token buffer when this stash actually
+        # consumed the tensor it still references.  In async mode another
+        # request group's chain may already have replaced it with drafts a
+        # later verify batch still needs (its DECODE_FIRST scatters the
+        # global directly); clearing here would corrupt that verify.
+        if not self.use_async_scheduling or (
+            verified_entry is not None
+            and verified_entry[1] is self._draft_token_ids
+        ):
+            self._draft_token_ids = None
+            self._draft_token_ids_req_ids = None
 
     def clear_pending_edge_cloud_draft_for_req_ids(
         self, req_ids: set[str] | list[str]

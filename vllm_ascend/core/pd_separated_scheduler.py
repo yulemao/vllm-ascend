@@ -1523,16 +1523,23 @@ class PDSeparatedScheduler(Scheduler):
         kept_first: deque[SchedulerOutput] = deque()
         for output in self.drafts_first_ready:
             if self._scheduler_output_intersects_req_ids(output, req_ids):
-                if (
-                    output.draft_task_id in self._pregenerated_draft_task_ids
-                    and self._draft_first_dispatched
-                ):
-                    # Once step 0 was dispatched, finish the FIFO chain even
-                    # if the request stopped meanwhile. Already queued edge
-                    # sends need matching cloud receives, and the worker-owned
-                    # draft context must live through the final DRL.
-                    kept_first.append(output)
-                    continue
+                task_id = output.draft_task_id
+                if task_id in self._pregenerated_draft_task_ids:
+                    chain_reqs = self._pregenerated_draft_req_ids.get(
+                        task_id, set()
+                    )
+                    if self._draft_first_dispatched or chain_reqs - req_ids:
+                        # Once step 0 was dispatched, finish the FIFO chain
+                        # even if the request stopped meanwhile. Already
+                        # queued edge sends need matching cloud receives, and
+                        # the worker-owned draft context must live through the
+                        # final DRL.  Likewise keep a chain that still covers
+                        # other running requests: dropping it would orphan
+                        # their next verify batch, whose scheduler-side spec
+                        # tokens are placeholders for the worker-local drafts
+                        # this chain is about to produce.
+                        kept_first.append(output)
+                        continue
                 if output.draft_task_id:
                     self._pregenerated_draft_task_ids.discard(
                         output.draft_task_id
@@ -1567,12 +1574,14 @@ class PDSeparatedScheduler(Scheduler):
         dropped_last = 0
         for output in self.drafts_last_ready:
             if self._scheduler_output_intersects_req_ids(output, req_ids):
-                if (
-                    output.draft_task_id in self._pregenerated_draft_task_ids
-                    and self._draft_first_dispatched
-                ):
-                    kept_last.append(output)
-                    continue
+                task_id = output.draft_task_id
+                if task_id in self._pregenerated_draft_task_ids:
+                    chain_reqs = self._pregenerated_draft_req_ids.get(
+                        task_id, set()
+                    )
+                    if self._draft_first_dispatched or chain_reqs - req_ids:
+                        kept_last.append(output)
+                        continue
                 dropped_last += 1
             else:
                 kept_last.append(output)

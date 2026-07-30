@@ -5249,6 +5249,39 @@ class NPUModelRunner(GPUModelRunner):
                 )
             finally:
                 forward_context.attn_metadata = original_attn_metadata
+            self._serialize_graph_params_update()
+
+    def _serialize_graph_params_update(self) -> None:
+        """Order the async graph-params update before any later batch's input
+        preparation.
+
+        The graph task update is launched on the independent ``update_stream``
+        and reads the runner's *reusable* metadata buffers (seq_lens /
+        block_table / ...).  Nothing otherwise prevents the NEXT batch's
+        ``_prepare_inputs`` from rewriting those buffers on the main stream
+        before ``update_stream`` has consumed them: with several requests in
+        flight (interleaved prefill/decode/draft batches) the update can then
+        bind another batch's attention params into this batch's graph, so the
+        replay reads wrong/uninitialized KV slots and the hidden states come
+        out NaN.
+
+        Make the main stream wait for the update to finish.  The replay
+        launched just before already blocks the main stream on the same
+        update via the in-graph ExternalEvent, so this extra dependency adds
+        ~no latency, but it deterministically orders all subsequent main
+        stream work (H2D metadata rewrites, the next replay) after this
+        update.  ``update_stream`` never waits on the main stream here, so
+        the dependency cannot deadlock.
+        """
+        update_stream = getattr(self, "update_stream", None)
+        if update_stream is None:
+            return
+        event = getattr(self, "_graph_params_update_done_event", None)
+        if event is None:
+            event = torch.npu.Event()
+            self._graph_params_update_done_event = event
+        event.record(update_stream)
+        torch.npu.current_stream().wait_event(event)
 
     def _model_forward(
         self,
@@ -5639,84 +5672,13 @@ class NPUModelRunner(GPUModelRunner):
                 **model_kwargs,
             )
 
-    def _edge_cloud_forward_edge(
-        self,
-        num_tokens_padded: int,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor | None,
-        intermediate_tensors: IntermediateTensors | None,
-        inputs_embeds: torch.Tensor | None,
-        use_graph: bool,
-        forward_context,
-        **model_kwargs: dict[str, Any],
-    ):
-        """Edge 侧分段执行：segment_a（首段）或 segment_e（尾段）。"""
-        seg_a = self.segment_a_wrapper if use_graph else self.segment_a
-        seg_e = self.segment_e_wrapper if use_graph else self.segment_e
-        seg_a_graph = isinstance(seg_a, ACLGraphWrapper)
-        seg_e_graph = isinstance(seg_e, ACLGraphWrapper)
-
-        if intermediate_tensors is None:
-            # Step 1：执行 Segment A（embedding + 首 head_k 层）
-            # 此时 input_ids 有效，输出 IntermediateTensors 供跨节点传输
-            from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-            old_layer_idx = _EXTRA_CTX.layer_idx
-            if _EXTRA_CTX.layer_idx is not None:
-                _EXTRA_CTX.layer_idx = 0
-            try:
-                if seg_a_graph and not forward_context.capturing:
-                    self._update_full_graph_params_if_needed(
-                        forward_context, num_tokens_padded, positions,
-                        layer_indices=list(range(0, self.head_k)),
-                        graph_wrapper=seg_a,
-                    )
-                hidden_states = seg_a(
-                    input_ids=input_ids,
-                    positions=positions,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
-            finally:
-                if old_layer_idx is not None:
-                    _EXTRA_CTX.layer_idx = old_layer_idx
-
-            assert isinstance(hidden_states, IntermediateTensors)
-            return hidden_states
-
-        # Step 2：执行 Segment E（尾 tail_k 层 + norm）
-        # intermediate_tensors 已由 NPUWorker 从 Cloud 侧接收
-        #
-        # 注意：segment_e 与 segment_a 共用同一个 scheduler_output，num_tokens
-        # 保持不变（scheduler_output 在同一迭代内不变化）。若两者 num_tokens
-        # 出现不一致，会导致 cudagraph shape 不匹配，引发图执行错误。
-        # 关键：重置 layer_idx，使 weight_prefetch / EPLB 定位到尾段起始层，
-        # 执行完毕后恢复原值，避免影响后续非边云路径
-        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-        old_layer_idx = _EXTRA_CTX.layer_idx
-        if _EXTRA_CTX.layer_idx is not None:
-            _EXTRA_CTX.layer_idx = self.num_layers - self.tail_k
-
-        try:
-            tail_layer_indices = list(range(
-                self.num_layers - self.tail_k,
-                self.num_layers,
-            ))
-            if seg_e_graph and not forward_context.capturing:
-                self._update_full_graph_params_if_needed(
-                    forward_context, num_tokens_padded, positions,
-                    layer_indices=tail_layer_indices,
-                    graph_wrapper=seg_e,
-                )
-            hidden_states = seg_e(
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                **model_kwargs,
-            )
-        finally:
-            # segment_e 执行完毕后恢复原始 layer_idx
-            if old_layer_idx is not None:
-                _EXTRA_CTX.layer_idx = old_layer_idx
-
+    # NOTE: there must be exactly ONE definition of this method.  A previous
+    # duplicate placed _update_full_graph_params_if_needed BEFORE the segment
+    # call; that is wrong for the NPU ExternalEvent design -- the replay's
+    # in-graph event wait is armed at launch and satisfied by the update's
+    # record, so the update must be enqueued AFTER the replay launch (same
+    # pattern as the standard _model_forward path).  Cross-batch ordering is
+    # instead guaranteed inside _update_full_graph_params_if_needed itself.
     def _edge_cloud_forward_edge(
         self,
         num_tokens_padded: int,

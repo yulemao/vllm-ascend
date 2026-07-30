@@ -1088,6 +1088,33 @@ class NPUWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
 
+        # [DEBUG] For verify batches, dump the cloud KV cache content health
+        # before the forward, to detect KV corruption by interleaved batches
+        # (draft chains / other requests' prefills) between prefill and verify.
+        # Per-block sums: blocks in use by the request (see gp-update blk_row0)
+        # should be finite; uninitialized free blocks may legitimately be NaN.
+        if scheduler_output.batch_type == BatchType.DECODE_FIRST:
+            try:
+                _kv = getattr(self.model_runner, "kv_caches", None) or []
+                for _li in {0, len(_kv) - 1}:
+                    if 0 <= _li < len(_kv) and isinstance(_kv[_li], torch.Tensor):
+                        _t = _kv[_li]
+                        # FIA layout: (2, num_blocks, block_size, kv_heads, head)
+                        _flat = _t.reshape(-1, _t.shape[1], _t[0][0].numel()) if _t.dim() >= 2 else None
+                        if _flat is None:
+                            continue
+                        _bsums = _flat.float().sum(dim=(0, 2))
+                        _nan_blocks = torch.isnan(_bsums).nonzero().flatten().tolist()
+                        logger.info(
+                            "[EC-DBG] cloud-kv head=%s layer=%d blocks=%d "
+                            "nan_blocks=%s block_sums=%s",
+                            scheduler_output.head_token, _li,
+                            int(_bsums.numel()), _nan_blocks[:16],
+                            [round(float(x), 1) for x in _bsums[:40]],
+                        )
+            except Exception:
+                logger.exception("[EC-DBG] cloud-kv failed")
+
         output = self.model_runner.execute_model(
             scheduler_output, intermediate_tensors,
             layer_slice_info=layer_slice_info,

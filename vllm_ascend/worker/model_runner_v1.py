@@ -6095,6 +6095,18 @@ class NPUModelRunner(GPUModelRunner):
             intermediate_tensors=intermediate_tensors,
             **model_kwargs,
         )
+        # [DEBUG] Record which execution path the cloud middle segment took
+        # (FULL graph replay vs eager) for this batch.
+        try:
+            logger.info(
+                "[EC-DBG] cloud-fwd graph=%s mode=%s desc=%s tokens=%d",
+                seg_c_graph,
+                forward_context.cudagraph_runtime_mode,
+                forward_context.batch_descriptor,
+                num_tokens_padded,
+            )
+        except Exception:
+            logger.exception("[EC-DBG] cloud-fwd failed")
         if seg_c_graph and not forward_context.capturing:
             self._update_full_graph_params_if_needed(
                 forward_context, num_tokens_padded, positions,
@@ -6217,8 +6229,8 @@ class NPUModelRunner(GPUModelRunner):
                 # produced by the local forward.
                 try:
                     _dbg_parts = []
-                    for k in intermediate_tensors.keys():
-                        v2 = self.intermediate_tensors.get(k)
+                    for k, _v in intermediate_tensors.items():
+                        v2 = self.intermediate_tensors[k]
                         if not isinstance(v2, torch.Tensor):
                             continue
                         copy_len = (num_tokens + tp - 1) // tp if enable_sp() else num_tokens

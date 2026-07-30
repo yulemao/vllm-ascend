@@ -1,6 +1,7 @@
 from typing import Any, Callable
 from dataclasses import dataclass
 import contextlib
+import os
 import threading
 
 import torch
@@ -96,6 +97,92 @@ def _hidden_channel_stream_ctx(
         stream.wait_stream(torch.npu.current_stream())
     with torch.npu.stream(stream):
         yield
+
+
+# ------------------------------------------------------------------ #
+# [DEBUG] Discriminating experiment for the DECODE-channel NaN issue. #
+# ------------------------------------------------------------------ #
+# Symptom: the edge verifiably sends clean hidden states (ec-send-nm
+# print, synced to host) but the cloud's waited recv buffer holds NaN
+# rows (ec-recv-nm print, after handle.wait()).  Two knobs, independent:
+#
+#   VLLM_ASCEND_EC_RECV_WAIT_DEFAULT=1
+#       Post irecv with wait_for_default=True so the channel stream is
+#       ordered after the default stream's pending work before the DMA.
+#       Candidate fix: the recv buffer is torch.empty allocated on the
+#       default stream and may recycle a block whose previous owner still
+#       has pending writes on the default stream; with
+#       wait_for_default=False the channel-stream DMA races those writes.
+#       If NaN disappears with this on, the race is confirmed.
+#
+#   VLLM_ASCEND_EC_RECV_SENTINEL=1
+#       Fill each recv buffer with a sentinel on the channel stream right
+#       before irecv (stream-ordered ahead of the DMA), then report rows
+#       still holding the sentinel after the wait:
+#         - rows still sentinel  -> the DMA never wrote them
+#           (message/size mismatch, not a race);
+#         - rows NaN but not sentinel -> the buffer was clobbered around
+#           the DMA (cross-stream/allocator race), or the wire itself
+#           carried NaN (sender-side in-flight overwrite).
+_EC_RECV_WAIT_DEFAULT = (
+    os.environ.get("VLLM_ASCEND_EC_RECV_WAIT_DEFAULT", "0") == "1"
+)
+_EC_RECV_SENTINEL = (
+    os.environ.get("VLLM_ASCEND_EC_RECV_SENTINEL", "0") == "1"
+)
+# 2^17: exactly representable in bf16/fp16/fp32 and far outside the range
+# of real hidden-state values, so a surviving row is unambiguous.
+_EC_RECV_SENTINEL_VALUE = 131072.0
+
+if _EC_RECV_WAIT_DEFAULT:
+    logger.info(
+        "[EC-DBG] recv experiment ON: posting irecv with "
+        "wait_for_default=True"
+    )
+if _EC_RECV_SENTINEL:
+    logger.info(
+        "[EC-DBG] recv experiment ON: sentinel prefill %.1f",
+        _EC_RECV_SENTINEL_VALUE,
+    )
+
+
+def _ec_recv_wait_default() -> bool:
+    """[DEBUG] Whether recv-path P2P posts wait for the default stream."""
+    return _EC_RECV_WAIT_DEFAULT
+
+
+def _ec_sentinel_prefill(recv_view: torch.Tensor) -> None:
+    """[DEBUG] Fill a recv buffer with the sentinel before irecv.
+
+    Must be called INSIDE _hidden_channel_stream_ctx so the fill is
+    stream-ordered before the DMA on the same channel stream.
+    """
+    if not _EC_RECV_SENTINEL:
+        return
+    if (
+        isinstance(recv_view, torch.Tensor)
+        and recv_view.numel() > 0
+        and recv_view.is_floating_point()
+    ):
+        recv_view.fill_(_EC_RECV_SENTINEL_VALUE)
+
+
+def _ec_sentinel_suffix(tensor: Any, num_tokens: int) -> str:
+    """[DEBUG] Report rows still holding the sentinel after the wait."""
+    if not _EC_RECV_SENTINEL or not isinstance(tensor, torch.Tensor):
+        return ""
+    if (
+        tensor.numel() == 0
+        or not tensor.is_floating_point()
+        or tensor.dim() < 2
+    ):
+        return ""
+    used = tensor[:num_tokens].float()
+    sentinel_mask = (used == _EC_RECV_SENTINEL_VALUE).all(dim=-1)
+    sentinel_rows = sentinel_mask.nonzero().flatten().tolist()
+    return f",sentinel_rows={sentinel_rows[:8]}"
+
+
 _FC3_QUANT_X: GroupCoordinator | None = None
 
 # shard_weight across rank groups
@@ -1260,7 +1347,10 @@ def edge_cloud_irecv_tensor_dict(
         # the leading num_tokens rows (mirrors the non-merge SP path).  When
         # SP is off this view is the whole buffer, a no-op.
         recv_view = merged[:num_tokens]
-        with _hidden_channel_stream_ctx(channel, wait_for_default=False):
+        with _hidden_channel_stream_ctx(
+            channel, wait_for_default=_ec_recv_wait_default()
+        ):
+            _ec_sentinel_prefill(recv_view)
             handle = torch.distributed.irecv(
                 recv_view, src=pp_group.ranks[src], group=group
             )
@@ -1286,9 +1376,11 @@ def edge_cloud_irecv_tensor_dict(
                 _rs = _mf.sum(dim=-1) if _mf.dim() >= 2 else _mf
                 _nan_rows = torch.isnan(_rs).nonzero().flatten().tolist()
                 logger.info(
-                    "[EC-DBG] ec-recv ch=%s rows=%d nan_rows=%s row_sums=%s",
+                    "[EC-DBG] ec-recv ch=%s rows=%d nan_rows=%s "
+                    "row_sums=%s%s",
                     channel, int(_rs.numel()), _nan_rows[:8],
                     [round(float(x), 2) for x in _rs[:8]],
+                    _ec_sentinel_suffix(merged, num_tokens),
                 )
             except Exception:
                 logger.exception("[EC-DBG] ec-recv failed")
@@ -1325,7 +1417,10 @@ def edge_cloud_irecv_tensor_dict(
 
             if key in send_keys:
                 recv_view = full_tensor[:num_tokens]
-                with _hidden_channel_stream_ctx(channel, wait_for_default=False):
+                with _hidden_channel_stream_ctx(
+                    channel, wait_for_default=_ec_recv_wait_default()
+                ):
+                    _ec_sentinel_prefill(recv_view)
                     handle = torch.distributed.irecv(
                         recv_view, src=pp_group.ranks[src], group=group
                     )
@@ -1579,7 +1674,9 @@ def edge_cloud_broadcast_recv(
                     _vf = _v.float()
                     _rs = _vf.sum(dim=-1) if _vf.dim() >= 2 else _vf
                     _parts.append(
-                        f"{_k}:rows={_v.shape[0]},nan={int(torch.isnan(_rs).sum())}/{_rs.numel()}"
+                        f"{_k}:rows={_v.shape[0]},"
+                        f"nan={int(torch.isnan(_rs).sum())}/{_rs.numel()}"
+                        f"{_ec_sentinel_suffix(_v, num_tokens)}"
                     )
                 logger.info(
                     "[EC-DBG] ec-recv-nm ch=%s tokens=%d %s",
@@ -1795,12 +1892,15 @@ def edge_cloud_broadcast_recv_scheduled_draft(
                 pp_group,
                 channel=channel,
             )
-            with _hidden_channel_stream_ctx(channel, wait_for_default=False):
+            with _hidden_channel_stream_ctx(
+                channel, wait_for_default=_ec_recv_wait_default()
+            ):
                 for key in tensor_meta.send_tensor_keys:
                     tensor = recv_tensor_dict[key]
                     assert isinstance(tensor, torch.Tensor)
                     if tensor.numel() == 0:
                         continue
+                    _ec_sentinel_prefill(tensor)
                     handle = torch.distributed.irecv(
                         tensor,
                         src=pp_group.ranks[src],

@@ -70,6 +70,7 @@ from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import (
     ScheduledDraftTensorMeta,
+    _ec_sentinel_suffix,
     build_scheduled_draft_tensor_meta,
     edge_cloud_broadcast_recv,
     edge_cloud_broadcast_recv_scheduled_draft,
@@ -150,7 +151,11 @@ def _dbg_tensor_sums(tag: str, scheduler_output: "SchedulerOutput",
             flat = value.float()
             sums = flat.sum(dim=-1) if flat.dim() >= 2 else flat
             nan_rows = int(torch.isnan(sums).sum())
-            parts.append(f"{key}:sum={float(flat.sum()):.4f},nan_rows={nan_rows}/{sums.numel()}")
+            parts.append(
+                f"{key}:sum={float(flat.sum()):.4f},"
+                f"nan_rows={nan_rows}/{sums.numel()}"
+                f"{_ec_sentinel_suffix(value, value.shape[0])}"
+            )
         logger.info(
             "[EC-DBG] %s batch=%s head=%s tokens=%s %s",
             tag,

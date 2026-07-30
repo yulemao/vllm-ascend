@@ -572,6 +572,13 @@ class PDSeparatedScheduler(Scheduler):
         self._decode_first_only_start_ts = None
 
     def _pick_decode_first_only_or_empty(self) -> SchedulerOutput | None:
+        if self._has_draft_work():
+            # A pending draft chain must not be held back by the
+            # decode-first-only window: returning EMPTY here breaks the
+            # batch_queue fill loop right after a DECODE_LAST pick, so the
+            # pre-generated DRF/DRL placeholder chain never reaches the
+            # worker MQ in the same EngineCore turn.
+            return None
         if not self._decode_first_only_active():
             return None
         if self._can_schedule_decode_first():

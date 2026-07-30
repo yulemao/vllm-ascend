@@ -5758,6 +5758,19 @@ class NPUModelRunner(GPUModelRunner):
                         layer_indices=list(range(0, self.head_k)),
                         graph_wrapper=seg_a,
                     )
+                    # The FULL-graph replay returns a weak-ref view of a
+                    # static buffer in the shared graph pool (ACLGraphWrapper
+                    # entry.output).  The worker isends this buffer on the
+                    # dedicated hidden-channel stream; that in-flight HCCL
+                    # copy is NOT covered by the next replay's pre-replay
+                    # current_stream().synchronize() (which only orders the
+                    # compute stream), so any later replay in the pool can
+                    # overwrite the buffer while the copy is still reading
+                    # it -> torn/NaN payload at the cloud.  Clone on the
+                    # compute stream so the payload gets a normal lifetime
+                    # (same remedy as the layer-slice freeze in execute_model
+                    # and the draft hidden-states clone).
+                    hidden_states = _freeze_intermediate_tensors(hidden_states)
             finally:
                 if old_layer_idx is not None:
                     _EXTRA_CTX.layer_idx = old_layer_idx
@@ -6113,6 +6126,12 @@ class NPUModelRunner(GPUModelRunner):
                 layer_indices=cloud_layer_indices,
                 graph_wrapper=seg_c,
             )
+            # Same weak-ref graph-output hazard as the edge seg_a path: the
+            # worker sends this buffer on the hidden-channel stream (directly
+            # on the non-merge path, via torch.cat on the merge path) while a
+            # later replay in the shared pool may already be overwriting it.
+            # Freeze before handing it to the comm layer.
+            hidden_states = _freeze_intermediate_tensors(hidden_states)
         
         if old_layer_idx is not None:
             _EXTRA_CTX.layer_idx = old_layer_idx

@@ -84,8 +84,10 @@ def _hidden_channel_stream_ctx(
 
     *wait_for_default* – True for the **send** path (the tensor being
     sent was produced on the default/compute stream, so the channel
-    stream must wait for it).  False for the **recv** path (writing
-    into a freshly allocated buffer, no prior producer to wait for).
+    stream must wait for it). Receive buffers must instead be allocated
+    inside this context with ``wait_for_default=False``. This makes the
+    channel stream their allocation stream and allows DMA to overlap
+    preceding default-stream compute safely.
     When *channel* is None (legacy non-hidden-channel path) this is a
     no-op (stays on the current/default stream).
     """
@@ -100,7 +102,7 @@ def _hidden_channel_stream_ctx(
 
 
 # ------------------------------------------------------------------ #
-# [DEBUG] Recv-side NaN corruption: confirmed root cause + fix.       #
+# Recv-side stream ownership for caching-allocator safety.            #
 # ------------------------------------------------------------------ #
 # Confirmed by the sentinel A/B experiment (16-request edge-cloud MTP):
 # the recv buffer is torch.empty allocated on the DEFAULT stream and may
@@ -109,10 +111,15 @@ def _hidden_channel_stream_ctx(
 # let the DMA race those pending writes; the waited buffer then held
 # NaN garbage (first victim: the DECODE_FIRST verify hidden states),
 # cascading into NaN KV, NaN replies and collapsed draft acceptance.
-# The recv paths below therefore always post with wait_for_default=True
-# so the channel-stream DMA is ordered after the default stream's
-# pending work.  Cost is negligible: the consumer forward is enqueued
-# on the default stream anyway, and decode payloads are tiny.
+# Waiting for the whole default stream fixes correctness but destroys
+# early-recv compute/communication overlap.
+#
+# The recv paths below instead allocate each wire buffer on its channel
+# stream and post irecv there without waiting for the default stream.
+# Once communication is complete, postprocess records the buffer on the
+# default consumer stream so it cannot be recycled before downstream
+# compute finishes. This fixes the allocation-stream ownership error
+# without serializing receive behind preceding compute.
 #
 # VLLM_ASCEND_EC_RECV_SENTINEL=1 (debug only, default off)
 #       Fill each recv buffer with a sentinel on the channel stream right
@@ -135,15 +142,6 @@ if _EC_RECV_SENTINEL:
         "[EC-DBG] recv experiment ON: sentinel prefill %.1f",
         _EC_RECV_SENTINEL_VALUE,
     )
-
-
-def _ec_recv_wait_default() -> bool:
-    """Recv-path P2P must wait for the default stream before the DMA.
-
-    Hard-coded True: see the root-cause note above.  Kept as a function
-    so the three recv sites share one documented switch point.
-    """
-    return True
 
 
 def _ec_sentinel_prefill(recv_view: torch.Tensor) -> None:
@@ -176,6 +174,19 @@ def _ec_sentinel_suffix(tensor: Any, num_tokens: int) -> str:
     sentinel_mask = (used == _EC_RECV_SENTINEL_VALUE).all(dim=-1)
     sentinel_rows = sentinel_mask.nonzero().flatten().tolist()
     return f",sentinel_rows={sentinel_rows[:8]}"
+
+
+def _record_recv_buffer_on_consumer_stream(tensor: torch.Tensor) -> None:
+    """Keep a channel-allocated recv buffer alive on its consumer stream.
+
+    The matching communication handle must be waited before this hand-off.
+    This records lifetime only; it does not order receive behind preceding
+    default-stream compute.
+    """
+    if tensor.is_cuda:
+        tensor.record_stream(torch.cuda.current_stream(tensor.device))
+    elif tensor.device.type == "npu":
+        tensor.record_stream(torch.npu.current_stream(tensor.device))
 
 
 _FC3_QUANT_X: GroupCoordinator | None = None
@@ -1336,15 +1347,16 @@ def edge_cloud_irecv_tensor_dict(
         # narrow into per-key tensors.  The split is appended to the
         # comm_postprocess list so it runs *after* the irecv handle is
         # waited on by AsyncIntermediateTensors.wait_for_comm().
-        merged = _allocate_merged_recv_buffer(ec_meta, num_tokens)
-        # When SP is on, `merged` is padded up to a TP multiple; the sender
-        # only transmits the actual num_tokens rows, so irecv into a view of
-        # the leading num_tokens rows (mirrors the non-merge SP path).  When
-        # SP is off this view is the whole buffer, a no-op.
-        recv_view = merged[:num_tokens]
         with _hidden_channel_stream_ctx(
-            channel, wait_for_default=_ec_recv_wait_default()
+            channel, wait_for_default=False
         ):
+            # Allocation and first use must share the channel stream. If
+            # torch.empty runs on the default stream, a recycled block can
+            # still have pending writes from its previous owner there.
+            merged = _allocate_merged_recv_buffer(ec_meta, num_tokens)
+            # When SP is on, `merged` is padded up to a TP multiple; the
+            # sender transmits only the actual num_tokens rows.
+            recv_view = merged[:num_tokens]
             _ec_sentinel_prefill(recv_view)
             handle = torch.distributed.irecv(
                 recv_view, src=pp_group.ranks[src], group=group
@@ -1361,6 +1373,7 @@ def edge_cloud_irecv_tensor_dict(
                 tensor_dict[key] = value
         # The split callback runs after irecv has populated `merged`.
         def _split_into_dict() -> None:
+            _record_recv_buffer_on_consumer_stream(merged)
             # [DEBUG] Verify the wire payload as received: per-row sums and
             # NaN rows of the merged recv buffer, before splitting.  This is
             # the earliest point where the received data is guaranteed to
@@ -1402,32 +1415,34 @@ def edge_cloud_irecv_tensor_dict(
             # Replace the placeholder dim-0 with the TP-padded size; the
             # actual wire transfer still only covers num_tokens rows.
             full_size = (recv_num_tokens,) + value.size[1:]
-            full_tensor = torch.empty(
-                full_size, dtype=value.dtype, device=value.device
-            )
-
-            if full_tensor.numel() == 0:
-                tensor_dict[key] = full_tensor
-                continue
-
             if key in send_keys:
-                recv_view = full_tensor[:num_tokens]
                 with _hidden_channel_stream_ctx(
-                    channel, wait_for_default=_ec_recv_wait_default()
+                    channel, wait_for_default=False
                 ):
-                    _ec_sentinel_prefill(recv_view)
-                    handle = torch.distributed.irecv(
-                        recv_view, src=pp_group.ranks[src], group=group
+                    # Allocate on the stream that performs the first write,
+                    # preserving overlap with default-stream compute.
+                    full_tensor = torch.empty(
+                        full_size, dtype=value.dtype, device=value.device
                     )
-                    if recv_view.device.type == "npu":
-                        recv_view.record_stream(
-                            torch.npu.current_stream(recv_view.device))
-                handles.append(handle)
+                    if full_tensor.numel() > 0:
+                        recv_view = full_tensor[:num_tokens]
+                        _ec_sentinel_prefill(recv_view)
+                        handle = torch.distributed.irecv(
+                            recv_view, src=pp_group.ranks[src], group=group
+                        )
+                        if recv_view.device.type == "npu":
+                            recv_view.record_stream(
+                                torch.npu.current_stream(recv_view.device))
+                        handles.append(handle)
             else:
                 # The sender skipped this tensor (e.g. the zero residual in
                 # embedding_only e2c). Keep the buffer zeroed so the model
                 # layers see a valid residual without paying cross-node cost.
-                full_tensor.zero_()
+                full_tensor = torch.empty(
+                    full_size, dtype=value.dtype, device=value.device
+                )
+                if full_tensor.numel() > 0:
+                    full_tensor.zero_()
             tensor_dict[key] = full_tensor
         else:
             tensor_dict[key] = value
@@ -1659,6 +1674,13 @@ def edge_cloud_broadcast_recv(
             return tensor_dict, comm_handles, comm_postprocess
 
         def broadcast_postprocess():
+            # PP receive buffers originate on the channel stream. Their
+            # handles have been waited before this callback, so hand their
+            # lifetime to the default consumer stream without delaying DMA
+            # behind preceding default-stream compute.
+            for tensor in tensor_dict.values():
+                if isinstance(tensor, torch.Tensor):
+                    _record_recv_buffer_on_consumer_stream(tensor)
             # [DEBUG] Non-merge wire payload as received (post irecv-wait,
             # pre TP-broadcast): per-key rows + NaN row count.
             try:
@@ -1880,16 +1902,6 @@ def edge_cloud_broadcast_recv_scheduled_draft(
 
     if tensor_meta is not None:
         recv_tensor_dict: dict[str, torch.Tensor | Any] = {}
-        for key, value in tensor_meta.metadata_list:
-            if isinstance(value, TensorMetadata):
-                recv_tensor_dict[key] = torch.empty(
-                    value.size,
-                    dtype=value.dtype,
-                    device=value.device,
-                )
-            else:
-                recv_tensor_dict[key] = value
-
         comm_handles: list[Handle] = []
         if is_pp_npu0:
             src = (pp_group.rank_in_group - 1) % pp_group.world_size
@@ -1897,29 +1909,47 @@ def edge_cloud_broadcast_recv_scheduled_draft(
                 pp_group,
                 channel=channel,
             )
-            with _hidden_channel_stream_ctx(
-                channel, wait_for_default=_ec_recv_wait_default()
-            ):
-                for key in tensor_meta.send_tensor_keys:
-                    tensor = recv_tensor_dict[key]
-                    assert isinstance(tensor, torch.Tensor)
-                    if tensor.numel() == 0:
-                        continue
-                    _ec_sentinel_prefill(tensor)
-                    handle = torch.distributed.irecv(
-                        tensor,
-                        src=pp_group.ranks[src],
-                        group=group,
+
+        send_keys = set(tensor_meta.send_tensor_keys)
+        for key, value in tensor_meta.metadata_list:
+            if not isinstance(value, TensorMetadata):
+                recv_tensor_dict[key] = value
+                continue
+
+            if is_pp_npu0 and key in send_keys:
+                with _hidden_channel_stream_ctx(
+                    channel, wait_for_default=False
+                ):
+                    # Scheduled-draft buffers follow the same allocation-
+                    # stream rule as the generic receive path.
+                    tensor = torch.empty(
+                        value.size,
+                        dtype=value.dtype,
+                        device=value.device,
                     )
-                    if tensor.is_cuda:
-                        tensor.record_stream(
-                            torch.cuda.current_stream(tensor.device)
+                    if tensor.numel() > 0:
+                        _ec_sentinel_prefill(tensor)
+                        handle = torch.distributed.irecv(
+                            tensor,
+                            src=pp_group.ranks[src],
+                            group=group,
                         )
-                    elif tensor.device.type == "npu":
-                        tensor.record_stream(
-                            torch.npu.current_stream(tensor.device)
-                        )
-                    comm_handles.append(handle)
+                        if tensor.is_cuda:
+                            tensor.record_stream(
+                                torch.cuda.current_stream(tensor.device)
+                            )
+                        elif tensor.device.type == "npu":
+                            tensor.record_stream(
+                                torch.npu.current_stream(tensor.device)
+                            )
+                        comm_handles.append(handle)
+            else:
+                tensor = torch.empty(
+                    value.size,
+                    dtype=value.dtype,
+                    device=value.device,
+                )
+            recv_tensor_dict[key] = tensor
 
         def broadcast_postprocess():
             handles = []
@@ -1928,6 +1958,8 @@ def edge_cloud_broadcast_recv_scheduled_draft(
                 assert isinstance(tensor, torch.Tensor)
                 if tensor.numel() == 0:
                     continue
+                if is_pp_npu0:
+                    _record_recv_buffer_on_consumer_stream(tensor)
                 group = (
                     tp_group.cpu_group
                     if tensor.is_cpu

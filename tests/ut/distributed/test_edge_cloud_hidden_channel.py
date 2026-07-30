@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -112,6 +113,53 @@ def test_edge_cloud_irecv_uses_precomputed_meta_without_metadata():
         recv_tensor = call.args[0]
         assert recv_tensor.shape == (5, 4)
         assert call.kwargs["group"] is group_by_channel[HiddenChannelType.PREFILL_2]
+
+
+def test_edge_cloud_irecv_allocates_on_channel_stream():
+    """The recv buffer's allocation and first DMA use share one stream."""
+    pp_group, _ = _pp_group_with_hidden_channels()
+    pp_group.rank_in_group = 1
+    in_channel_stream = False
+    wait_values = []
+    real_empty = torch.empty
+
+    @contextmanager
+    def channel_stream_ctx(channel, *, wait_for_default):
+        nonlocal in_channel_stream
+        assert channel == HiddenChannelType.DECODE
+        assert not in_channel_stream
+        wait_values.append(wait_for_default)
+        in_channel_stream = True
+        try:
+            yield
+        finally:
+            in_channel_stream = False
+
+    def checked_empty(*args, **kwargs):
+        assert in_channel_stream
+        return real_empty(*args, **kwargs)
+
+    with patch.object(parallel_state, "get_pp_group", return_value=pp_group), \
+            patch("torch.distributed.is_initialized", return_value=True), \
+            patch("torch.distributed.irecv", return_value=Mock()), \
+            patch.object(
+                parallel_state,
+                "_hidden_channel_stream_ctx",
+                channel_stream_ctx,
+            ), \
+            patch.object(torch, "empty", side_effect=checked_empty):
+        tensor_dict, handles, postprocess = (
+            edge_cloud_irecv_tensor_dict_on_hidden_channel(
+                channel=HiddenChannelType.DECODE,
+                num_tokens=5,
+            )
+        )
+
+    assert len(handles) == 2
+    assert postprocess == []
+    assert tensor_dict["hidden_states"].shape == (5, 4)
+    assert tensor_dict["residual"].shape == (5, 4)
+    assert wait_values == [False, False]
 
 
 def test_edge_cloud_hidden_channel_fallback_without_extra_groups():

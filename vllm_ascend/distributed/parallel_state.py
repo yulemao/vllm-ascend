@@ -100,22 +100,21 @@ def _hidden_channel_stream_ctx(
 
 
 # ------------------------------------------------------------------ #
-# [DEBUG] Discriminating experiment for the DECODE-channel NaN issue. #
+# [DEBUG] Recv-side NaN corruption: confirmed root cause + fix.       #
 # ------------------------------------------------------------------ #
-# Symptom: the edge verifiably sends clean hidden states (ec-send-nm
-# print, synced to host) but the cloud's waited recv buffer holds NaN
-# rows (ec-recv-nm print, after handle.wait()).  Two knobs, independent:
+# Confirmed by the sentinel A/B experiment (16-request edge-cloud MTP):
+# the recv buffer is torch.empty allocated on the DEFAULT stream and may
+# recycle a block whose previous owner still has pending writes there.
+# Posting the irecv on the channel stream with wait_for_default=False
+# let the DMA race those pending writes; the waited buffer then held
+# NaN garbage (first victim: the DECODE_FIRST verify hidden states),
+# cascading into NaN KV, NaN replies and collapsed draft acceptance.
+# The recv paths below therefore always post with wait_for_default=True
+# so the channel-stream DMA is ordered after the default stream's
+# pending work.  Cost is negligible: the consumer forward is enqueued
+# on the default stream anyway, and decode payloads are tiny.
 #
-#   VLLM_ASCEND_EC_RECV_WAIT_DEFAULT=1
-#       Post irecv with wait_for_default=True so the channel stream is
-#       ordered after the default stream's pending work before the DMA.
-#       Candidate fix: the recv buffer is torch.empty allocated on the
-#       default stream and may recycle a block whose previous owner still
-#       has pending writes on the default stream; with
-#       wait_for_default=False the channel-stream DMA races those writes.
-#       If NaN disappears with this on, the race is confirmed.
-#
-#   VLLM_ASCEND_EC_RECV_SENTINEL=1
+# VLLM_ASCEND_EC_RECV_SENTINEL=1 (debug only, default off)
 #       Fill each recv buffer with a sentinel on the channel stream right
 #       before irecv (stream-ordered ahead of the DMA), then report rows
 #       still holding the sentinel after the wait:
@@ -124,9 +123,6 @@ def _hidden_channel_stream_ctx(
 #         - rows NaN but not sentinel -> the buffer was clobbered around
 #           the DMA (cross-stream/allocator race), or the wire itself
 #           carried NaN (sender-side in-flight overwrite).
-_EC_RECV_WAIT_DEFAULT = (
-    os.environ.get("VLLM_ASCEND_EC_RECV_WAIT_DEFAULT", "0") == "1"
-)
 _EC_RECV_SENTINEL = (
     os.environ.get("VLLM_ASCEND_EC_RECV_SENTINEL", "0") == "1"
 )
@@ -134,11 +130,6 @@ _EC_RECV_SENTINEL = (
 # of real hidden-state values, so a surviving row is unambiguous.
 _EC_RECV_SENTINEL_VALUE = 131072.0
 
-if _EC_RECV_WAIT_DEFAULT:
-    logger.info(
-        "[EC-DBG] recv experiment ON: posting irecv with "
-        "wait_for_default=True"
-    )
 if _EC_RECV_SENTINEL:
     logger.info(
         "[EC-DBG] recv experiment ON: sentinel prefill %.1f",
@@ -147,8 +138,12 @@ if _EC_RECV_SENTINEL:
 
 
 def _ec_recv_wait_default() -> bool:
-    """[DEBUG] Whether recv-path P2P posts wait for the default stream."""
-    return _EC_RECV_WAIT_DEFAULT
+    """Recv-path P2P must wait for the default stream before the DMA.
+
+    Hard-coded True: see the root-cause note above.  Kept as a function
+    so the three recv sites share one documented switch point.
+    """
+    return True
 
 
 def _ec_sentinel_prefill(recv_view: torch.Tensor) -> None:

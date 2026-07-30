@@ -1051,6 +1051,19 @@ def edge_cloud_isend_tensor_dict(
                 value = value.contiguous()
             pieces.append(value)
         merged = torch.cat(pieces, dim=-1)
+        # [DEBUG] Wire payload as sent: per-row sums + NaN rows, so the
+        # sender/receiver contents can be compared message by message.
+        try:
+            _mf = merged.float()
+            _rs = _mf.sum(dim=-1) if _mf.dim() >= 2 else _mf
+            _nan_rows = torch.isnan(_rs).nonzero().flatten().tolist()
+            logger.info(
+                "[EC-DBG] ec-send ch=%s rows=%d nan_rows=%s row_sums=%s",
+                channel, int(_rs.numel()), _nan_rows[:8],
+                [round(float(x), 2) for x in _rs[:8]],
+            )
+        except Exception:
+            logger.exception("[EC-DBG] ec-send failed")
         # cat with multiple inputs always allocates a fresh contiguous buffer.
         assert merged.is_contiguous()
         # Belt-and-suspenders: verify the merged buffer's non-dim-0 shape
@@ -1249,6 +1262,22 @@ def edge_cloud_irecv_tensor_dict(
                 tensor_dict[key] = value
         # The split callback runs after irecv has populated `merged`.
         def _split_into_dict() -> None:
+            # [DEBUG] Verify the wire payload as received: per-row sums and
+            # NaN rows of the merged recv buffer, before splitting.  This is
+            # the earliest point where the received data is guaranteed to
+            # have landed, so it isolates transport corruption from any
+            # downstream compute.
+            try:
+                _mf = merged[:num_tokens].float()
+                _rs = _mf.sum(dim=-1) if _mf.dim() >= 2 else _mf
+                _nan_rows = torch.isnan(_rs).nonzero().flatten().tolist()
+                logger.info(
+                    "[EC-DBG] ec-recv ch=%s rows=%d nan_rows=%s row_sums=%s",
+                    channel, int(_rs.numel()), _nan_rows[:8],
+                    [round(float(x), 2) for x in _rs[:8]],
+                )
+            except Exception:
+                logger.exception("[EC-DBG] ec-recv failed")
             split = _split_merged_buffer_into_dict(merged, ec_meta)
             tensor_dict.update(split)
 
@@ -1395,6 +1424,15 @@ def edge_cloud_send_tensor_dict_scheduled_draft(
             )
             if not tensor.is_contiguous():
                 tensor = tensor.contiguous()
+            # [DEBUG] Draft payload as sent (decode channel message log).
+            try:
+                logger.info(
+                    "[EC-DBG] ec-send-draft ch=%s key=%s rows=%d sum=%.2f",
+                    channel, key, int(tensor.shape[0]),
+                    float(tensor.float().sum()),
+                )
+            except Exception:
+                logger.exception("[EC-DBG] ec-send-draft failed")
             with _hidden_channel_stream_ctx(channel, wait_for_default=True):
                 handle = torch.distributed.isend(
                     tensor,

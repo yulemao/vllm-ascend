@@ -1180,6 +1180,11 @@ class NPUWorker(WorkerBase):
         for postprocess in comm_postprocess:
             postprocess()
         assert tensor_dict is not None
+        # [DEBUG] Draft payload as received on the cloud (decode channel).
+        try:
+            _dbg_tensor_sums("cloud-draft-recv", scheduler_output, tensor_dict)
+        except Exception:
+            logger.exception("[EC-DBG] cloud-draft-recv failed")
         output = self.model_runner._run_edge_cloud_draft_middle_segment(
             scheduler_output, IntermediateTensors(tensor_dict)
         )

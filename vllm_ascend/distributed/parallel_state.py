@@ -1673,11 +1673,21 @@ def edge_cloud_broadcast_recv(
                         continue
                     _vf = _v.float()
                     _rs = _vf.sum(dim=-1) if _vf.dim() >= 2 else _vf
-                    _parts.append(
+                    _nan_idx = torch.isnan(_rs).nonzero().flatten().tolist()
+                    _part = (
                         f"{_k}:rows={_v.shape[0]},"
-                        f"nan={int(torch.isnan(_rs).sum())}/{_rs.numel()}"
+                        f"nan={len(_nan_idx)}/{_rs.numel()}"
                         f"{_ec_sentinel_suffix(_v, num_tokens)}"
                     )
+                    # Small batches (verify/draft payloads): dump per-row
+                    # sums and NaN indices so the surviving rows can be
+                    # compared 1:1 against the sender's ec-send-nm rows.
+                    if _rs.numel() <= 8:
+                        _part += (
+                            f",nan_idx={_nan_idx},"
+                            f"sums={[round(float(x), 2) for x in _rs]}"
+                        )
+                    _parts.append(_part)
                 logger.info(
                     "[EC-DBG] ec-recv-nm ch=%s tokens=%d %s",
                     channel, num_tokens, " ".join(_parts),

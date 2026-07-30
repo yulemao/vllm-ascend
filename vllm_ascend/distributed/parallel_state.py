@@ -912,8 +912,20 @@ def _get_edge_cloud_hidden_channel_device_group(
     pp_group: GroupCoordinator,
     channel: HiddenChannelType | None = None,
     use_alt_group: bool = False,
+    for_send: bool | None = None,
 ):
     if channel is not None:
+        if (channel == HiddenChannelType.DECODE and for_send is not None
+                and getattr(pp_group, "decode_c2e_device_group", None)
+                is not None):
+            # Decode-channel directions use independent communicators (see
+            # create_hidden_channel_groups): e2c on the alternate group,
+            # c2e on the dedicated decode_c2e group, so a transiently
+            # unmatched c2e isend can never stall the e2c recvs queued
+            # behind it on the same HCCL-internal stream.
+            is_c2e = is_edge_device() != for_send
+            if is_c2e:
+                return pp_group.decode_c2e_device_group
         if hasattr(pp_group, "_hidden_channel_groups"):
             device_group, _ = pp_group._hidden_channel_groups(channel)
             return device_group
@@ -978,7 +990,7 @@ def edge_cloud_isend_tensor_dict(
         dst = (pp_group.rank_in_group + 1) % pp_group.world_size
 
     group = _get_edge_cloud_hidden_channel_device_group(
-        pp_group, channel=channel, use_alt_group=use_alt_group
+        pp_group, channel=channel, use_alt_group=use_alt_group, for_send=True
     )
 
     # Guard against silent key/order drift between sender and receiver.
@@ -1247,7 +1259,7 @@ def edge_cloud_irecv_tensor_dict(
 
     ec_meta = _select_edge_cloud_meta_for_recv()
     group = _get_edge_cloud_hidden_channel_device_group(
-        pp_group, channel=channel, use_alt_group=use_alt_group
+        pp_group, channel=channel, use_alt_group=use_alt_group, for_send=False
     )
 
     if ec_meta.merge_payload:
@@ -1410,6 +1422,7 @@ def edge_cloud_send_tensor_dict_scheduled_draft(
         group = _get_edge_cloud_hidden_channel_device_group(
             pp_group,
             channel=channel,
+            for_send=True,
         )
         sender_tensor_keys = [
             key
@@ -1805,6 +1818,7 @@ def edge_cloud_broadcast_recv_scheduled_draft(
             group = _get_edge_cloud_hidden_channel_device_group(
                 pp_group,
                 channel=channel,
+                for_send=False,
             )
             with _hidden_channel_stream_ctx(channel, wait_for_default=False):
                 for key in tensor_meta.send_tensor_keys:

@@ -251,6 +251,16 @@ class GroupCoordinatorPatch(GroupCoordinator):
             torch.distributed.destroy_process_group(prefill2_device_group)
             self.prefill2_device_group = None
 
+        decode_c2e_cpu_group = getattr(self, "decode_c2e_cpu_group", None)
+        if decode_c2e_cpu_group is not None:
+            torch.distributed.destroy_process_group(decode_c2e_cpu_group)
+            self.decode_c2e_cpu_group = None
+
+        decode_c2e_device_group = getattr(self, "decode_c2e_device_group", None)
+        if decode_c2e_device_group is not None:
+            torch.distributed.destroy_process_group(decode_c2e_device_group)
+            self.decode_c2e_device_group = None
+
         if getattr(self, "mq_broadcaster", None) is not None:
             self.mq_broadcaster = None
 
@@ -297,18 +307,34 @@ class GroupCoordinatorPatch(GroupCoordinator):
         self,
         torch_distributed_backend: str | Backend,
     ) -> None:
-        """Create the extra Phase6 PREFILL_2 group.
+        """Create the extra Phase6 PREFILL_2 group and the decode c2e group.
 
         The default pp group is PREFILL_1 and the existing alternate group is
-        DECODE.  This method adds PREFILL_2 as the third independent data-plane
-        channel over the same ranks.
+        DECODE (e2c direction).  This method adds PREFILL_2 as the third
+        independent data-plane channel over the same ranks, plus a dedicated
+        cloud->edge (c2e) communicator for the decode channel.
+
+        The c2e split is required because a ProcessGroupHCCL comm owns a
+        single internal stream for BOTH directions: a transiently-unmatched
+        c2e isend (e.g. a draft reply whose edge-side DRAFT_LAST irecv is
+        still queued behind other batches) stalls every e2c recv posted
+        behind it on the same comm.  The decode verify recv is consumed
+        immediately (unlike drafts, which are prefetched), so it observed
+        the not-yet-landed buffer (NaN/zeros) whenever the c2e path was
+        momentarily blocked.
         """
         assert self.prefill2_device_group is None, (
             "PREFILL_2 hidden channel group already created"
         )
+        assert getattr(self, "decode_c2e_device_group", None) is None, (
+            "Decode c2e channel group already created"
+        )
         hccl_pg_options = create_hccl_pg_options("pp_prefill2")
         prefill2_device_group = None
         prefill2_cpu_group = None
+        decode_c2e_pg_options = create_hccl_pg_options("pp_decode_c2e")
+        decode_c2e_device_group = None
+        decode_c2e_cpu_group = None
         for ranks in self._all_group_ranks:
             device_group = torch.distributed.new_group(
                 ranks,
@@ -316,13 +342,25 @@ class GroupCoordinatorPatch(GroupCoordinator):
                 pg_options=hccl_pg_options,
             )
             cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+            c2e_device_group = torch.distributed.new_group(
+                ranks,
+                backend=torch_distributed_backend,
+                pg_options=decode_c2e_pg_options,
+            )
+            c2e_cpu_group = torch.distributed.new_group(ranks, backend="gloo")
             if self.rank in ranks:
                 prefill2_device_group = device_group
                 prefill2_cpu_group = cpu_group
+                decode_c2e_device_group = c2e_device_group
+                decode_c2e_cpu_group = c2e_cpu_group
         assert prefill2_device_group is not None
         assert prefill2_cpu_group is not None
+        assert decode_c2e_device_group is not None
+        assert decode_c2e_cpu_group is not None
         self.prefill2_device_group = prefill2_device_group
         self.prefill2_cpu_group = prefill2_cpu_group
+        self.decode_c2e_device_group = decode_c2e_device_group
+        self.decode_c2e_cpu_group = decode_c2e_cpu_group
 
     def _hidden_channel_groups(self, channel: Any):
         value = getattr(channel, "value", channel)
@@ -337,6 +375,25 @@ class GroupCoordinatorPatch(GroupCoordinator):
             assert self.prefill2_cpu_group is not None
             return self.prefill2_device_group, self.prefill2_cpu_group
         raise ValueError(f"Unknown hidden channel: {channel}")
+
+    def _hidden_channel_groups_for(self, channel: Any, for_send: bool):
+        """Direction-aware decode-channel group resolution.
+
+        On the decode channel the e2c and c2e directions use independent
+        communicators (see create_hidden_channel_groups): e2c traffic (edge
+        verify/draft payloads and their cloud-side recvs) stays on the
+        alternate group, while c2e traffic (cloud verify/draft replies and
+        their edge-side recvs) goes to the dedicated decode_c2e group.
+        Other channels ignore *for_send*.
+        """
+        value = getattr(channel, "value", channel)
+        if value == "decode" and getattr(
+                self, "decode_c2e_device_group", None) is not None:
+            from vllm.distributed.parallel_state import is_edge_device
+            is_c2e = is_edge_device() != for_send
+            if is_c2e:
+                return self.decode_c2e_device_group, self.decode_c2e_cpu_group
+        return self._hidden_channel_groups(channel)
 
     def send_object_on_hidden_channel(
         self, obj: Any, dst: int, channel: Any
@@ -392,7 +449,8 @@ class GroupCoordinatorPatch(GroupCoordinator):
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
-        device_group, cpu_group = self._hidden_channel_groups(channel)
+        device_group, cpu_group = self._hidden_channel_groups_for(
+            channel, for_send=True)
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
         # Use async send for metadata so the edge head segment can return
         # immediately even when the cloud worker has not yet reached the
@@ -425,7 +483,8 @@ class GroupCoordinatorPatch(GroupCoordinator):
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
-        device_group, cpu_group = self._hidden_channel_groups(channel)
+        device_group, cpu_group = self._hidden_channel_groups_for(
+            channel, for_send=False)
         recv_metadata_list = self.recv_object_on_hidden_channel(src, channel)
         tensor_dict: dict[str, Any] = {}
         handles = []

@@ -1111,6 +1111,20 @@ def edge_cloud_isend_tensor_dict(
             # only happens when upstream code returned a non-standard
             # layout, in which case we materialize once.
             value = value.contiguous()
+        # [DEBUG] Non-merge wire payload as sent (e2c direction uses this
+        # path): per-key rows + per-row sums so receiver content can be
+        # compared 1:1.
+        try:
+            _vf = value.float()
+            _rs = _vf.sum(dim=-1) if _vf.dim() >= 2 else _vf
+            logger.info(
+                "[EC-DBG] ec-send-nm ch=%s key=%s rows=%d nan=%d row_sums=%s",
+                channel, key, int(value.shape[0]),
+                int(torch.isnan(_rs).sum()),
+                [round(float(x), 2) for x in _rs[:8]],
+            )
+        except Exception:
+            logger.exception("[EC-DBG] ec-send-nm failed")
         with _hidden_channel_stream_ctx(channel, wait_for_default=True):
             handle = torch.distributed.isend(
                 value, dst=pp_group.ranks[dst], group=group
@@ -1555,6 +1569,24 @@ def edge_cloud_broadcast_recv(
             return tensor_dict, comm_handles, comm_postprocess
 
         def broadcast_postprocess():
+            # [DEBUG] Non-merge wire payload as received (post irecv-wait,
+            # pre TP-broadcast): per-key rows + NaN row count.
+            try:
+                _parts = []
+                for _k, _v in tensor_dict.items():
+                    if not isinstance(_v, torch.Tensor):
+                        continue
+                    _vf = _v.float()
+                    _rs = _vf.sum(dim=-1) if _vf.dim() >= 2 else _vf
+                    _parts.append(
+                        f"{_k}:rows={_v.shape[0]},nan={int(torch.isnan(_rs).sum())}/{_rs.numel()}"
+                    )
+                logger.info(
+                    "[EC-DBG] ec-recv-nm ch=%s tokens=%d %s",
+                    channel, num_tokens, " ".join(_parts),
+                )
+            except Exception:
+                logger.exception("[EC-DBG] ec-recv-nm failed")
             _, tensor_list = _split_tensor_dict(tensor_dict) if tensor_dict else (None, [])
             handles = []
             for tensor in tensor_list:

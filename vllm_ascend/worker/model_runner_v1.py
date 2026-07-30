@@ -6208,6 +6208,25 @@ class NPUModelRunner(GPUModelRunner):
                         dst[:recv_len].copy_(v[:recv_len], non_blocking=True)
                     if recv_len < copy_len:
                         dst[recv_len:].zero_()
+                # [DEBUG] Same payload health log as the generic branch below.
+                try:
+                    _dbg_parts = []
+                    for k, _v in intermediate_tensors.items():
+                        v2 = self.intermediate_tensors[k]
+                        if not isinstance(v2, torch.Tensor):
+                            continue
+                        used = v2[:num_tokens].float()
+                        row_sums = used.sum(dim=-1) if used.dim() >= 2 else used
+                        nan_rows = int(torch.isnan(row_sums).sum())
+                        _dbg_parts.append(
+                            f"{k}:sum={float(used.sum()):.4f},nan_rows={nan_rows}/{row_sums.numel()}"
+                        )
+                    logger.info(
+                        "[EC-DBG] sync-slice role=%s tokens=%d %s",
+                        self.edge_cloud_cfg.role, num_tokens, " ".join(_dbg_parts),
+                    )
+                except Exception:
+                    logger.exception("[EC-DBG] sync-slice failed")
                 return IntermediateTensors(
                     {
                         k: v[:num_tokens]

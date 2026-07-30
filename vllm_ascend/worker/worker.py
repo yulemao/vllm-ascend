@@ -1096,6 +1096,11 @@ class NPUWorker(WorkerBase):
         if scheduler_output.batch_type == BatchType.DECODE_FIRST:
             try:
                 _kv = getattr(self.model_runner, "kv_caches", None) or []
+                logger.info(
+                    "[EC-DBG] cloud-kv head=%s kv_caches=%d shapes=%s",
+                    scheduler_output.head_token, len(_kv),
+                    [list(t.shape) for t in _kv[:2] if isinstance(t, torch.Tensor)],
+                )
                 for _li in {0, len(_kv) - 1}:
                     if 0 <= _li < len(_kv) and isinstance(_kv[_li], torch.Tensor):
                         _t = _kv[_li]

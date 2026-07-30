@@ -1118,9 +1118,10 @@ def edge_cloud_isend_tensor_dict(
             _vf = value.float()
             _rs = _vf.sum(dim=-1) if _vf.dim() >= 2 else _vf
             logger.info(
-                "[EC-DBG] ec-send-nm ch=%s key=%s rows=%d nan=%d row_sums=%s",
+                "[EC-DBG] ec-send-nm ch=%s key=%s rows=%d nan=%d ptr=%#x row_sums=%s",
                 channel, key, int(value.shape[0]),
                 int(torch.isnan(_rs).sum()),
+                value.data_ptr(),
                 [round(float(x), 2) for x in _rs[:8]],
             )
         except Exception:
@@ -1276,12 +1277,12 @@ def edge_cloud_irecv_tensor_dict(
                 tensor_dict[key] = value
         # The split callback runs after irecv has populated `merged`.
         def _split_into_dict() -> None:
-            # [DEBUG] Verify the wire payload as received: per-row sums and
-            # NaN rows of the merged recv buffer, before splitting.  This is
-            # the earliest point where the received data is guaranteed to
-            # have landed, so it isolates transport corruption from any
-            # downstream compute.
+            # [DEBUG] Verify the wire payload as received: HARD device sync
+            # first (same rationale as the non-merge ec-recv-nm debug), then
+            # per-row sums + NaN rows of the merged recv buffer, before
+            # splitting.
             try:
+                torch.npu.synchronize()
                 _mf = merged[:num_tokens].float()
                 _rs = _mf.sum(dim=-1) if _mf.dim() >= 2 else _mf
                 _nan_rows = torch.isnan(_rs).nonzero().flatten().tolist()
@@ -1315,7 +1316,12 @@ def edge_cloud_irecv_tensor_dict(
             # Replace the placeholder dim-0 with the TP-padded size; the
             # actual wire transfer still only covers num_tokens rows.
             full_size = (recv_num_tokens,) + value.size[1:]
-            full_tensor = torch.empty(
+            # [DEBUG] Zero-init instead of empty: if a row is never written
+            # by the irecv it stays exactly 0, which distinguishes
+            # "recv never landed / size mispairing" (zeros) from "recv
+            # delivered NaN bytes" (NaN) from "read before completion"
+            # (rows become correct after a hard synchronize below).
+            full_tensor = torch.zeros(
                 full_size, dtype=value.dtype, device=value.device
             )
 
@@ -1569,9 +1575,13 @@ def edge_cloud_broadcast_recv(
             return tensor_dict, comm_handles, comm_postprocess
 
         def broadcast_postprocess():
-            # [DEBUG] Non-merge wire payload as received (post irecv-wait,
-            # pre TP-broadcast): per-key rows + NaN row count.
+            # [DEBUG] Non-merge wire payload as received: HARD device sync
+            # first so the read cannot race an in-flight HCCL recv (the
+            # default WorkHCCL::wait only event-blocks the current stream,
+            # it never blocks the CPU).  Then per-key rows + NaN count +
+            # per-row sum VALUES for 1:1 comparison with the sender log.
             try:
+                torch.npu.synchronize()
                 _parts = []
                 for _k, _v in tensor_dict.items():
                     if not isinstance(_v, torch.Tensor):
@@ -1580,6 +1590,7 @@ def edge_cloud_broadcast_recv(
                     _rs = _vf.sum(dim=-1) if _vf.dim() >= 2 else _vf
                     _parts.append(
                         f"{_k}:rows={_v.shape[0]},nan={int(torch.isnan(_rs).sum())}/{_rs.numel()}"
+                        f",ptr={_v.data_ptr():#x},row_sums={[round(float(x), 2) for x in _rs[:8]]}"
                     )
                 logger.info(
                     "[EC-DBG] ec-recv-nm ch=%s tokens=%d %s",

@@ -300,11 +300,13 @@ class AscendMultiprocExecutor(MultiprocExecutor):
         )
 
     def clear_pending_edge_cloud_draft_for_req_ids(
-        self, req_ids: set[str] | list[str]
+        self,
+        req_ids: set[str] | list[str],
+        force_drop_task_ids: set[str] | list[str] = (),
     ) -> None:
         self.collective_rpc(
             "clear_pending_edge_cloud_draft_for_req_ids",
-            args=(req_ids,),
+            args=(req_ids, force_drop_task_ids),
             # local_only=True keeps this RPC off the cross-node queue, so the
             # cloud workers never execute it and never reply.  Without
             # unique_reply_rank the engine would wait for replies from ALL

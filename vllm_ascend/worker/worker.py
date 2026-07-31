@@ -1635,9 +1635,13 @@ class NPUWorker(WorkerBase):
         return self.model_runner.take_draft_token_ids()
 
     def clear_pending_edge_cloud_draft_for_req_ids(
-        self, req_ids: set[str] | list[str]
+        self,
+        req_ids: set[str] | list[str],
+        force_drop_task_ids: set[str] | list[str] = (),
     ) -> None:
-        self.model_runner.clear_pending_edge_cloud_draft_for_req_ids(req_ids)
+        self.model_runner.clear_pending_edge_cloud_draft_for_req_ids(
+            req_ids, force_drop_task_ids
+        )
 
     def check_health(self) -> None:
         import subprocess

@@ -3044,28 +3044,46 @@ class NPUModelRunner(GPUModelRunner):
             self._draft_token_ids_req_ids = None
 
     def clear_pending_edge_cloud_draft_for_req_ids(
-        self, req_ids: set[str] | list[str]
+        self,
+        req_ids: set[str] | list[str],
+        force_drop_task_ids: set[str] | list[str] = (),
     ) -> None:
+        """Mark finished requests on pending deferred drafts.
+
+        Aligned with the non-edge-cloud behavior, where the drafter still
+        runs over the whole verify batch and finished requests' outputs
+        are discarded afterwards: a pending draft context is dropped ONLY
+        when every request of its parent batch has finished.  Partial
+        finishes keep the draft alive — the cloud-side cached attention
+        metadata is whole-batch, so dropping/filtering rows here would
+        desync the token counts; the dead rows' draft tokens are instead
+        discarded when the chain completes (see
+        _run_edge_cloud_draft_last_segment).
+
+        ``force_drop_task_ids`` carries chains the scheduler cut from its
+        ready queues (all requests finished): their contexts are dropped
+        unconditionally.  Dropping a context whose DRAFT_FIRST already
+        executed is safe — the matching DRAFT_LAST drains through the
+        context-is-None path in _run_edge_cloud_draft_last_segment, and
+        worker FIFO ordering guarantees an already-dispatched DRAFT_FIRST
+        ran before this RPC arrives.
+        """
         req_id_set = set(req_ids)
         for req_id in req_id_set:
             self._worker_draft_token_ids_by_req.pop(req_id, None)
-        stale_task_ids = [
-            task_id
-            for task_id, context in (
-                self._pending_edge_cloud_draft_contexts.items()
-            )
-            if req_id_set.intersection(context.get("req_ids") or ())
-        ]
-        for task_id in stale_task_ids:
-            # Keep enqueued contexts whose draft is not yet complete:
-            # they have been converted to a DRAFT_FIRST SchedulerOutput
-            # and the worker will need the context when it executes that
-            # DRAFT_FIRST.  But if the draft IS already complete, the
-            # context was fully consumed and can safely be removed.
-            context = self._pending_edge_cloud_draft_contexts.get(task_id)
-            if context and context.get("enqueued") and not context.get(
-                "draft_complete"
-            ):
+        force_dropped = set(force_drop_task_ids)
+        for task_id, context in list(
+            self._pending_edge_cloud_draft_contexts.items()
+        ):
+            ctx_req_ids = context.get("req_ids") or ()
+            hit = req_id_set.intersection(ctx_req_ids)
+            if hit:
+                finished = context.setdefault("finished_req_ids", set())
+                finished.update(hit)
+                if not all(req_id in finished for req_id in ctx_req_ids):
+                    # Partial finish: keep the draft alive.
+                    continue
+            elif task_id not in force_dropped:
                 continue
             self._pending_edge_cloud_draft_contexts.pop(task_id, None)
 
@@ -3354,8 +3372,14 @@ class NPUModelRunner(GPUModelRunner):
             # Also record the rows per request: this is the authoritative
             # source for the verify-time spec scatter in _prepare_inputs,
             # which must survive both input-batch re-indexing and later
-            # chains overwriting the global above.
+            # chains overwriting the global above.  Requests that finished
+            # while the chain was in flight are skipped (non-edge-cloud
+            # semantics: dead rows still go through the drafter, their
+            # outputs are discarded here).
+            finished_req_ids = context.get("finished_req_ids") or set()
             for row, req_id in enumerate(self._draft_token_ids_req_ids):
+                if req_id in finished_req_ids:
+                    continue
                 self._worker_draft_token_ids_by_req[req_id] = (
                     self._draft_token_ids[row]
                 )
@@ -4750,6 +4774,58 @@ class NPUModelRunner(GPUModelRunner):
                 f"tokens={num_tokens}, task_id={task_id}"
             )
         return base_positions + draft_step_idx
+
+    def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
+        result = super()._update_states(scheduler_output)
+        self._purge_invalidated_cloud_draft_metadata(
+            getattr(scheduler_output, "cloud_draft_invalidate_task_ids", None)
+        )
+        return result
+
+    def _purge_invalidated_cloud_draft_metadata(
+        self, task_ids: list[str] | None
+    ) -> None:
+        """Cloud-side purge of draft metadata for edge-dropped tasks.
+
+        The edge drops a deferred draft when every request of its parent
+        verify/prefill batch finished (or was aborted), so the DRAFT
+        batch never (fully) arrives and the normal pop at the last draft
+        step never runs.  The edge stamps the affected task ids on a
+        later SchedulerOutput (``cloud_draft_invalidate_task_ids``);
+        purge the entries here instead of letting them occupy the
+        bounded cache until eviction (which could otherwise evict a
+        still-in-flight task and crash its DRAFT with "no matching
+        target attention metadata").  The edge only invalidates tasks
+        whose draft was never published/dispatched or already fully
+        consumed, so purging cannot race an in-flight DRAFT batch.
+
+        Only active on the cloud side with scheduled edge-cloud draft;
+        a no-op everywhere else.
+        """
+        if not task_ids:
+            return
+        if not (
+            self._edge_cloud_enabled
+            and not is_edge_device()
+            and self._uses_scheduled_edge_cloud_draft()
+        ):
+            return
+        for task_id in task_ids:
+            if (
+                self._cloud_spec_decode_metadata_by_task.pop(task_id, None)
+                is not None
+            ):
+                logger.info(
+                    "Purged cloud draft metadata for invalidated "
+                    "task_id=%s (draft dropped on the edge)",
+                    task_id,
+                )
+            self._cloud_scheduler_output_by_task.pop(task_id, None)
+            # NOTE: the original fix (518616040) forgot this dict; its
+            # cloned positions tensors would otherwise linger until the
+            # bounded metadata cache evicts the task.
+            self._cloud_draft_position_state_by_task.pop(task_id, None)
+            self._eagle3_cloud_aux_hidden_states_by_task.pop(task_id, None)
 
     def _build_edge_cloud_draft_attn_metadata(
         self,

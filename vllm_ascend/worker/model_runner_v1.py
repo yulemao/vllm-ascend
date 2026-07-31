@@ -5152,6 +5152,13 @@ class NPUModelRunner(GPUModelRunner):
         The worker records (rather than waits for) the cloud->edge send,
         exactly like ``_execute_model_cloud``.
         """
+        # DRAFT batches bypass execute_model/_update_states on the cloud, so
+        # the purge hook there never runs for them.  Consume any piggybacked
+        # draft-metadata invalidations here instead; the call is a guarded
+        # no-op off the cloud path.
+        self._purge_invalidated_cloud_draft_metadata(
+            getattr(scheduler_output, "cloud_draft_invalidate_task_ids", None)
+        )
         spec_step_idx = int(scheduler_output.draft_step_idx or 0)
         # The edge carries rejection-corrected sampling state on the step-0
         # SchedulerOutput. Keeping it on the control plane avoids extra CPU

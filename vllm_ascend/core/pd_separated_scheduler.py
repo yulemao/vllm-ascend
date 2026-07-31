@@ -389,11 +389,20 @@ class PDSeparatedScheduler(Scheduler):
 
     def schedule(self) -> SchedulerOutput:
         scheduler_output = self._schedule_pd_separated()
-        # EMPTY batches are not broadcast to the workers, so keep the
-        # invalidations pending until a real batch can carry them.
-        if (
-            self._pending_cloud_draft_invalidations
-            and scheduler_output.batch_type != BatchType.EMPTY
+        # Only FIRST-segment batches are published to the cloud over PRE_OUT
+        # (the publish hook drops PL/DL/DRL tails), and only batches whose
+        # cloud-side execution runs the purge hook can deliver the
+        # invalidations.  EMPTY batches are not broadcast either.  Stamping
+        # any other batch type would silently discard the pending list, so
+        # keep the invalidations queued until a cloud-bound batch can carry
+        # them.
+        if self._pending_cloud_draft_invalidations and (
+            scheduler_output.batch_type
+            in (
+                BatchType.PREFILL_FIRST,
+                BatchType.DECODE_FIRST,
+                BatchType.DRAFT_FIRST,
+            )
         ):
             scheduler_output.cloud_draft_invalidate_task_ids = (
                 self._pending_cloud_draft_invalidations

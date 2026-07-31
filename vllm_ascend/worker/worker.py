@@ -70,7 +70,6 @@ from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import (
     ScheduledDraftTensorMeta,
-    _ec_sentinel_suffix,
     build_scheduled_draft_tensor_meta,
     edge_cloud_broadcast_recv,
     edge_cloud_broadcast_recv_scheduled_draft,
@@ -134,38 +133,6 @@ def _detect_has_residual(model_config) -> bool:
     # Default: most modern decoder models produce residual
     # Can be made more specific as more models are supported
     return True
-
-
-def _dbg_tensor_sums(tag: str, scheduler_output: "SchedulerOutput",
-                     tensors: dict[str, Any]) -> None:
-    """[DEBUG] Log per-key sums (and NaN row counts) of edge-cloud payloads.
-
-    Used to pinpoint where NaN first appears along the
-    edge-head -> cloud-middle -> edge-tail pipeline for a given batch.
-    """
-    try:
-        parts = []
-        for key, value in tensors.items():
-            if not isinstance(value, torch.Tensor):
-                continue
-            flat = value.float()
-            sums = flat.sum(dim=-1) if flat.dim() >= 2 else flat
-            nan_rows = int(torch.isnan(sums).sum())
-            parts.append(
-                f"{key}:sum={float(flat.sum()):.4f},"
-                f"nan_rows={nan_rows}/{sums.numel()}"
-                f"{_ec_sentinel_suffix(value, value.shape[0])}"
-            )
-        logger.info(
-            "[EC-DBG] %s batch=%s head=%s tokens=%s %s",
-            tag,
-            scheduler_output.batch_type,
-            scheduler_output.head_token,
-            scheduler_output.total_num_scheduled_tokens,
-            " ".join(parts),
-        )
-    except Exception:
-        logger.exception("[EC-DBG] %s failed", tag)
 
 
 class NPUWorker(WorkerBase):
@@ -927,7 +894,6 @@ class NPUWorker(WorkerBase):
             return output
 
         assert isinstance(output, IntermediateTensors)
-        _dbg_tensor_sums("edge-head-out", scheduler_output, output.tensors)
         # Edge-cloud with heterogeneous SP: aggregate SP shards to full
         # sequence before cross-PP send so cloud can re-chunk by its SP.
         if enable_sp() and (self.model_runner.edge_cloud_cfg.mode != "embedding_only"
@@ -1093,38 +1059,6 @@ class NPUWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
 
-        # [DEBUG] For verify batches, dump the cloud KV cache content health
-        # before the forward, to detect KV corruption by interleaved batches
-        # (draft chains / other requests' prefills) between prefill and verify.
-        # Per-block sums: blocks in use by the request (see gp-update blk_row0)
-        # should be finite; uninitialized free blocks may legitimately be NaN.
-        if scheduler_output.batch_type == BatchType.DECODE_FIRST:
-            try:
-                _kv = getattr(self.model_runner, "kv_caches", None) or []
-                logger.info(
-                    "[EC-DBG] cloud-kv head=%s kv_caches=%d shapes=%s",
-                    scheduler_output.head_token, len(_kv),
-                    [list(t.shape) for t in _kv[:2] if isinstance(t, torch.Tensor)],
-                )
-                for _li in {0, len(_kv) - 1}:
-                    if 0 <= _li < len(_kv) and isinstance(_kv[_li], torch.Tensor):
-                        _t = _kv[_li]
-                        # FIA layout: (2, num_blocks, block_size, kv_heads, head)
-                        _flat = _t.reshape(-1, _t.shape[1], _t[0][0].numel()) if _t.dim() >= 2 else None
-                        if _flat is None:
-                            continue
-                        _bsums = _flat.float().sum(dim=(0, 2))
-                        _nan_blocks = torch.isnan(_bsums).nonzero().flatten().tolist()
-                        logger.info(
-                            "[EC-DBG] cloud-kv head=%s layer=%d blocks=%d "
-                            "nan_blocks=%s block_sums=%s",
-                            scheduler_output.head_token, _li,
-                            int(_bsums.numel()), _nan_blocks[:16],
-                            [round(float(x), 1) for x in _bsums[:40]],
-                        )
-            except Exception:
-                logger.exception("[EC-DBG] cloud-kv failed")
-
         output = self.model_runner.execute_model(
             scheduler_output, intermediate_tensors,
             layer_slice_info=layer_slice_info,
@@ -1141,7 +1075,6 @@ class NPUWorker(WorkerBase):
             return output
 
         assert isinstance(output, IntermediateTensors)
-        _dbg_tensor_sums("cloud-mid-out", scheduler_output, output.tensors)
         # Edge-cloud with heterogeneous SP: aggregate SP shards to full
         # sequence before cross-PP send so edge can re-chunk by its SP.
         if enable_sp():
@@ -1185,11 +1118,6 @@ class NPUWorker(WorkerBase):
         for postprocess in comm_postprocess:
             postprocess()
         assert tensor_dict is not None
-        # [DEBUG] Draft payload as received on the cloud (decode channel).
-        try:
-            _dbg_tensor_sums("cloud-draft-recv", scheduler_output, tensor_dict)
-        except Exception:
-            logger.exception("[EC-DBG] cloud-draft-recv failed")
         output = self.model_runner._run_edge_cloud_draft_middle_segment(
             scheduler_output, IntermediateTensors(tensor_dict)
         )

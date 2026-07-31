@@ -1,7 +1,6 @@
 from typing import Any, Callable
 from dataclasses import dataclass
 import contextlib
-import os
 import threading
 
 import torch
@@ -120,60 +119,6 @@ def _hidden_channel_stream_ctx(
 # default consumer stream so it cannot be recycled before downstream
 # compute finishes. This fixes the allocation-stream ownership error
 # without serializing receive behind preceding compute.
-#
-# VLLM_ASCEND_EC_RECV_SENTINEL=1 (debug only, default off)
-#       Fill each recv buffer with a sentinel on the channel stream right
-#       before irecv (stream-ordered ahead of the DMA), then report rows
-#       still holding the sentinel after the wait:
-#         - rows still sentinel  -> the DMA never wrote them
-#           (message/size mismatch, not a race);
-#         - rows NaN but not sentinel -> the buffer was clobbered around
-#           the DMA (cross-stream/allocator race), or the wire itself
-#           carried NaN (sender-side in-flight overwrite).
-_EC_RECV_SENTINEL = (
-    os.environ.get("VLLM_ASCEND_EC_RECV_SENTINEL", "0") == "1"
-)
-# 2^17: exactly representable in bf16/fp16/fp32 and far outside the range
-# of real hidden-state values, so a surviving row is unambiguous.
-_EC_RECV_SENTINEL_VALUE = 131072.0
-
-if _EC_RECV_SENTINEL:
-    logger.info(
-        "[EC-DBG] recv experiment ON: sentinel prefill %.1f",
-        _EC_RECV_SENTINEL_VALUE,
-    )
-
-
-def _ec_sentinel_prefill(recv_view: torch.Tensor) -> None:
-    """[DEBUG] Fill a recv buffer with the sentinel before irecv.
-
-    Must be called INSIDE _hidden_channel_stream_ctx so the fill is
-    stream-ordered before the DMA on the same channel stream.
-    """
-    if not _EC_RECV_SENTINEL:
-        return
-    if (
-        isinstance(recv_view, torch.Tensor)
-        and recv_view.numel() > 0
-        and recv_view.is_floating_point()
-    ):
-        recv_view.fill_(_EC_RECV_SENTINEL_VALUE)
-
-
-def _ec_sentinel_suffix(tensor: Any, num_tokens: int) -> str:
-    """[DEBUG] Report rows still holding the sentinel after the wait."""
-    if not _EC_RECV_SENTINEL or not isinstance(tensor, torch.Tensor):
-        return ""
-    if (
-        tensor.numel() == 0
-        or not tensor.is_floating_point()
-        or tensor.dim() < 2
-    ):
-        return ""
-    used = tensor[:num_tokens].float()
-    sentinel_mask = (used == _EC_RECV_SENTINEL_VALUE).all(dim=-1)
-    sentinel_rows = sentinel_mask.nonzero().flatten().tolist()
-    return f",sentinel_rows={sentinel_rows[:8]}"
 
 
 def _record_recv_buffer_on_consumer_stream(tensor: torch.Tensor) -> None:
@@ -1144,19 +1089,6 @@ def edge_cloud_isend_tensor_dict(
                 value = value.contiguous()
             pieces.append(value)
         merged = torch.cat(pieces, dim=-1)
-        # [DEBUG] Wire payload as sent: per-row sums + NaN rows, so the
-        # sender/receiver contents can be compared message by message.
-        try:
-            _mf = merged.float()
-            _rs = _mf.sum(dim=-1) if _mf.dim() >= 2 else _mf
-            _nan_rows = torch.isnan(_rs).nonzero().flatten().tolist()
-            logger.info(
-                "[EC-DBG] ec-send ch=%s rows=%d nan_rows=%s row_sums=%s",
-                channel, int(_rs.numel()), _nan_rows[:8],
-                [round(float(x), 2) for x in _rs[:8]],
-            )
-        except Exception:
-            logger.exception("[EC-DBG] ec-send failed")
         # cat with multiple inputs always allocates a fresh contiguous buffer.
         assert merged.is_contiguous()
         # Belt-and-suspenders: verify the merged buffer's non-dim-0 shape
@@ -1204,20 +1136,6 @@ def edge_cloud_isend_tensor_dict(
             # only happens when upstream code returned a non-standard
             # layout, in which case we materialize once.
             value = value.contiguous()
-        # [DEBUG] Non-merge wire payload as sent (e2c direction uses this
-        # path): per-key rows + per-row sums so receiver content can be
-        # compared 1:1.
-        try:
-            _vf = value.float()
-            _rs = _vf.sum(dim=-1) if _vf.dim() >= 2 else _vf
-            logger.info(
-                "[EC-DBG] ec-send-nm ch=%s key=%s rows=%d nan=%d row_sums=%s",
-                channel, key, int(value.shape[0]),
-                int(torch.isnan(_rs).sum()),
-                [round(float(x), 2) for x in _rs[:8]],
-            )
-        except Exception:
-            logger.exception("[EC-DBG] ec-send-nm failed")
         with _hidden_channel_stream_ctx(channel, wait_for_default=True):
             handle = torch.distributed.isend(
                 value, dst=pp_group.ranks[dst], group=group
@@ -1357,7 +1275,6 @@ def edge_cloud_irecv_tensor_dict(
             # When SP is on, `merged` is padded up to a TP multiple; the
             # sender transmits only the actual num_tokens rows.
             recv_view = merged[:num_tokens]
-            _ec_sentinel_prefill(recv_view)
             handle = torch.distributed.irecv(
                 recv_view, src=pp_group.ranks[src], group=group
             )
@@ -1374,24 +1291,6 @@ def edge_cloud_irecv_tensor_dict(
         # The split callback runs after irecv has populated `merged`.
         def _split_into_dict() -> None:
             _record_recv_buffer_on_consumer_stream(merged)
-            # [DEBUG] Verify the wire payload as received: per-row sums and
-            # NaN rows of the merged recv buffer, before splitting.  This is
-            # the earliest point where the received data is guaranteed to
-            # have landed, so it isolates transport corruption from any
-            # downstream compute.
-            try:
-                _mf = merged[:num_tokens].float()
-                _rs = _mf.sum(dim=-1) if _mf.dim() >= 2 else _mf
-                _nan_rows = torch.isnan(_rs).nonzero().flatten().tolist()
-                logger.info(
-                    "[EC-DBG] ec-recv ch=%s rows=%d nan_rows=%s "
-                    "row_sums=%s%s",
-                    channel, int(_rs.numel()), _nan_rows[:8],
-                    [round(float(x), 2) for x in _rs[:8]],
-                    _ec_sentinel_suffix(merged, num_tokens),
-                )
-            except Exception:
-                logger.exception("[EC-DBG] ec-recv failed")
             split = _split_merged_buffer_into_dict(merged, ec_meta)
             tensor_dict.update(split)
 
@@ -1426,7 +1325,6 @@ def edge_cloud_irecv_tensor_dict(
                     )
                     if full_tensor.numel() > 0:
                         recv_view = full_tensor[:num_tokens]
-                        _ec_sentinel_prefill(recv_view)
                         handle = torch.distributed.irecv(
                             recv_view, src=pp_group.ranks[src], group=group
                         )
@@ -1543,15 +1441,6 @@ def edge_cloud_send_tensor_dict_scheduled_draft(
             )
             if not tensor.is_contiguous():
                 tensor = tensor.contiguous()
-            # [DEBUG] Draft payload as sent (decode channel message log).
-            try:
-                logger.info(
-                    "[EC-DBG] ec-send-draft ch=%s key=%s rows=%d sum=%.2f",
-                    channel, key, int(tensor.shape[0]),
-                    float(tensor.float().sum()),
-                )
-            except Exception:
-                logger.exception("[EC-DBG] ec-send-draft failed")
             with _hidden_channel_stream_ctx(channel, wait_for_default=True):
                 handle = torch.distributed.isend(
                     tensor,
@@ -1681,36 +1570,6 @@ def edge_cloud_broadcast_recv(
             for tensor in tensor_dict.values():
                 if isinstance(tensor, torch.Tensor):
                     _record_recv_buffer_on_consumer_stream(tensor)
-            # [DEBUG] Non-merge wire payload as received (post irecv-wait,
-            # pre TP-broadcast): per-key rows + NaN row count.
-            try:
-                _parts = []
-                for _k, _v in tensor_dict.items():
-                    if not isinstance(_v, torch.Tensor):
-                        continue
-                    _vf = _v.float()
-                    _rs = _vf.sum(dim=-1) if _vf.dim() >= 2 else _vf
-                    _nan_idx = torch.isnan(_rs).nonzero().flatten().tolist()
-                    _part = (
-                        f"{_k}:rows={_v.shape[0]},"
-                        f"nan={len(_nan_idx)}/{_rs.numel()}"
-                        f"{_ec_sentinel_suffix(_v, num_tokens)}"
-                    )
-                    # Small batches (verify/draft payloads): dump per-row
-                    # sums and NaN indices so the surviving rows can be
-                    # compared 1:1 against the sender's ec-send-nm rows.
-                    if _rs.numel() <= 8:
-                        _part += (
-                            f",nan_idx={_nan_idx},"
-                            f"sums={[round(float(x), 2) for x in _rs]}"
-                        )
-                    _parts.append(_part)
-                logger.info(
-                    "[EC-DBG] ec-recv-nm ch=%s tokens=%d %s",
-                    channel, num_tokens, " ".join(_parts),
-                )
-            except Exception:
-                logger.exception("[EC-DBG] ec-recv-nm failed")
             _, tensor_list = _split_tensor_dict(tensor_dict) if tensor_dict else (None, [])
             handles = []
             for tensor in tensor_list:
@@ -1928,7 +1787,6 @@ def edge_cloud_broadcast_recv_scheduled_draft(
                         device=value.device,
                     )
                     if tensor.numel() > 0:
-                        _ec_sentinel_prefill(tensor)
                         handle = torch.distributed.irecv(
                             tensor,
                             src=pp_group.ranks[src],

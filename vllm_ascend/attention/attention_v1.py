@@ -18,8 +18,6 @@
 from dataclasses import dataclass
 from enum import Enum
 
-from vllm.logger import logger
-
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
@@ -410,26 +408,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_dcp_pcp_tokens=None,
         draft_attn_metadatas=None,
     ):
-        # [DEBUG] Verify the graph-task update actually covers every layer:
-        # if the zip is empty/truncated (e.g. events/handles lists were never
-        # populated at capture, or the branch taken at runtime differs from
-        # capture time), the replay silently runs with warmup-time params and
-        # produces NaN hidden states.
-        try:
-            _gp = get_draft_graph_params() if _EXTRA_CTX.is_draft_model else get_graph_params()
-            logger.info(
-                "[EC-DBG] attn-update paged=%s sinks=%s num_tokens=%d "
-                "md_keys=%d params=%d handles=%d events=%d",
-                using_paged_attention(num_tokens, vllm_config),
-                bool(getattr(_EXTRA_CTX, "sinks", False)),
-                num_tokens,
-                len(forward_context.attn_metadata) if forward_context.attn_metadata else -1,
-                len(_gp.attn_params.get(num_tokens, [])) if _gp else -1,
-                len(_gp.handles.get(num_tokens, [])) if _gp else -1,
-                len(_gp.events.get(num_tokens, [])) if _gp else -1,
-            )
-        except Exception:
-            logger.exception("[EC-DBG] attn-update failed")
         if using_paged_attention(num_tokens, vllm_config):
             # Paged Attention update logic
             if _EXTRA_CTX.is_draft_model:

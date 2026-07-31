@@ -2812,23 +2812,6 @@ class NPUModelRunner(GPUModelRunner):
         # The draft needs the target hidden states of every scheduled token
         # (sample_hidden_states only covers the logits rows).
         draft_hidden_states = hidden_states[:scheduled_token_count].clone()
-        # [DEBUG] Per-row NaN accounting of the stashed target hidden states:
-        # tells us whether the NaN affects all rows (whole forward corrupted)
-        # or only the spec/draft rows (e.g. spec-position KV/attention issue).
-        try:
-            _row_sums = draft_hidden_states.float().sum(dim=-1)
-            _nan_rows = torch.isnan(_row_sums).nonzero().flatten().tolist()
-            logger.info(
-                "[EC-DBG] stash head=%s batch=%s rows=%d nan_rows=%s "
-                "row_sums_head=%s",
-                task_id,
-                scheduler_output.batch_type,
-                int(_row_sums.numel()),
-                _nan_rows[:8],
-                [round(float(x), 3) for x in _row_sums[:8]],
-            )
-        except Exception:
-            logger.exception("[EC-DBG] stash debug failed")
 
         # Snapshot the scheduled token ids so the first draft step can build
         # the shifted input ids (target ids shifted left by one, closed by
@@ -5266,30 +5249,6 @@ class NPUModelRunner(GPUModelRunner):
                 )
             finally:
                 forward_context.attn_metadata = original_attn_metadata
-            # [DEBUG] Record the attention params actually bound into the
-            # graph for this batch, to detect cross-batch param mixups
-            # (replay reading another request's seq_lens / block_table).
-            try:
-                _md = original_attn_metadata
-                if _md:
-                    _key = next(iter(_md))
-                    _first = _md[_key]
-                    _seq_lens = getattr(_first, "seq_lens", None)
-                    _blk = getattr(_first, "block_tables", None)
-                    if _blk is None:
-                        _blk = getattr(_first, "block_table", None)
-                    logger.info(
-                        "[EC-DBG] gp-update tokens=%d layers=%s..%s keys=%d "
-                        "seq_lens=%s blk_row0=%s",
-                        num_tokens_padded,
-                        layer_indices[0] if layer_indices else -1,
-                        layer_indices[-1] if layer_indices else -1,
-                        len(_md),
-                        _seq_lens.tolist() if isinstance(_seq_lens, torch.Tensor) else _seq_lens,
-                        (_blk[0, :6].tolist() if isinstance(_blk, torch.Tensor) and _blk.dim() >= 2 else None),
-                    )
-            except Exception:
-                logger.exception("[EC-DBG] gp-update debug failed")
             self._serialize_graph_params_update()
 
     def _serialize_graph_params_update(self) -> None:
@@ -6095,18 +6054,6 @@ class NPUModelRunner(GPUModelRunner):
             intermediate_tensors=intermediate_tensors,
             **model_kwargs,
         )
-        # [DEBUG] Record which execution path the cloud middle segment took
-        # (FULL graph replay vs eager) for this batch.
-        try:
-            logger.info(
-                "[EC-DBG] cloud-fwd graph=%s mode=%s desc=%s tokens=%d",
-                seg_c_graph,
-                forward_context.cudagraph_runtime_mode,
-                forward_context.batch_descriptor,
-                num_tokens_padded,
-            )
-        except Exception:
-            logger.exception("[EC-DBG] cloud-fwd failed")
         if seg_c_graph and not forward_context.capturing:
             self._update_full_graph_params_if_needed(
                 forward_context, num_tokens_padded, positions,
@@ -6208,25 +6155,6 @@ class NPUModelRunner(GPUModelRunner):
                         dst[:recv_len].copy_(v[:recv_len], non_blocking=True)
                     if recv_len < copy_len:
                         dst[recv_len:].zero_()
-                # [DEBUG] Same payload health log as the generic branch below.
-                try:
-                    _dbg_parts = []
-                    for k, _v in intermediate_tensors.items():
-                        v2 = self.intermediate_tensors[k]
-                        if not isinstance(v2, torch.Tensor):
-                            continue
-                        used = v2[:num_tokens].float()
-                        row_sums = used.sum(dim=-1) if used.dim() >= 2 else used
-                        nan_rows = int(torch.isnan(row_sums).sum())
-                        _dbg_parts.append(
-                            f"{k}:sum={float(used.sum()):.4f},nan_rows={nan_rows}/{row_sums.numel()}"
-                        )
-                    logger.info(
-                        "[EC-DBG] sync-slice role=%s tokens=%d %s",
-                        self.edge_cloud_cfg.role, num_tokens, " ".join(_dbg_parts),
-                    )
-                except Exception:
-                    logger.exception("[EC-DBG] sync-slice failed")
                 return IntermediateTensors(
                     {
                         k: v[:num_tokens]
@@ -6243,28 +6171,6 @@ class NPUModelRunner(GPUModelRunner):
                         dst[:recv_len].copy_(v[:recv_len], non_blocking=True)
                     if recv_len < copy_len:
                         dst[recv_len:].zero_()
-                # [DEBUG] Log the payload exactly as consumed by this segment,
-                # so we can tell whether NaN arrived over the channel or was
-                # produced by the local forward.
-                try:
-                    _dbg_parts = []
-                    for k, _v in intermediate_tensors.items():
-                        v2 = self.intermediate_tensors[k]
-                        if not isinstance(v2, torch.Tensor):
-                            continue
-                        copy_len = (num_tokens + tp - 1) // tp if enable_sp() else num_tokens
-                        used = v2[:copy_len].float()
-                        row_sums = used.sum(dim=-1) if used.dim() >= 2 else used
-                        nan_rows = int(torch.isnan(row_sums).sum())
-                        _dbg_parts.append(
-                            f"{k}:sum={float(used.sum()):.4f},nan_rows={nan_rows}/{row_sums.numel()}"
-                        )
-                    logger.info(
-                        "[EC-DBG] sync-slice role=%s tokens=%d %s",
-                        self.edge_cloud_cfg.role, num_tokens, " ".join(_dbg_parts),
-                    )
-                except Exception:
-                    logger.exception("[EC-DBG] sync-slice failed")
 
         return IntermediateTensors(
             {

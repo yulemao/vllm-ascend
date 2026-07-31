@@ -23,15 +23,20 @@ Regression coverage for the edge-side MTP draft deadlock fixes:
   * ``_run_edge_cloud_draft_last_segment`` drains (recv already done by the
     caller, skip tail compute, return a token-less placeholder) when the draft
     context is gone, instead of raising.
-  * Every middle prefill chunk runs a complete draft chain to populate MTP KV,
-    while its proposals are discarded and no target verify placeholder is
-    created.
+  * Every middle prefill chunk runs a single-step draft chain: step 0 already
+    runs the drafter over the whole chunk and populates the MTP KV, while
+    follow-up steps would only produce discarded proposals whose KV slots
+    are overwritten by the next chunk's step 0.  Chain-termination checks
+    (scheduler task bookkeeping, worker context pop, engine pre-out close /
+    retained-block release) therefore key off the per-chain length derived
+    from ``is_last_prefill_chunk`` instead of ``num_spec_tokens``.
 """
 
 from collections import deque
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from vllm.v1.core.sched.output import (
     BatchType,
@@ -242,14 +247,111 @@ class TestMidPrefillDraftChain:
         target.draft_output_req_ids = ()
         s._pregenerate_draft_chain(target)
 
+        # Mid-prefill chains are single-step: step 0 alone populates the
+        # MTP KV for the whole chunk; follow-up steps would only produce
+        # discarded proposals.
+        assert len(s.drafts_first_ready) == 1
+        assert s.drafts_first_ready[0].draft_step_idx == 0
+        assert s.drafts_first_ready[0].is_last_prefill_chunk is False
+        assert s.drafts_first_ready[0].draft_output_req_ids == ()
+
+    def test_pregenerates_last_chunk_full_chain(self):
+        s = _make_bare_scheduler()
+        request = MagicMock()
+        request.is_finished.return_value = False
+        s.requests["req-0"] = request
+        s._uses_async_scheduled_mtp_placeholders = MagicMock(
+            return_value=True
+        )
+
+        target = _make_real_output()
+        target.is_last_prefill_chunk = True
+        target.draft_output_req_ids = ("req-0",)
+        s._pregenerate_draft_chain(target)
+
         assert len(s.drafts_first_ready) == s.num_spec_tokens
+        assert [
+            output.draft_step_idx for output in s.drafts_first_ready
+        ] == list(range(s.num_spec_tokens))
         assert all(
-            getattr(output, "is_last_prefill_chunk", True) is False
+            output.is_last_prefill_chunk is True
             for output in s.drafts_first_ready
         )
-        assert all(
-            output.draft_output_req_ids == ()
-            for output in s.drafts_first_ready
+
+    def test_mid_chunk_chain_discards_task_at_step_zero(self):
+        """_enqueue_next_draft_first must drop the pre-generated task record
+        when the single-step mid-prefill chain completes, not after
+        num_spec_tokens steps."""
+        s = _make_bare_scheduler()
+        s._pregenerated_draft_task_ids.add("task-0")
+        s._pregenerated_draft_req_ids["task-0"] = {"req-0"}
+        tail = _make_draft_last(step=0)
+        tail.is_last_prefill_chunk = False
+        tail.draft_output_req_ids = ()
+
+        assert s._enqueue_next_draft_first(tail) is False
+        assert "task-0" not in s._pregenerated_draft_task_ids
+        assert "task-0" not in s._pregenerated_draft_req_ids
+
+    def test_last_chunk_chain_keeps_task_until_final_step(self):
+        s = _make_bare_scheduler()
+        s._pregenerated_draft_task_ids.add("task-0")
+        s._pregenerated_draft_req_ids["task-0"] = {"req-0"}
+
+        assert s._enqueue_next_draft_first(_make_draft_last(step=0)) is False
+        assert "task-0" in s._pregenerated_draft_task_ids
+
+        final = _make_draft_last(step=s.num_spec_tokens - 1)
+        assert s._enqueue_next_draft_first(final) is False
+        assert "task-0" not in s._pregenerated_draft_task_ids
+        assert "task-0" not in s._pregenerated_draft_req_ids
+
+    def test_engine_closes_mid_prefill_chain_at_step_zero(self):
+        """A mid-prefill DRAFT_LAST completes its chain at step 0: the
+        pre-out stream closes and retained KV blocks are released."""
+        from vllm_ascend.patch.platform.patch_engine_core import (
+            _advance_edge_cloud_draft,
+        )
+
+        engine = MagicMock()
+        engine.use_spec_decode = True
+        engine.scheduler.num_spec_tokens = 3
+        completed = _make_real_output(BatchType.DRAFT_LAST)
+        completed.draft_task_id = "task-0"
+        completed.draft_step_idx = 0
+        completed.is_last_prefill_chunk = False
+        completed.draft_output_req_ids = ()
+
+        _advance_edge_cloud_draft(engine, completed, MagicMock())
+
+        engine._close_draft_pre_out.assert_called_once_with("task-0")
+        engine.scheduler.release_draft_retained_blocks.assert_called_once_with(
+            "task-0"
+        )
+
+    def test_engine_keeps_last_chunk_chain_open_until_final_step(self):
+        from vllm_ascend.patch.platform.patch_engine_core import (
+            _advance_edge_cloud_draft,
+        )
+
+        engine = MagicMock()
+        engine.use_spec_decode = True
+        engine.scheduler.num_spec_tokens = 3
+        completed = _make_real_output(BatchType.DRAFT_LAST)
+        completed.draft_task_id = "task-0"
+        completed.draft_step_idx = 0
+        completed.is_last_prefill_chunk = True
+
+        _advance_edge_cloud_draft(engine, completed, MagicMock())
+
+        engine._close_draft_pre_out.assert_not_called()
+        engine.scheduler.release_draft_retained_blocks.assert_not_called()
+
+        completed.draft_step_idx = 2
+        _advance_edge_cloud_draft(engine, completed, MagicMock())
+        engine._close_draft_pre_out.assert_called_once_with("task-0")
+        engine.scheduler.release_draft_retained_blocks.assert_called_once_with(
+            "task-0"
         )
 
     def test_mid_chunk_draft_tail_does_not_prepare_verify(self):
@@ -483,3 +585,76 @@ class TestRunDraftLastSegmentDrain:
         )
         assert isinstance(result, ModelRunnerOutput)
         assert result.req_ids == ["req-0"]
+
+
+# ------------------------------------------------------------------ #
+# Test: mid-prefill chains are single-step (worker side)             #
+# ------------------------------------------------------------------ #
+
+
+class TestMidPrefillSingleStepChainWorker:
+    """_run_edge_cloud_draft_last_segment completes a mid-prefill chain at
+    step 0 (context popped, proposals discarded) instead of advancing it
+    toward num_spec_tokens steps."""
+
+    def _make_runner(self, *, is_last_chunk):
+        from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.num_spec_tokens = 3
+        runner.uses_mrope = False
+        runner.use_async_scheduling = True
+        runner.speculative_config = MagicMock(method="qwen3_5_mtp")
+        runner.vllm_config = MagicMock()
+        runner._edge_cloud_draft_segments = {
+            "e": MagicMock(return_value=torch.zeros(1, 4))
+        }
+        runner._sync_edge_cloud_draft_intermediate_tensors = MagicMock(
+            side_effect=lambda num_tokens, tensors: tensors
+        )
+        runner._compute_edge_cloud_draft_token_ids = MagicMock(
+            return_value=torch.zeros(1, dtype=torch.long)
+        )
+        context = {
+            "req_ids": ["req-0"],
+            "is_last_prefill_chunk": is_last_chunk,
+            "draft_output_req_ids": ("req-0",) if is_last_chunk else (),
+            "sample_row_indices": torch.tensor([0]),
+        }
+        runner._pending_edge_cloud_draft_contexts = {"task-0": context}
+        return runner, context
+
+    @staticmethod
+    def _run(runner):
+        so = MagicMock()
+        so.draft_task_id = "task-0"
+        so.draft_step_idx = 0
+        so.num_scheduled_tokens = {"req-0": 1}
+        intermediate = MagicMock()
+        intermediate.tensors = {
+            "positions": torch.zeros(1, dtype=torch.long)
+        }
+        with patch(
+            "vllm_ascend.worker.model_runner_v1.set_ascend_forward_context"
+        ):
+            return runner._run_edge_cloud_draft_last_segment(
+                so, intermediate
+            )
+
+    def test_mid_prefill_chain_completes_at_step_zero(self):
+        runner, context = self._make_runner(is_last_chunk=False)
+        output = self._run(runner)
+
+        # The single-step chain is done: the context is released and no
+        # draft tokens are published to a target verify batch.
+        assert "task-0" not in runner._pending_edge_cloud_draft_contexts
+        assert getattr(runner, "_draft_token_ids", None) is None
+        assert output.req_ids == ["req-0"]
+
+    def test_last_chunk_chain_advances_past_step_zero(self):
+        runner, context = self._make_runner(is_last_chunk=True)
+        self._run(runner)
+
+        # A full chain keeps its context and advances to the next step.
+        assert "task-0" in runner._pending_edge_cloud_draft_contexts
+        assert context["draft_step_idx"] == 1

@@ -480,9 +480,16 @@ def _advance_edge_cloud_draft(
     if batch_type != BatchType.DRAFT_LAST:
         return
     draft_step_idx = int(completed_scheduler_output.draft_step_idx or 0)
-    if draft_step_idx + 1 >= getattr(
-        self.scheduler, "num_spec_tokens", 0
-    ):
+    # Mid-prefill draft chains are single-step (KV warmup only, see
+    # PDSeparatedScheduler._draft_chain_length): step 0 already completes
+    # them, so the pre-out stream must close and the retained KV blocks
+    # must be released here rather than after num_spec_tokens steps.
+    chain_length = (
+        getattr(self.scheduler, "num_spec_tokens", 0)
+        if getattr(completed_scheduler_output, "is_last_prefill_chunk", True)
+        else 1
+    )
+    if draft_step_idx + 1 >= chain_length:
         self._close_draft_pre_out(
             completed_scheduler_output.draft_task_id
         )

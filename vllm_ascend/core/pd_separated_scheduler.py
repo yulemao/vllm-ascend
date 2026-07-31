@@ -1460,6 +1460,20 @@ class PDSeparatedScheduler(Scheduler):
             getattr(hf_config, "model_type", "")
         ).lower()
 
+    def _draft_chain_length(self, scheduler_output: SchedulerOutput) -> int:
+        """Number of draft steps in the chain spawned by this tail batch.
+
+        Mid-prefill chunks only warm the MTP KV cache: their step-0 draft
+        pass already runs the drafter over the whole chunk, while the
+        follow-up steps' proposals are discarded (their KV slots are
+        overwritten by the next chunk's step 0).  Their chain is therefore
+        a single step; every chain-termination check must agree with this
+        length (edge worker, cloud worker, and EngineCore).
+        """
+        if getattr(scheduler_output, "is_last_prefill_chunk", True):
+            return self.num_spec_tokens
+        return 1
+
     def _pregenerate_draft_chain(
         self, target_tail: SchedulerOutput
     ) -> None:
@@ -1487,7 +1501,14 @@ class PDSeparatedScheduler(Scheduler):
         if not task_id:
             return
 
-        for step_idx in range(self.num_spec_tokens):
+        # Mid-prefill chains only warm the MTP KV cache: step 0 already runs
+        # the drafter over the whole chunk, and the follow-up steps'
+        # proposals would be discarded (their KV slots are overwritten by
+        # the next chunk's step 0).  Generate a single-step chain for them
+        # and keep every chain-termination check in sync with this length
+        # (see _draft_chain_length).
+        chain_length = self._draft_chain_length(target_tail)
+        for step_idx in range(chain_length):
             draft_first = replace(
                 target_tail,
                 batch_type=BatchType.DRAFT_FIRST,
@@ -1521,7 +1542,7 @@ class PDSeparatedScheduler(Scheduler):
         logger.info(
             "[PD] pre-generated async MTP placeholders task_id=%s steps=%d",
             task_id,
-            self.num_spec_tokens,
+            chain_length,
         )
 
     def finalize_pre_generated_draft_first(
@@ -1622,12 +1643,16 @@ class PDSeparatedScheduler(Scheduler):
         draft_step_idx = int(draft_last.draft_step_idx or 0)
         next_step_idx = draft_step_idx + 1
         task_id = draft_last.draft_task_id
+        # Mid-prefill chains are single-step (KV warmup only), so they
+        # complete -- and their pre-generated task record is dropped -- at
+        # step 0 rather than after num_spec_tokens steps.
+        chain_length = self._draft_chain_length(draft_last)
         if task_id in self._pregenerated_draft_task_ids:
-            if next_step_idx >= self.num_spec_tokens:
+            if next_step_idx >= chain_length:
                 self._pregenerated_draft_task_ids.discard(task_id)
                 self._pregenerated_draft_req_ids.pop(task_id, None)
             return False
-        if next_step_idx >= self.num_spec_tokens:
+        if next_step_idx >= chain_length:
             return False
         if task_id is None:
             raise RuntimeError("DRAFT_LAST missing draft_task_id")

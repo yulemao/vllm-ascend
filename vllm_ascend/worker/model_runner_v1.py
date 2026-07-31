@@ -3369,7 +3369,16 @@ class NPUModelRunner(GPUModelRunner):
         draft_steps.append(draft_token_ids.clone())
         next_step_idx = draft_step_idx + 1
         completed_draft_token_ids = None
-        if next_step_idx < self.num_spec_tokens:
+        # Mid-prefill chains are single-step: step 0 already populated the
+        # draft KV for the whole chunk and the proposals are discarded, so
+        # the chain completes here (see PDSeparatedScheduler
+        # ._draft_chain_length, which only queues step 0 for them).
+        chain_length = (
+            self.num_spec_tokens
+            if context.get("is_last_prefill_chunk", True)
+            else 1
+        )
+        if next_step_idx < chain_length:
             context["draft_step_idx"] = next_step_idx
             # DRAFT_LAST completion is the readiness signal for the next
             # step. PDSeparatedScheduler derives the next DRAFT_FIRST locally
@@ -3412,7 +3421,7 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         req_ids = list(context["req_ids"])
-        if next_step_idx >= self.num_spec_tokens:
+        if next_step_idx >= chain_length:
             # Native async spec-decode semantics: keep the real draft token
             # IDs in the worker.  The already queued next target batch carries
             # fixed-length placeholders and _prepare_input_ids scatters this
@@ -5256,9 +5265,21 @@ class NPUModelRunner(GPUModelRunner):
                 "Edge-cloud draft middle segment returned no intermediates"
             )
 
+        # Mid-prefill chains are single-step (see PDSeparatedScheduler
+        # ._draft_chain_length): their per-task metadata must be released at
+        # step 0.  is_last_prefill_chunk is a dynamic SchedulerOutput
+        # attribute set on the edge before publish; fall back to the
+        # equally specific empty draft_output_req_ids marker in case it did
+        # not survive the trip.
+        is_mid_prefill_chain = not getattr(
+            scheduler_output, "is_last_prefill_chunk", True
+        ) or getattr(scheduler_output, "draft_output_req_ids", None) == ()
+        chain_length = (
+            1 if is_mid_prefill_chain else self.num_spec_tokens
+        )
         if (
             scheduler_output.draft_task_id is not None
-            and spec_step_idx + 1 >= self.num_spec_tokens
+            and spec_step_idx + 1 >= chain_length
         ):
             self._cloud_spec_decode_metadata_by_task.pop(
                 scheduler_output.draft_task_id, None

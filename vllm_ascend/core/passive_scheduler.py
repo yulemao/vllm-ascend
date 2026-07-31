@@ -660,6 +660,42 @@ class PassiveScheduler:
         """
         return self._build_batch(self.ready_drafts.popleft())
 
+    def _pick_decode_or_draft_by_arrival(self) -> ScheduledBatch:
+        """Pick between the head decode and head draft by arrival order.
+
+        DECODE_FIRST and DRAFT_FIRST payloads share the DECODE hidden
+        channel, and the edge publishes control messages in exactly the
+        order its data plane requires.  Letting a later-arrived draft
+        overtake an earlier decode (unconditional draft priority) makes
+        the cloud post a recv for the draft payload while the edge's
+        next in-flight message is a decode payload of a different size;
+        the cloud then never produces the decode response the edge is
+        blocked on, and the edge never sends the draft payload the cloud
+        is blocked on -- a cross-side deadlock.  Fall back to draft
+        priority only when an arrival seq is unavailable.
+
+        Caller must ensure at least one of the two queues is non-empty.
+        """
+        decode_seq = (
+            self._arrival_seq(self.ready_decodes[0])
+            if self.ready_decodes
+            else None
+        )
+        draft_seq = (
+            self._arrival_seq(self.ready_drafts[0])
+            if self.ready_drafts
+            else None
+        )
+        if (
+            decode_seq is not None
+            and draft_seq is not None
+            and decode_seq < draft_seq
+        ):
+            return self._pick_decode_batch()
+        if self.ready_drafts:
+            return self._pick_draft_batch()
+        return self._pick_decode_batch()
+
     def _ready_prefill_is_sliced_first_block(self) -> bool:
         if not self.ready_prefills:
             return False
@@ -669,24 +705,39 @@ class PassiveScheduler:
     def _schedule_by_arrival(self) -> ScheduledBatch:
         prefill_seq = self._arrival_seq(self.ready_prefills[0])
         decode_seq = self._arrival_seq(self.ready_decodes[0])
-        if prefill_seq is None or decode_seq is None:
+        draft_seq = (
+            self._arrival_seq(self.ready_drafts[0])
+            if self.ready_drafts
+            else None
+        )
+        # Decodes and drafts share the DECODE hidden channel, so the
+        # "channel work" competing with prefill slice-0 is whichever of
+        # the two arrived first -- an earlier draft must not be
+        # overtaken by a later decode either (same deadlock hazard as
+        # the reverse, see _pick_decode_or_draft_by_arrival).
+        channel_seq = decode_seq
+        if draft_seq is not None and (
+            channel_seq is None or draft_seq < channel_seq
+        ):
+            channel_seq = draft_seq
+        if prefill_seq is None or channel_seq is None:
             self.cloud_scheduling_state = CloudSchedulingState.EXPECT_EXECUTE_DECODE_OR_DRAFT
             self._start_prefill_middle_throttle()
             return self._build_batch(self.ready_prefills.popleft())
-        if decode_seq < prefill_seq:
+        if channel_seq < prefill_seq:
             logger.info(
-                "[PD-PASSIVE] Decode arrived before prefill slice-0: "
-                "decode_seq=%d, prefill_seq=%d",
-                decode_seq,
+                "[PD-PASSIVE] Decode/draft arrived before prefill slice-0: "
+                "channel_seq=%d, prefill_seq=%d",
+                channel_seq,
                 prefill_seq,
             )
             self._clear_prefill_middle_throttle()
-            return self._build_batch(self.ready_decodes.popleft())
+            return self._pick_decode_or_draft_by_arrival()
         logger.info(
-            "[PD-PASSIVE] Prefill slice-0 arrived before decode: "
-            "prefill_seq=%d, decode_seq=%d",
+            "[PD-PASSIVE] Prefill slice-0 arrived before decode/draft: "
+            "prefill_seq=%d, channel_seq=%d",
             prefill_seq,
-            decode_seq,
+            channel_seq,
         )
         self.cloud_scheduling_state = CloudSchedulingState.EXPECT_EXECUTE_DECODE_OR_DRAFT
         self._start_prefill_middle_throttle()
@@ -715,27 +766,20 @@ class PassiveScheduler:
                 ):
                     self._start_prefill_middle_throttle()
                 return self._pick_prefill_batch()
-            # No Prefill: callback to Draft (priority) or Decode
-            if self.ready_drafts:
+            # No Prefill: callback to Decode/Draft.  Arrival order is
+            # mandatory here (shared DECODE channel), not a preference.
+            if self.ready_drafts or self.ready_decodes:
                 self._clear_prefill_middle_throttle()
-                return self._pick_draft_batch()
-            if self.ready_decodes:
-                self._clear_prefill_middle_throttle()
-                return self._pick_decode_batch()
+                return self._pick_decode_or_draft_by_arrival()
         else:  # EXPECT_EXECUTE_DECODE_OR_DRAFT
-            # Draft priority > Decode
-            if self.ready_drafts:
+            # Decode/Draft in arrival order (shared DECODE channel --
+            # see _pick_decode_or_draft_by_arrival).
+            if self.ready_drafts or self.ready_decodes:
                 self.cloud_scheduling_state = (
                     CloudSchedulingState.EXPECT_EXECUTE_PREFILL
                 )
                 self._clear_prefill_middle_throttle()
-                return self._pick_draft_batch()
-            if self.ready_decodes:
-                self.cloud_scheduling_state = (
-                    CloudSchedulingState.EXPECT_EXECUTE_PREFILL
-                )
-                self._clear_prefill_middle_throttle()
-                return self._pick_decode_batch()
+                return self._pick_decode_or_draft_by_arrival()
             # No Draft/Decode: callback to Prefill.  Stay in the current
             # state — the next schedule() call will check for drafts
             # again at its earliest opportunity.

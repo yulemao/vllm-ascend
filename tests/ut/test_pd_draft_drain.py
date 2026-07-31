@@ -23,6 +23,9 @@ Regression coverage for the edge-side MTP draft deadlock fixes:
   * ``_run_edge_cloud_draft_last_segment`` drains (recv already done by the
     caller, skip tail compute, return a token-less placeholder) when the draft
     context is gone, instead of raising.
+  * Every middle prefill chunk runs a complete draft chain to populate MTP KV,
+    while its proposals are discarded and no target verify placeholder is
+    created.
 """
 
 from collections import deque
@@ -30,7 +33,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from vllm.v1.core.sched.output import BatchType, HiddenChannelType
+from vllm.v1.core.sched.output import (
+    BatchType,
+    HiddenChannelType,
+    SchedulerOutput,
+)
 
 
 # ------------------------------------------------------------------ #
@@ -72,6 +79,8 @@ def _make_draft_first(task_id="task-0", req_id="req-0", step=0):
     so.parent_req_id = req_id
     so.num_accepted_tokens = None
     so.valid_sampled_token_count = None
+    so.is_last_prefill_chunk = True
+    so.draft_output_req_ids = (req_id,)
     return so
 
 
@@ -84,6 +93,21 @@ def _make_draft_last(task_id="task-0", req_id="req-0", step=0):
     so.hidden_channel = HiddenChannelType.DECODE
     so.num_scheduled_tokens = {req_id: 1}
     so.parent_req_id = req_id
+    so.is_last_prefill_chunk = True
+    so.draft_output_req_ids = (req_id,)
+    return so
+
+
+def _make_real_output(
+    batch_type=BatchType.PREFILL_LAST,
+    task_id="task-0",
+    req_id="req-0",
+):
+    so = SchedulerOutput.make_empty()
+    so.batch_type = batch_type
+    so.head_token = task_id
+    so.num_scheduled_tokens = {req_id: 8}
+    so.total_num_scheduled_tokens = 8
     return so
 
 
@@ -181,6 +205,137 @@ class TestDraftFirstLastAlternation:
         s._force_draft_last = False
         s.drafts_last_ready.clear()
         assert s._can_schedule_draft_first() is True
+
+
+class TestMidPrefillDraftChain:
+    """Every chunk warms MTP KV, but only the last chunk may seed verify."""
+
+    def test_pick_mid_prefill_tail_starts_draft_chain(self):
+        s = _make_bare_scheduler()
+        target = _make_real_output()
+        flight = MagicMock()
+        flight.is_last_chunk = False
+        s.prefills_last_ready = deque([target])
+        s._prefill_flight_by_token = {target.head_token: flight}
+        s.chunk_prefill_first = []
+        s._validate_prefill_tail_channel = MagicMock()
+        s._pregenerate_draft_chain = MagicMock()
+
+        result = s._pick_prefill_last_batch()
+
+        assert result is target
+        assert result.is_last_prefill_chunk is False
+        assert result.draft_output_req_ids == ()
+        s._pregenerate_draft_chain.assert_called_once_with(target)
+
+    def test_pregenerates_mid_chunk_and_preserves_marker(self):
+        s = _make_bare_scheduler()
+        request = MagicMock()
+        request.is_finished.return_value = False
+        s.requests["req-0"] = request
+        s._uses_async_scheduled_mtp_placeholders = MagicMock(
+            return_value=True
+        )
+
+        target = _make_real_output()
+        target.is_last_prefill_chunk = False
+        target.draft_output_req_ids = ()
+        s._pregenerate_draft_chain(target)
+
+        assert len(s.drafts_first_ready) == s.num_spec_tokens
+        assert all(
+            getattr(output, "is_last_prefill_chunk", True) is False
+            for output in s.drafts_first_ready
+        )
+        assert all(
+            output.draft_output_req_ids == ()
+            for output in s.drafts_first_ready
+        )
+
+    def test_mid_chunk_draft_tail_does_not_prepare_verify(self):
+        s = _make_bare_scheduler()
+        request = MagicMock()
+        request.is_finished.return_value = False
+        s.requests["req-0"] = request
+        tail = _make_draft_last()
+        tail.is_last_prefill_chunk = False
+        tail.draft_output_req_ids = ()
+        s.drafts_last_ready.append(tail)
+        s._force_draft_last = True
+        s._validate_draft_tail_channel = MagicMock()
+        s._start_decode_or_draft_first_only_window = MagicMock()
+        s._prepare_next_decode_first_placeholder = MagicMock()
+
+        assert s._pick_draft_last_batch() is tail
+        s._prepare_next_decode_first_placeholder.assert_not_called()
+
+    def test_engine_advances_mid_prefill_draft(self):
+        from vllm_ascend.patch.platform.patch_engine_core import (
+            _advance_edge_cloud_draft,
+        )
+
+        engine = MagicMock()
+        engine.use_spec_decode = True
+        finalized = _make_real_output(BatchType.DRAFT_FIRST)
+        engine.scheduler.finalize_pre_generated_draft_first.return_value = (
+            finalized
+        )
+        completed = _make_real_output()
+        completed.is_last_prefill_chunk = False
+        model_output = MagicMock()
+        model_output.edge_cloud_draft_state = {
+            "draft_task_id": completed.head_token,
+            "draft_step_idx": 0,
+        }
+        model_output.sampled_token_ids = [[]]
+
+        _advance_edge_cloud_draft(engine, completed, model_output)
+
+        engine.scheduler.finalize_pre_generated_draft_first.assert_called_once_with(
+            draft_task_id=completed.head_token,
+            num_accepted_tokens=[0],
+            valid_sampled_token_count=[0],
+        )
+        engine._release_deferred_draft_pre_out.assert_called_once_with(
+            completed.head_token
+        )
+        engine.scheduler.enqueue_draft_first.assert_not_called()
+
+    def test_registers_worker_created_fallback_draft(self):
+        from vllm_ascend.patch.platform.patch_engine_core import (
+            _register_edge_cloud_draft_parent,
+        )
+
+        engine = MagicMock()
+        engine.use_spec_decode = True
+        engine._uses_scheduled_edge_cloud_draft.return_value = True
+        completed = _make_real_output()
+        model_output = MagicMock()
+        model_output.edge_cloud_draft_state = {
+            "draft_task_id": completed.head_token,
+            "draft_step_idx": 0,
+        }
+
+        _register_edge_cloud_draft_parent(engine, completed, model_output)
+
+        engine.scheduler.register_edge_cloud_draft_task.assert_called_once_with(
+            completed.head_token, {"req-0"}
+        )
+
+    def test_does_not_register_without_worker_draft_state(self):
+        from vllm_ascend.patch.platform.patch_engine_core import (
+            _register_edge_cloud_draft_parent,
+        )
+
+        engine = MagicMock()
+        engine.use_spec_decode = True
+        engine._uses_scheduled_edge_cloud_draft.return_value = True
+        completed = _make_real_output()
+        model_output = MagicMock(spec=[])
+
+        _register_edge_cloud_draft_parent(engine, completed, model_output)
+
+        engine.scheduler.register_edge_cloud_draft_task.assert_not_called()
 
 
 # ------------------------------------------------------------------ #

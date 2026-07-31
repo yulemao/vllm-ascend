@@ -420,11 +420,12 @@ def _advance_edge_cloud_draft(
         return
 
     batch_type = completed_scheduler_output.batch_type
-    is_target_tail = batch_type == BatchType.DECODE_LAST or (
-        batch_type == BatchType.PREFILL_LAST
-        and getattr(
-            completed_scheduler_output, "is_last_prefill_chunk", True
-        )
+    # Every prefill chunk must run the drafter to populate the MTP KV cache.
+    # Mid-chunk sampled/draft tokens are discarded by the worker, but their
+    # independently scheduled draft chain still needs to be finalized here.
+    is_target_tail = batch_type in (
+        BatchType.PREFILL_LAST,
+        BatchType.DECODE_LAST,
     )
     if is_target_tail:
         state = getattr(model_output, "edge_cloud_draft_state", None)
@@ -549,9 +550,11 @@ def _clear_pending_edge_cloud_draft_for_finished_requests(self) -> None:
 
 
 def _register_edge_cloud_draft_parent(
-    self, scheduler_output: SchedulerOutput
+    self,
+    scheduler_output: SchedulerOutput,
+    model_output: ModelRunnerOutput,
 ) -> None:
-    """Register a deferred draft locally before applying its parent output."""
+    """Retain a parent request when its worker created a draft task."""
     if not getattr(self, "use_spec_decode", False):
         return
     if not self._uses_scheduled_edge_cloud_draft():
@@ -561,18 +564,22 @@ def _register_edge_cloud_draft_parent(
         BatchType.DECODE_LAST,
     ):
         return
-    if (
-        scheduler_output.batch_type == BatchType.PREFILL_LAST
-        and not getattr(scheduler_output, "is_last_prefill_chunk", True)
-    ):
+    # Pregeneration is only an optimization and can be skipped while another
+    # draft chain occupies the local queue.  The worker state is authoritative:
+    # _advance_edge_cloud_draft() will enqueue a fallback chain whenever this
+    # state exists, so its parent KV must be retained even without a
+    # pre-generated SchedulerOutput.
+    state = getattr(model_output, "edge_cloud_draft_state", None)
+    if state is None:
         return
-    task_id = getattr(scheduler_output, "head_token", None)
+    task_id = state.get("draft_task_id")
+    parent_task_id = getattr(scheduler_output, "head_token", None)
+    if task_id != parent_task_id:
+        raise RuntimeError(
+            "Edge-cloud draft parent task mismatch: "
+            f"scheduler={parent_task_id}, worker={task_id}"
+        )
     req_ids = set(scheduler_output.num_scheduled_tokens)
-    # Skip registration when the parent's draft chain was never created
-    # (e.g. pregeneration skipped): nothing would release the retention.
-    has_task = getattr(self.scheduler, "has_deferred_draft_task", None)
-    if has_task is not None and not has_task(task_id):
-        return
     register = getattr(
         self.scheduler, "register_edge_cloud_draft_task", None
     )
@@ -670,7 +677,7 @@ def _patched_step(self):
     # during the model execution.
     # Register the deferred draft before abort/model completion can free
     # requests referenced by this parent batch.
-    self._register_edge_cloud_draft_parent(scheduler_output)
+    self._register_edge_cloud_draft_parent(scheduler_output, model_output)
     self._process_aborts_queue()
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output
@@ -812,7 +819,7 @@ def _patched_step_with_batch_queue(self):
 
     # Register the deferred draft before abort/model completion can free
     # requests referenced by this parent batch.
-    self._register_edge_cloud_draft_parent(scheduler_output)
+    self._register_edge_cloud_draft_parent(scheduler_output, model_output)
     self._process_aborts_queue()
     engine_core_outputs = self.scheduler.update_from_output(
         scheduler_output, model_output

@@ -1264,19 +1264,33 @@ class PDSeparatedScheduler(Scheduler):
         assert so.batch_type == BatchType.PREFILL_LAST, (
             f"prefills_last_ready expects PREFILL_LAST, got {so.batch_type}"
         )
-        # [ascend insert] Mark whether this PL is the request's last
-        # prefill chunk.  Mid-chunk PL must not sample: prefill is still
-        # incomplete, and the would-be sampled token actually predicts a
-        # prompt token belonging to the next chunk.  sample_tokens() reads
-        # this flag to skip sampling, which also avoids decrementing
-        # num_output_placeholders (only incremented for the last chunk)
-        # below zero.  The flight is still in the map here; it is popped
-        # later in _update_from_output_prefill_last_chunk_prior.
+        # Mark whether this PL is the request's last prefill chunk.  Mid-chunk
+        # PL still has to run the drafter so that the MTP layer populates its
+        # KV cache for every prompt chunk; its sampled/draft tokens are only
+        # discarded after the draft forward.  The flight is still in the map
+        # here and is popped later in
+        # _update_from_output_prefill_last_chunk_prior.
         flight = (
             self._prefill_flight_by_token.get(so.head_token)
             if so.head_token else None
         )
-        so.is_last_prefill_chunk = True if flight is None else flight.is_last_chunk
+        batch_req_ids = tuple(so.num_scheduled_tokens)
+        if flight is not None:
+            draft_output_req_ids = (
+                batch_req_ids if flight.is_last_chunk else ()
+            )
+        else:
+            # Legacy mode may batch several prefill requests.  Preserve the
+            # per-request distinction: every row warms draft KV, while only
+            # requests whose prompt is complete may publish proposals.
+            draft_output_req_ids = tuple(
+                req_id
+                for req_id in batch_req_ids
+                if (request := self.requests.get(req_id)) is not None
+                and not request.is_prefill_chunk
+            )
+        so.draft_output_req_ids = draft_output_req_ids
+        so.is_last_prefill_chunk = bool(draft_output_req_ids)
         # Drop these reqs from chunk_prefill_first. Keep them in
         # prefill_last_pending until update_from_output() moves them to running.
         last_req_ids = set(so.num_scheduled_tokens.keys())
@@ -1286,8 +1300,10 @@ class PDSeparatedScheduler(Scheduler):
                 if req.request_id not in last_req_ids
             ]
         self._validate_prefill_tail_channel(so)
-        if so.is_last_prefill_chunk:
-            self._pregenerate_draft_chain(so)
+        # Every chunk needs a draft-prefill pass.  Only the last chunk's draft
+        # tokens are published to the following target verify batch; the
+        # worker uses draft_output_req_ids to discard mid-chunk outputs.
+        self._pregenerate_draft_chain(so)
         return so
 
     def _validate_prefill_tail_channel(self, scheduler_output: SchedulerOutput) -> None:
@@ -1387,6 +1403,16 @@ class PDSeparatedScheduler(Scheduler):
             num_accepted_tokens=None,
             valid_sampled_token_count=None,
         )
+        # is_last_prefill_chunk is a downstream dynamic SchedulerOutput
+        # attribute, so dataclasses.replace() does not preserve it.
+        draft_last.is_last_prefill_chunk = getattr(
+            scheduler_output, "is_last_prefill_chunk", True
+        )
+        draft_last.draft_output_req_ids = getattr(
+            scheduler_output,
+            "draft_output_req_ids",
+            tuple(scheduler_output.num_scheduled_tokens),
+        )
         self._validate_draft_tail_channel(draft_last)
         self.drafts_last_ready.append(draft_last)
         self.decode_or_draft_inflight_count += 1
@@ -1463,6 +1489,17 @@ class PDSeparatedScheduler(Scheduler):
                 draft_step_idx=step_idx,
                 num_accepted_tokens=None,
                 valid_sampled_token_count=None,
+            )
+            # Preserve the parent prefill phase across the independently
+            # scheduled draft chain.  Mid-chunk chains warm the draft KV but
+            # must not seed a target decode placeholder.
+            draft_first.is_last_prefill_chunk = getattr(
+                target_tail, "is_last_prefill_chunk", True
+            )
+            draft_first.draft_output_req_ids = getattr(
+                target_tail,
+                "draft_output_req_ids",
+                tuple(target_tail.num_scheduled_tokens),
             )
             self.drafts_first_ready.append(draft_first)
             if step_idx == 0:
@@ -1559,6 +1596,14 @@ class PDSeparatedScheduler(Scheduler):
             num_accepted_tokens=num_accepted_tokens,
             valid_sampled_token_count=valid_sampled_token_count,
         )
+        draft_first.is_last_prefill_chunk = getattr(
+            source, "is_last_prefill_chunk", True
+        )
+        draft_first.draft_output_req_ids = getattr(
+            source,
+            "draft_output_req_ids",
+            tuple(source.num_scheduled_tokens),
+        )
         self.drafts_first_ready.append(draft_first)
         return True
 
@@ -1604,8 +1649,25 @@ class PDSeparatedScheduler(Scheduler):
             # verify placeholder for a dead request.
             self._force_draft_last = False
             self._start_decode_or_draft_first_only_window()
-            if self._draft_output_reqs_live(scheduler_output):
+            output_req_ids = getattr(
+                scheduler_output,
+                "draft_output_req_ids",
+                tuple(scheduler_output.num_scheduled_tokens),
+            )
+            has_live_output_req = any(
+                (request := self.requests.get(req_id)) is not None
+                and not request.is_finished()
+                for req_id in output_req_ids
+            )
+            if has_live_output_req:
                 self._prepare_next_decode_first_placeholder(scheduler_output)
+            elif not output_req_ids:
+                logger.info(
+                    "[PD] finish DRAFT_LAST task_id=%s step=%s "
+                    "(mid-prefill KV warmup; no verify placeholder)",
+                    scheduler_output.draft_task_id,
+                    scheduler_output.draft_step_idx,
+                )
             else:
                 logger.info(
                     "[PD] drain DRAFT_LAST task_id=%s step=%s "
@@ -1712,26 +1774,6 @@ class PDSeparatedScheduler(Scheduler):
             self._edge_cloud_draft_req_tasks.setdefault(req_id, set()).add(
                 task_id
             )
-
-    def has_deferred_draft_task(self, task_id: str | None) -> bool:
-        """Whether a deferred draft chain exists (or will be enqueued when
-        the parent output completes) for the given parent task.
-
-        EngineCore consults this before registering KV retention: a parent
-        whose draft chain was never created (e.g. pregeneration skipped
-        because a previous chain was still queued, or the parent carried
-        no head_token) must NOT be registered — nothing would ever release
-        it, and the referenced requests' blocks would leak.
-        """
-        if not self._edge_cloud_draft_retention_enabled or not task_id:
-            return False
-        if not self._uses_async_scheduled_mtp_placeholders():
-            # Non-pregenerated chains are enqueued from the completed
-            # parent output (engine-core _advance_edge_cloud_draft);
-            # registration is exactly what lets that enqueue succeed for
-            # finished-but-retained requests.
-            return True
-        return task_id in self._pregenerated_draft_task_ids
 
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False

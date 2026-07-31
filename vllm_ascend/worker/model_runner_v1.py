@@ -2991,6 +2991,18 @@ class NPUModelRunner(GPUModelRunner):
             "sample_row_indices": sample_row_indices,
             "req_ids": req_ids,
             "draft_step_idx": 0,
+            # Mid-prefill chunks run the same draft forward to populate MTP
+            # KV, but their proposals must not be exposed to target decode.
+            "is_last_prefill_chunk": getattr(
+                scheduler_output, "is_last_prefill_chunk", True
+            ),
+            "draft_output_req_ids": tuple(
+                getattr(
+                    scheduler_output,
+                    "draft_output_req_ids",
+                    req_ids,
+                )
+            ),
         }
         self._pending_edge_cloud_draft_contexts[task_id] = context
 
@@ -3363,7 +3375,7 @@ class NPUModelRunner(GPUModelRunner):
             # step. PDSeparatedScheduler derives the next DRAFT_FIRST locally
             # from this completed SchedulerOutput, so no worker-side pending
             # task or follow-up control RPC is needed.
-        else:
+        elif context.get("draft_output_req_ids"):
             self._draft_token_ids = torch.stack(draft_steps, dim=1)
             # Rows of _draft_token_ids follow this context's request order;
             # remember it so the deferred-draft context stash can map rows
@@ -3377,8 +3389,12 @@ class NPUModelRunner(GPUModelRunner):
             # semantics: dead rows still go through the drafter, their
             # outputs are discarded here).
             finished_req_ids = context.get("finished_req_ids") or set()
+            draft_output_req_ids = set(context["draft_output_req_ids"])
             for row, req_id in enumerate(self._draft_token_ids_req_ids):
-                if req_id in finished_req_ids:
+                if (
+                    req_id in finished_req_ids
+                    or req_id not in draft_output_req_ids
+                ):
                     continue
                 self._worker_draft_token_ids_by_req[req_id] = (
                     self._draft_token_ids[row]
@@ -3388,6 +3404,12 @@ class NPUModelRunner(GPUModelRunner):
                 scheduler_output.draft_task_id,
                 self._draft_token_ids.tolist(),
             )
+        else:
+            logger.info(
+                "[DRAFT-PREFILL] task=%s completed for mid-prefill chunk; "
+                "draft KV populated and proposals discarded",
+                scheduler_output.draft_task_id,
+            )
 
         req_ids = list(context["req_ids"])
         if next_step_idx >= self.num_spec_tokens:
@@ -3396,10 +3418,21 @@ class NPUModelRunner(GPUModelRunner):
             # fixed-length placeholders and _prepare_input_ids scatters this
             # tensor into the actual verify inputs after this DRL executes.
             # Avoid the device->CPU->EngineCore->scheduler round trip entirely.
-            if not self.use_async_scheduling:
+            if (
+                context.get("draft_output_req_ids")
+                and not self.use_async_scheduling
+            ):
+                output_rows = [
+                    row
+                    for row, req_id in enumerate(req_ids)
+                    if req_id in context["draft_output_req_ids"]
+                ]
                 completed_draft_token_ids = DraftTokenIds(
-                    req_ids,
-                    self._draft_token_ids.detach().cpu().tolist(),
+                    [req_ids[row] for row in output_rows],
+                    self._draft_token_ids[output_rows]
+                    .detach()
+                    .cpu()
+                    .tolist(),
                 )
             task_id = scheduler_output.draft_task_id
             assert task_id is not None
@@ -4315,37 +4348,62 @@ class NPUModelRunner(GPUModelRunner):
         # Clear ephemeral state.
         self.execute_model_state = None
 
-        # [ascend insert] Chunk-prior mid-chunk PL: prefill is not
-        # complete, so there is no valid token to sample (the logits
-        # predict a prompt token that belongs to the next chunk).  Skip
-        # sampling and return an empty output.  This also prevents
-        # num_output_placeholders -- which vLLM only reserves for the
-        # last prefill chunk (AsyncScheduler._update_after_schedule skips
-        # is_prefill_chunk) -- from being decremented below zero in
-        # _update_request_with_output.  segment_e / KV-cache write
-        # already happened in execute_model, so skipping sampling here
-        # does not affect prefill correctness.
-        if (
+        is_mid_prefill_chunk = bool(
             self._edge_cloud_enabled
             and scheduler_output.batch_type == BatchType.PREFILL_LAST
-            and not getattr(scheduler_output, "is_last_prefill_chunk", True)
-        ):
-            # Mid chunk: no valid token to sample. Return a placeholder that
-            # carries the req_id mapping (so super().update_from_output can
-            # look up req_index for every req_id in num_scheduled_tokens)
-            # but leaves sampled_token_ids empty (default []), so
-            # generated_token_ids is [] and _update_request_with_output is
-            # skipped -- num_output_placeholders is not decremented. Do NOT
-            # return EMPTY_MODEL_RUNNER_OUTPUT here: its req_id_to_index is
-            # empty, which raises KeyError in update_from_output.
-            req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+            and not getattr(
+                scheduler_output, "is_last_prefill_chunk", True
+            )
+        )
+        can_skip_mid_prefill_sampling = bool(
+            is_mid_prefill_chunk
+            and self.speculative_config is None
+            and not self.num_prompt_logprobs
+            and not self.model_config.enable_return_routed_experts
+            and not self.need_accepted_tokens
+        )
+        if can_skip_mid_prefill_sampling:
+            # With no drafter and no sampling-dependent auxiliary output, a
+            # middle chunk has no valid generated token.  Its target KV was
+            # already written by execute_model(), so avoid the sampler and
+            # bookkeeping while preserving the normal connector/profiling
+            # output and end-of-forward hooks.
+            req_ids = list(scheduler_output.num_scheduled_tokens)
             output = ModelRunnerOutput(
                 req_ids=req_ids,
                 req_id_to_index={rid: i for i, rid in enumerate(req_ids)},
+                kv_connector_output=kv_connector_output,
+                pooler_output=[],
+                ec_connector_output=(
+                    ec_connector_output if self.supports_mm_inputs else None
+                ),
+                cudagraph_stats=cudagraph_stats,
+                **(
+                    {}
+                    if vllm_version_is("0.20.2")
+                    else {"routed_experts": None}
+                ),
             )
-            if kv_connector_output and not kv_connector_output.is_empty():
-                output.kv_connector_output = kv_connector_output
+            if (
+                self.ascend_config.profiling_chunk_config.need_timing
+                and hasattr(self, "_execution_start_time")
+            ):
+                self._sync_device()
+                output.execution_time_ms = (
+                    time.perf_counter() - self._execution_start_time
+                ) * 1000.0
+            if self.dynamic_eplb:
+                with record_function_or_nullcontext("EPLB update"):
+                    self.eplb_updator.forward_end()
+            self._finalize_dump_data()
             return output
+
+        # With speculative decoding enabled, a mid-prefill chunk intentionally
+        # continues through sampling and drafting. _prepare_inputs marked it
+        # in discard_request_indices, so bookkeeping emits no target token and
+        # prepare_next_token_ids_padded feeds the real next prompt token to the
+        # drafter. This mirrors the native non-edge-cloud path and is required
+        # to populate MTP KV for the entire prompt.
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:

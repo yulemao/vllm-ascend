@@ -351,6 +351,10 @@ class CloudDraftPositionState:
     num_scheduled_tokens: tuple[int, ...]
     is_prefill: bool
     base_positions: torch.Tensor | None = None
+    # Per-request sampled rows (last accepted token) within the step-0
+    # payload, derived alongside base_positions.  The cloud sends only these
+    # rows back to the edge.
+    sample_row_indices: torch.Tensor | None = None
 
 
 def _freeze_scheduled_state(value: Any, memo: dict[int, Any] | None = None) -> Any:
@@ -3159,6 +3163,17 @@ class NPUModelRunner(GPUModelRunner):
         if positions is None:
             raise RuntimeError("DRAFT_LAST missing positions")
         num_tokens = positions.shape[-1] if self.uses_mrope else positions.shape[0]
+        if draft_step_idx == 0:
+            # Compact c2e payload: for MTP step 0 the cloud pre-selects the
+            # per-request sampled rows, so the payload can carry fewer rows
+            # than the scheduled tokens.  Size the sync/segment run to the
+            # payload rather than to the scheduled positions.
+            payload = intermediate_tensors.tensors.get("hidden_states")
+            if (
+                isinstance(payload, torch.Tensor)
+                and payload.shape[0] != num_tokens
+            ):
+                num_tokens = payload.shape[0]
         intermediate_tensors = (
             self._sync_edge_cloud_draft_intermediate_tensors(
                 num_tokens, intermediate_tensors
@@ -3202,20 +3217,26 @@ class NPUModelRunner(GPUModelRunner):
                 )
             last_hidden_states = hidden_states = segment_output
         num_reqs = len(context["req_ids"])
-        if draft_step_idx == 0 and last_hidden_states.shape[0] != num_reqs:
+        if draft_step_idx == 0:
             # The first draft pass ran over all scheduled tokens; only the
             # last row of each request produces the proposed draft token and
-            # feeds the next speculative step.
+            # feeds the next speculative step.  Positions always span all
+            # scheduled rows here, while the hidden states arrive already
+            # row-selected when the cloud sent a compact payload.
             sample_rows = context["sample_row_indices"].to(
                 hidden_states.device
             )
-            logits_hidden_states = last_hidden_states[sample_rows]
-            next_hidden_states = hidden_states[sample_rows]
             step_positions = (
                 positions[:, sample_rows]
                 if self.uses_mrope
                 else positions[sample_rows]
             )
+            if last_hidden_states.shape[0] != num_reqs:
+                logits_hidden_states = last_hidden_states[sample_rows]
+                next_hidden_states = hidden_states[sample_rows]
+            else:
+                logits_hidden_states = last_hidden_states
+                next_hidden_states = hidden_states
         else:
             logits_hidden_states = last_hidden_states
             next_hidden_states = hidden_states
@@ -4607,6 +4628,7 @@ class NPUModelRunner(GPUModelRunner):
             state.base_positions = target_positions.index_select(
                 -1, row_indices
             )
+            state.sample_row_indices = row_indices
             logger.info(
                 "[CLOUD-DRAFT] task=%s accepted_counts=%s sample_rows=%s "
                 "base_pos=%s",
@@ -4994,6 +5016,31 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError(
                 "Edge-cloud draft middle segment returned no intermediates"
             )
+
+        if spec_step_idx == 0:
+            # Only the per-request sampled rows (last accepted token) are
+            # consumed on the edge; the c2e wire schema for draft step 0 is
+            # sized to num_reqs, so select those rows before the send.  The
+            # selection covers every row-major tensor of the payload: MTP
+            # carries only hidden_states, eagle3 also carries the pre-norm
+            # residual.
+            position_state = self._cloud_draft_position_state_by_task.get(
+                scheduler_output.draft_task_id
+            )
+            sample_rows = (
+                position_state.sample_row_indices
+                if position_state is not None
+                else None
+            )
+            if sample_rows is not None:
+                for key in ("hidden_states", "residual"):
+                    tensor = output.tensors.get(key)
+                    if (
+                        isinstance(tensor, torch.Tensor)
+                        and tensor.dim() >= 1
+                        and tensor.shape[0] != sample_rows.shape[0]
+                    ):
+                        output[key] = tensor.index_select(0, sample_rows)
 
         if (
             scheduler_output.draft_task_id is not None

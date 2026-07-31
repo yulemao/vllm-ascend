@@ -857,11 +857,25 @@ class NPUWorker(WorkerBase):
             return None
 
         draft_step_idx = int(scheduler_output.draft_step_idx or 0)
-        num_tokens = (
-            scheduler_output.total_num_scheduled_tokens
-            if draft_step_idx == 0
-            else len(scheduler_output.num_scheduled_tokens)
-        )
+        num_reqs = len(scheduler_output.num_scheduled_tokens)
+        if draft_step_idx == 0:
+            if direction == "c2e" and speculative_config.method in (
+                "mtp",
+                "qwen_mtp",
+                "qwen3_5_mtp",
+                "eagle3",
+            ):
+                # The cloud pre-selects the per-request sampled rows (last
+                # accepted token) before sending.  Only those rows feed the
+                # edge-side logits and the next draft step, so the remaining
+                # scheduled rows would be dead bandwidth.  Applies to every
+                # c2e tensor of the step-0 payload (hidden_states, plus the
+                # pre-norm residual for eagle3).
+                num_tokens = num_reqs
+            else:
+                num_tokens = scheduler_output.total_num_scheduled_tokens
+        else:
+            num_tokens = num_reqs
         return build_scheduled_draft_tensor_meta(
             method=speculative_config.method,
             direction=direction,

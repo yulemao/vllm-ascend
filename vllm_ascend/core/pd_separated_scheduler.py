@@ -661,11 +661,18 @@ class PDSeparatedScheduler(Scheduler):
             self._prepare_next_decode_first_placeholder(
                 self._decode_first_placeholder_parent
             )
-        # A placeholder DECODE_FIRST prepared when the final DRAFT_LAST was
-        # dispatched must stay immediately behind that draft tail.  Its real
-        # draft token IDs are filled from the worker-local _draft_token_ids
-        # buffer when it executes, exactly like native async spec decode.
-        if self.decodes_first_ready:
+        # A placeholder DECODE_FIRST is prepared at the final DRAFT_FIRST
+        # pick and published to the cloud together with that DRAFT_FIRST,
+        # but it must stay immediately behind the final DRAFT_LAST in the
+        # local worker FIFO: its real draft token IDs are filled from the
+        # worker-local _draft_token_ids buffer only after that DRAFT_LAST
+        # has executed, exactly like native async spec decode.  Hold it
+        # back while a DRAFT_LAST is still pending.
+        if (
+            self.decodes_first_ready
+            and not self.drafts_last_ready
+            and not self._force_draft_last
+        ):
             return self.decodes_first_ready.popleft()
 
         first_only = self._pick_decode_or_draft_first_only_or_empty()
@@ -1429,6 +1436,16 @@ class PDSeparatedScheduler(Scheduler):
         self._force_draft_last = True
         self._start_draft_last_delay()
 
+        # Prepare the target verify placeholder as soon as the FINAL
+        # DRAFT_FIRST is picked, instead of waiting for the final
+        # DRAFT_LAST pick (which the wall-clock draft-last delay gates).
+        # The engine core publishes it to the cloud together with this
+        # DRAFT_FIRST so the cloud can pre-post its verify recv one draft
+        # step earlier; local edge dispatch still waits behind the final
+        # DRAFT_LAST (see the decodes_first_ready gate in _pick_by_state).
+        # No-op for non-final steps and non-pre-generated chains.
+        self._prepare_next_decode_first_placeholder(scheduler_output)
+
         logger.info(
             "[MTP-DEBUG] scheduler picked DRAFT_FIRST: task_id=%s, "
             "parent_req_id=%s, draft_step_idx=%s, head_token=%s, "
@@ -1555,6 +1572,32 @@ class PDSeparatedScheduler(Scheduler):
             or scheduler_output.head_token
         )
         return bool(task_id and task_id in self._pregenerated_draft_task_ids)
+
+    def take_early_publish_decode_first(
+        self, draft_task_id: str | None
+    ) -> SchedulerOutput | None:
+        """Hand the queued verify DECODE_FIRST placeholder to the engine
+        core for early cloud publication with the final DRAFT_FIRST of its
+        draft chain.
+
+        The placeholder stays in ``decodes_first_ready`` for local dispatch
+        after the final DRAFT_LAST is picked; only the cloud control plane
+        goes out early (one draft step ahead of the wall-clock-delayed
+        DRAFT_LAST pick).  Returns None when no placeholder is queued, when
+        it belongs to a different chain, or when it was already handed out.
+        """
+        if not draft_task_id or not self.decodes_first_ready:
+            return None
+        decode_first = self.decodes_first_ready[0]
+        if getattr(decode_first, "cloud_published_with_draft_chain", False):
+            return None
+        if (
+            getattr(decode_first, "parent_draft_task_id", None)
+            != draft_task_id
+        ):
+            return None
+        decode_first.cloud_published_with_draft_chain = True
+        return decode_first
 
     def active_pre_generated_draft_req_ids(self) -> set[str]:
         active: set[str] = set()
@@ -1688,9 +1731,15 @@ class PDSeparatedScheduler(Scheduler):
         return self._make_empty_batch()
 
     def _prepare_next_decode_first_placeholder(
-        self, draft_last: SchedulerOutput
+        self, draft_output: SchedulerOutput
     ) -> None:
-        """Prepare the next target verify batch behind the final draft tail.
+        """Prepare the next target verify batch behind the final draft step.
+
+        Accepts either the final DRAFT_FIRST (early path: called from
+        ``_pick_draft_first_batch`` so the engine core can publish the
+        placeholder to the cloud together with that DRAFT_FIRST) or its
+        DRAFT_LAST (fallback/retry path: called from
+        ``_pick_draft_last_batch`` and the ``_pick_by_state`` retry).
 
         Scheduler-side spec token values are placeholders.  The edge worker
         replaces them with its local ``_draft_token_ids`` after this DRL has
@@ -1698,20 +1747,36 @@ class PDSeparatedScheduler(Scheduler):
         """
         if not self._uses_async_scheduled_mtp_placeholders():
             return
-        if draft_last.draft_task_id not in self._pregenerated_draft_task_ids:
+        if draft_output.draft_task_id not in self._pregenerated_draft_task_ids:
             self._decode_first_placeholder_parent = None
             return
-        step_idx = int(draft_last.draft_step_idx or 0)
+        step_idx = int(draft_output.draft_step_idx or 0)
         if step_idx + 1 < self.num_spec_tokens:
             return
-        self._decode_first_placeholder_parent = draft_last
+        output_req_ids = getattr(
+            draft_output,
+            "draft_output_req_ids",
+            tuple(draft_output.num_scheduled_tokens),
+        )
+        has_live_output_req = any(
+            (request := self.requests.get(req_id)) is not None
+            and not request.is_finished()
+            for req_id in output_req_ids
+        )
+        if not has_live_output_req:
+            # Mid-prefill KV warmup (empty draft_output_req_ids) or a chain
+            # whose requests are all gone: never spawn a verify placeholder.
+            self._decode_first_placeholder_parent = None
+            return
+        self._decode_first_placeholder_parent = draft_output
         if self.decodes_first_ready:
             self._decode_first_placeholder_parent = None
             return
         if not self.running:
             # A chain pre-generated from the final PREFILL_LAST can reach its
-            # final DRL before EngineCore has applied the prefill result. Retry
-            # on the next schedule turn after that request moves to running.
+            # final draft step before EngineCore has applied the prefill
+            # result. Retry on the next schedule turn after that request
+            # moves to running.
             return
 
         next_decode = self._pick_decode_first_batch()
@@ -1720,6 +1785,10 @@ class PDSeparatedScheduler(Scheduler):
             and next_decode.batch_type == BatchType.DECODE_FIRST
             and next_decode.total_num_scheduled_tokens > 0
         ):
+            # Bind the placeholder to its draft chain so the engine core can
+            # publish it together with the chain's final DRAFT_FIRST and so
+            # the drain path can recognise it as already cloud-bound.
+            next_decode.parent_draft_task_id = draft_output.draft_task_id
             self.decodes_first_ready.append(next_decode)
             self._decode_first_placeholder_parent = None
 
@@ -1878,13 +1947,28 @@ class PDSeparatedScheduler(Scheduler):
                 kept_first.append(output)
         self.drafts_first_ready = kept_first
 
-        self.decodes_first_ready = deque(
-            output
-            for output in self.decodes_first_ready
+        kept_decodes_first: deque[SchedulerOutput] = deque()
+        for output in self.decodes_first_ready:
             if not self._scheduler_output_intersects_req_ids(
                 output, req_ids
-            )
-        )
+            ):
+                kept_decodes_first.append(output)
+                continue
+            if getattr(output, "cloud_published_with_draft_chain", False):
+                # Already published to the cloud together with the chain's
+                # final DRAFT_FIRST.  The cloud does not track request
+                # lifecycle: it will run the verify middle and isend its
+                # response, so the edge MUST still execute this head (and
+                # its self-posted DECODE_LAST) to keep the DECODE hidden
+                # channel paired -- the same drain rule as DRAFT_LAST.
+                logger.info(
+                    "[PD] keep DECODE_FIRST head_token=%s for drain "
+                    "(already published to cloud with its draft chain; "
+                    "member request(s) gone)",
+                    output.head_token,
+                )
+                kept_decodes_first.append(output)
+        self.decodes_first_ready = kept_decodes_first
         pending_decode = self._decode_first_placeholder_parent
         if (
             pending_decode is not None

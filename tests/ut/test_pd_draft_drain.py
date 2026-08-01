@@ -26,6 +26,11 @@ Regression coverage for the edge-side MTP draft deadlock fixes:
   * Every middle prefill chunk runs a complete draft chain to populate MTP KV,
     while its proposals are discarded and no target verify placeholder is
     created.
+  * The verify DECODE_FIRST placeholder is created at the final DRAFT_FIRST
+    pick (not the wall-clock-delayed final DRAFT_LAST pick) and published to
+    the cloud together with that DRAFT_FIRST; local dispatch stays behind
+    the final DRAFT_LAST, and an already-published placeholder is kept for
+    drain if its requests finish before local dispatch.
 """
 
 from collections import deque
@@ -483,3 +488,223 @@ class TestRunDraftLastSegmentDrain:
         )
         assert isinstance(result, ModelRunnerOutput)
         assert result.req_ids == ["req-0"]
+
+
+# ------------------------------------------------------------------ #
+# Test: early DECODE_FIRST placeholder at the final DRAFT_FIRST pick   #
+# ------------------------------------------------------------------ #
+
+
+def _make_real_draft_first(task_id="task-0", req_id="req-0", step=2):
+    so = SchedulerOutput.make_empty()
+    so.batch_type = BatchType.DRAFT_FIRST
+    so.draft_task_id = task_id
+    so.draft_step_idx = step
+    so.head_token = None
+    so.hidden_channel = HiddenChannelType.DECODE
+    so.num_scheduled_tokens = {req_id: 1}
+    so.total_num_scheduled_tokens = 1
+    so.parent_req_id = req_id
+    so.is_last_prefill_chunk = True
+    so.draft_output_req_ids = (req_id,)
+    return so
+
+
+def _make_real_decode_first(task_id="task-0", req_id="req-0"):
+    so = SchedulerOutput.make_empty()
+    so.batch_type = BatchType.DECODE_FIRST
+    so.head_token = f"df-{task_id}"
+    so.hidden_channel = HiddenChannelType.DECODE
+    so.num_scheduled_tokens = {req_id: 4}
+    so.total_num_scheduled_tokens = 4
+    return so
+
+
+class TestEarlyDecodeFirstPlaceholder:
+    """The verify DECODE_FIRST placeholder is created at the final
+    DRAFT_FIRST pick (instead of the wall-clock-delayed final DRAFT_LAST
+    pick) and published to the cloud together with that DRAFT_FIRST, so
+    the cloud can pre-post its verify recv one draft step earlier.  Local
+    edge dispatch still stays behind the final DRAFT_LAST."""
+
+    def _setup(self):
+        s = _make_bare_scheduler()
+        s.decodes_first_ready = deque()
+        s._decode_first_placeholder_parent = None
+        s._edge_cloud_draft_task_reqs = {}
+        s.finished_req_ids = set()
+        request = MagicMock()
+        request.is_finished.return_value = False
+        s.requests["req-0"] = request
+        s.running = [request]
+        s._pregenerated_draft_task_ids.add("task-0")
+        s._uses_async_scheduled_mtp_placeholders = MagicMock(
+            return_value=True
+        )
+        s._validate_draft_tail_channel = MagicMock()
+        return s
+
+    def test_final_draft_first_pick_creates_placeholder(self):
+        s = self._setup()
+        df = _make_real_decode_first()
+        s._pick_decode_first_batch = MagicMock(return_value=df)
+        drf = _make_real_draft_first(step=2)  # final of num_spec_tokens=3
+        s.drafts_first_ready.append(drf)
+
+        picked = s._pick_draft_first_batch()
+
+        assert picked is drf
+        assert len(s.drafts_last_ready) == 1
+        assert list(s.decodes_first_ready) == [df]
+        assert df.parent_draft_task_id == "task-0"
+        assert not getattr(df, "cloud_published_with_draft_chain", False)
+
+    def test_non_final_draft_first_pick_creates_nothing(self):
+        s = self._setup()
+        s._pick_decode_first_batch = MagicMock()
+        s.drafts_first_ready.append(_make_real_draft_first(step=0))
+
+        s._pick_draft_first_batch()
+
+        s._pick_decode_first_batch.assert_not_called()
+        assert not s.decodes_first_ready
+
+    def test_placeholder_held_behind_pending_draft_last(self):
+        from vllm_ascend.core.pd_separated_scheduler import PrefillState
+
+        s = self._setup()
+        df = _make_real_decode_first()
+        s._pick_decode_first_batch = MagicMock(return_value=df)
+        s.drafts_first_ready.append(_make_real_draft_first(step=2))
+        s._pick_draft_first_batch()
+        # State machine stubs: no other work than the pending tail.
+        s._pick_decode_or_draft_first_only_or_empty = MagicMock(
+            return_value=None
+        )
+        s._can_schedule_prefill_first = MagicMock(return_value=False)
+        s._can_schedule_draft_last = MagicMock(return_value=True)
+        s._can_schedule_draft_first = MagicMock(return_value=False)
+        s._can_schedule_decode_last = MagicMock(return_value=False)
+        s._can_schedule_decode_first = MagicMock(return_value=False)
+        s._log_scheduler_state = MagicMock()
+        s._start_decode_or_draft_first_only_window = MagicMock()
+        s.prefill_inflight_count = 0
+
+        # The pending DRAFT_LAST is picked before the queued DECODE_FIRST.
+        out = s._pick_by_state(PrefillState.IDLE)
+        assert out.batch_type == BatchType.DRAFT_LAST
+        # Once the tail is picked, the verify head follows immediately.
+        out = s._pick_by_state(PrefillState.IDLE)
+        assert out is df
+
+    def test_take_early_publish_decode_first(self):
+        s = _make_bare_scheduler()
+        s.decodes_first_ready = deque()
+        df = _make_real_decode_first()
+        df.parent_draft_task_id = "task-0"
+        s.decodes_first_ready.append(df)
+
+        assert s.take_early_publish_decode_first("task-x") is None
+        assert s.take_early_publish_decode_first("task-0") is df
+        assert df.cloud_published_with_draft_chain is True
+        # One-shot: a second take for the same chain returns None.
+        assert s.take_early_publish_decode_first("task-0") is None
+        # Still queued for local dispatch after the final DRAFT_LAST.
+        assert list(s.decodes_first_ready) == [df]
+
+    def test_early_published_placeholder_kept_for_drain(self):
+        """A DECODE_FIRST already published to the cloud must not be
+        dropped when its requests finish before local dispatch: the cloud
+        will run the verify middle and isend its response, so the edge
+        keeps it (and its self-posted DECODE_LAST) to pair the channel --
+        the same drain rule as DRAFT_LAST."""
+        s = _make_bare_scheduler()
+        s.decodes_first_ready = deque()
+        s._decode_first_placeholder_parent = None
+        s._dropped_draft_task_ids_to_report = []
+        published = _make_real_decode_first(task_id="task-0")
+        published.parent_draft_task_id = "task-0"
+        published.cloud_published_with_draft_chain = True
+        unpublished = _make_real_decode_first(task_id="task-1")
+        unpublished.parent_draft_task_id = "task-1"
+        s.decodes_first_ready.extend([published, unpublished])
+
+        s._drop_stale_drafts_for_req_ids({"req-0"})
+
+        assert list(s.decodes_first_ready) == [published]
+
+
+class TestEarlyDecodeFirstPublish:
+    """EngineCore publishes the verify DECODE_FIRST to the cloud together
+    with the final DRAFT_FIRST, preserving wire order on the shared DECODE
+    hidden channel (DRAFT_FIRSTs first, DECODE_FIRST last)."""
+
+    def _make_engine(self, opened):
+        from vllm_ascend.patch.platform.patch_engine_core import (
+            _publish_early_decode_first,
+        )
+
+        engine = MagicMock()
+        engine.scheduler.num_spec_tokens = 3
+        engine.scheduler.is_pre_generated_draft.return_value = True
+        engine._pd_draft_pre_out_open_tasks = opened
+        engine._pd_deferred_draft_pre_out = {}
+        engine._publish_early_decode_first = (
+            lambda drf, defer: _publish_early_decode_first(
+                engine, drf, defer=defer
+            )
+        )
+        return engine
+
+    def test_publishes_decode_first_with_final_draft_first(self):
+        from vllm_ascend.patch.platform.patch_engine_core import (
+            _maybe_publish_pre_out,
+        )
+
+        engine = self._make_engine(opened={"task-0"})
+        df = _make_real_decode_first()
+        df.parent_draft_task_id = "task-0"
+        engine.scheduler.take_early_publish_decode_first.return_value = df
+        drf = _make_real_draft_first(step=2)
+
+        _maybe_publish_pre_out(engine, drf)
+
+        published = [
+            call.args[0]
+            for call in engine._pp_pd_channel.publish.call_args_list
+        ]
+        # Wire order: the final DRAFT_FIRST first, DECODE_FIRST behind it.
+        assert published == [drf, df]
+
+    def test_local_dispatch_does_not_republish(self):
+        from vllm_ascend.patch.platform.patch_engine_core import (
+            _maybe_publish_pre_out,
+        )
+
+        engine = self._make_engine(opened={"task-0"})
+        df = _make_real_decode_first()
+        df.parent_draft_task_id = "task-0"
+        df.cloud_published_with_draft_chain = True
+
+        _maybe_publish_pre_out(engine, df)
+
+        engine._pp_pd_channel.publish.assert_not_called()
+
+    def test_deferred_stream_keeps_draft_then_decode_order(self):
+        from vllm_ascend.patch.platform.patch_engine_core import (
+            _maybe_publish_pre_out,
+        )
+
+        engine = self._make_engine(opened=set())
+        df = _make_real_decode_first()
+        df.parent_draft_task_id = "task-0"
+        engine.scheduler.take_early_publish_decode_first.return_value = df
+        drf = _make_real_draft_first(step=2)
+
+        _maybe_publish_pre_out(engine, drf)
+
+        # Stream not open: nothing published yet, and the DECODE_FIRST
+        # rides the deferred queue behind the final DRAFT_FIRST.
+        engine._pp_pd_channel.publish.assert_not_called()
+        assert engine._pd_deferred_draft_pre_out["task-0"] == [drf, df]
+

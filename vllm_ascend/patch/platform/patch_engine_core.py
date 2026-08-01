@@ -244,12 +244,26 @@ def _maybe_publish_pre_out(
                     deferred = {}
                     self._pd_deferred_draft_pre_out = deferred
                 deferred.setdefault(task_id, []).append(scheduler_output)
+                # The verify DECODE_FIRST placeholder rides the same
+                # deferred stream behind the final DRAFT_FIRST.
+                self._publish_early_decode_first(
+                    scheduler_output, defer=True
+                )
                 return
         self._pp_pd_channel.publish(scheduler_output)
+        if is_pregenerated:
+            self._publish_early_decode_first(scheduler_output, defer=False)
     elif bt in (
         BatchType.PREFILL_FIRST,
         BatchType.DECODE_FIRST,
     ):
+        if getattr(
+            scheduler_output, "cloud_published_with_draft_chain", False
+        ):
+            # Already published to the cloud together with the final
+            # DRAFT_FIRST of its chain; this schedule() is only the local
+            # edge dispatch.
+            return
         self._pp_pd_channel.publish(scheduler_output)
     elif bt in (
         BatchType.EMPTY,
@@ -263,6 +277,57 @@ def _maybe_publish_pre_out(
             "PD-separation PRE_OUT skipping non-separated batch_type=%s",
             bt.value if bt is not None else "<none>",
         )
+
+
+def _publish_early_decode_first(
+    self, draft_first_output: SchedulerOutput, *, defer: bool
+) -> None:
+    """Publish the verify DECODE_FIRST placeholder with the final DRAFT_FIRST.
+
+    The scheduler creates the placeholder at the final DRAFT_FIRST pick.
+    Publishing it together with that DRAFT_FIRST — instead of at DECODE_FIRST
+    dispatch time, after the wall-clock draft-last delay has gated the final
+    DRAFT_LAST pick — lets the cloud pre-post its verify recv one draft step
+    earlier and hides the draft-tail -> decode-head boundary latency.
+
+    Wire order is preserved in both modes: published directly right behind
+    the final DRAFT_FIRST when the task's cloud stream is open, or appended
+    to the task's deferred queue (behind every DRAFT_FIRST) when the stream
+    is still closed, so the DECODE_FIRST can never overtake a DRAFT_FIRST on
+    the shared DECODE hidden channel.
+
+    Local edge dispatch is unchanged: the placeholder stays queued until the
+    final DRAFT_LAST is picked, and its later ``_maybe_publish_pre_out``
+    call is skipped via the ``cloud_published_with_draft_chain`` marker.
+    """
+    if getattr(self, "_pp_pd_channel", None) is None:
+        return
+    scheduler = self.scheduler
+    num_spec_tokens = getattr(scheduler, "num_spec_tokens", 0)
+    if int(draft_first_output.draft_step_idx or 0) + 1 < num_spec_tokens:
+        return
+    take = getattr(scheduler, "take_early_publish_decode_first", None)
+    if take is None:
+        return
+    decode_first = take(draft_first_output.draft_task_id)
+    if decode_first is None:
+        return
+    if defer:
+        deferred = getattr(self, "_pd_deferred_draft_pre_out", None)
+        if deferred is None:
+            deferred = {}
+            self._pd_deferred_draft_pre_out = deferred
+        deferred.setdefault(
+            draft_first_output.draft_task_id, []
+        ).append(decode_first)
+        return
+    logger.info(
+        "[PRE_OUT] early publish DECODE_FIRST with final DRAFT_FIRST "
+        "task_id=%s head_token=%s",
+        draft_first_output.draft_task_id,
+        decode_first.head_token,
+    )
+    self._pp_pd_channel.publish(decode_first)
 
 
 def _release_deferred_draft_pre_out(
@@ -996,6 +1061,7 @@ def install() -> None:
     EngineCore.__init__ = _patched_engine_core_init
     EngineCore._drain_pd_channel_inbox = _drain_pd_channel_inbox
     EngineCore._maybe_publish_pre_out = _maybe_publish_pre_out
+    EngineCore._publish_early_decode_first = _publish_early_decode_first
     EngineCore._release_deferred_draft_pre_out = (
         _release_deferred_draft_pre_out
     )

@@ -149,6 +149,73 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
         self.assertEqual(actual_output_token_ids[1], [4, 5, 7])
 
 
+class TestDeferredDraftTokenBackfill(unittest.TestCase):
+    def _build_runner(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.use_async_scheduling = True
+        runner._edge_cloud_enabled = True
+        runner.edge_cloud_cfg = SimpleNamespace(role="edge")
+        runner._worker_draft_token_ids_by_req = {
+            "req-a": torch.tensor([11, 12]),
+            "req-b": torch.tensor([21, 22]),
+        }
+        # Simulate another interleaved chain overwriting the global tensor.
+        runner._draft_token_ids = torch.tensor([[21, 22]])
+        runner._draft_token_ids_req_ids = ["req-b"]
+        runner._verified_draft_token_ids_by_head = {}
+        return runner
+
+    def test_uses_repaired_verify_snapshot_when_global_draft_is_overwritten(self):
+        runner = self._build_runner()
+        runner.input_batch = SimpleNamespace(req_ids=["req-a"])
+        runner.input_ids = SimpleNamespace(
+            gpu=torch.tensor([101, 11, 12])
+        )
+        scheduler_output = SimpleNamespace(
+            head_token="task-a",
+            scheduled_spec_decode_tokens={"req-a": [-1, -1]},
+        )
+        scheduled_token_ids = torch.tensor([101, -1, -1])
+
+        runner._snapshot_verified_draft_tokens(
+            scheduler_output,
+            1,
+            torch.tensor([3]).numpy(),
+        )
+        # A finished member can be removed from the per-request map before
+        # the rest of its multi-request target batch reaches the tail.  The
+        # per-head snapshot must remain sufficient to backfill the context.
+        runner._worker_draft_token_ids_by_req.pop("req-a")
+        runner._patch_deferred_draft_token_ids(
+            scheduler_output,
+            ("req-a",),
+            [3],
+            scheduled_token_ids,
+        )
+
+        self.assertEqual(scheduled_token_ids.tolist(), [101, 11, 12])
+        self.assertEqual(runner._draft_token_ids_req_ids, ["req-b"])
+
+    def test_missing_per_request_tokens_fails_instead_of_using_placeholder(self):
+        runner = self._build_runner()
+        scheduler_output = SimpleNamespace(
+            head_token="task-missing",
+            scheduled_spec_decode_tokens={"req-missing": [-1, -1]},
+        )
+        scheduled_token_ids = torch.tensor([101, -1, -1])
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "no verified draft tokens",
+        ):
+            runner._patch_deferred_draft_token_ids(
+                scheduler_output,
+                ("req-missing",),
+                [3],
+                scheduled_token_ids,
+            )
+
+
 class TestNPUModelRunnerDebugger(unittest.TestCase):
     def _build_runner(self, debugger=None):
         runner = NPUModelRunner.__new__(NPUModelRunner)

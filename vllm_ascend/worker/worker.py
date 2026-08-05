@@ -913,6 +913,23 @@ class NPUWorker(WorkerBase):
             _gathered = output.tensors
         if get_pp_group().world_size == 2:
             channel = self._hidden_channel_for(scheduler_output)
+            _rows = next(
+                (
+                    v.shape[0]
+                    for v in _gathered.values()
+                    if isinstance(v, torch.Tensor) and v.numel() > 0
+                ),
+                -1,
+            )
+            logger.info(
+                "[PD-TRACE] edge head send: batch_type=%s head_token=%s "
+                "n_reqs=%d total_tokens=%d tensor_rows=%d",
+                scheduler_output.batch_type.value,
+                getattr(scheduler_output, "head_token", None),
+                len(scheduler_output.num_scheduled_tokens),
+                scheduler_output.total_num_scheduled_tokens,
+                _rows,
+            )
             self._record_pp_send_work(
                 edge_cloud_send_tensor_dict(_gathered, channel=channel,
                                             num_tokens=scheduler_output.total_num_scheduled_tokens),
@@ -938,6 +955,14 @@ class NPUWorker(WorkerBase):
         """Edge tail segment (PL/DL): recv -> segment_e -> return output."""
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}")
         channel = self._hidden_channel_for(scheduler_output)
+        logger.info(
+            "[PD-TRACE] edge tail recv: batch_type=%s head_token=%s "
+            "n_reqs=%d total_tokens=%d",
+            scheduler_output.batch_type.value,
+            getattr(scheduler_output, "head_token", None),
+            len(scheduler_output.num_scheduled_tokens),
+            scheduler_output.total_num_scheduled_tokens,
+        )
         tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
             num_tokens=scheduler_output.total_num_scheduled_tokens,
             channel=channel,

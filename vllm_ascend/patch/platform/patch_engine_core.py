@@ -783,6 +783,13 @@ def _patched_step_with_batch_queue(self):
             len(batch_queue),
             queue_types,
         )
+        vllm_logger.info(
+            "[PD-TRACE] enqueue %s head_token=%s n_reqs=%d total_tokens=%d",
+            scheduler_output.batch_type.value,
+            getattr(scheduler_output, "head_token", None),
+            len(scheduler_output.num_scheduled_tokens),
+            scheduler_output.total_num_scheduled_tokens,
+        )
         if not fill_async_mtp_placeholders:
             # Preserve the upstream one-schedule-per-turn behavior for every
             # other mode. Only async scheduled-MTP needs one EngineCore turn
@@ -805,9 +812,11 @@ def _patched_step_with_batch_queue(self):
     bt = scheduler_output.batch_type
     vllm_logger.info(
         "[PD] EngineCore blocking on future.result(): "
-        "batch_type=%s total_tokens=%d",
+        "batch_type=%s total_tokens=%d head_token=%s n_reqs=%d",
         bt.value if bt else "N/A",
-        scheduler_output.total_num_scheduled_tokens)
+        scheduler_output.total_num_scheduled_tokens,
+        getattr(scheduler_output, "head_token", None),
+        len(scheduler_output.num_scheduled_tokens))
     with (
         self.log_error_detail(scheduler_output),
         self.log_iteration_details(scheduler_output),

@@ -1878,6 +1878,26 @@ class PDSeparatedScheduler(Scheduler):
                 kept_first.append(output)
         self.drafts_first_ready = kept_first
 
+        dropped_decode_first = [
+            output
+            for output in self.decodes_first_ready
+            if self._scheduler_output_intersects_req_ids(output, req_ids)
+        ]
+        if dropped_decode_first:
+            logger.info(
+                "[PD-TRACE] drop %d DECODE_FIRST placeholder(s) intersecting "
+                "finished req_ids=%s: %s",
+                len(dropped_decode_first),
+                sorted(req_ids),
+                [
+                    (
+                        o.head_token,
+                        len(o.num_scheduled_tokens),
+                        o.total_num_scheduled_tokens,
+                    )
+                    for o in dropped_decode_first
+                ],
+            )
         self.decodes_first_ready = deque(
             output
             for output in self.decodes_first_ready
@@ -2019,6 +2039,22 @@ class PDSeparatedScheduler(Scheduler):
         if not self.running:
             return self._make_empty_batch()
 
+        # [PD-TRACE] A finished-but-not-yet-reaped request in running[] would
+        # be scheduled into the (placeholder) decode batch, inflating its
+        # token count vs. the post-cleanup control-plane view.
+        zombie_running = [
+            req.request_id
+            for req in self.running
+            if req.is_finished() or req.request_id not in self.requests
+        ]
+        if zombie_running:
+            logger.warning(
+                "[PD-TRACE] zombie request(s) in running[] before "
+                "DECODE_FIRST schedule: %s (running=%d)",
+                zombie_running,
+                len(self.running),
+            )
+
         saved_chunk_prefill_first = self.chunk_prefill_first
         saved_waiting = self.waiting
         saved_skipped = self.skipped_waiting
@@ -2065,6 +2101,23 @@ class PDSeparatedScheduler(Scheduler):
                     )
                     self.decodes_last_ready.append(decode_last)
                     # ===============================================
+                    finished_in_batch = [
+                        rid
+                        for rid in scheduler_output.num_scheduled_tokens
+                        if (req := self.requests.get(rid)) is None
+                        or req.is_finished()
+                    ]
+                    logger.info(
+                        "[PD-TRACE] DECODE_FIRST created: head_token=%s "
+                        "n_reqs=%d total_tokens=%d running=%d "
+                        "finished_in_batch=%s placeholder=%s",
+                        scheduler_output.head_token,
+                        len(scheduler_output.num_scheduled_tokens),
+                        scheduler_output.total_num_scheduled_tokens,
+                        len(self.running),
+                        finished_in_batch or "-",
+                        self._decode_first_placeholder_parent is not None,
+                    )
                 for req in list(self.waiting):
                     saved_waiting.prepend_request(req)
                 self.chunk_prefill_first = saved_chunk_prefill_first

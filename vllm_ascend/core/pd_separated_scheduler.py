@@ -348,6 +348,14 @@ class PDSeparatedScheduler(Scheduler):
         self._pregenerated_draft_req_ids: dict[str, set[str]] = {}
         self._draft_remote_pending_limit: int = 2
         self._decode_first_placeholder_parent: SchedulerOutput | None = None
+        # Requests whose prefill finished but whose 3-step draft chain has
+        # not completed yet.  They are held out of DECODE_FIRST scheduling:
+        # their spec slots would be unrepaired -1 placeholders (the worker
+        # records the real draft ids only when the chain completes), which
+        # wastes the verify and can feed negative token ids to device
+        # kernels (observed as sporadic ACL 507035 on the first decode
+        # round after a prefill).
+        self._awaiting_first_draft_req_ids: set[str] = set()
 
         # ------------------------------------------------------------------ #
         # Edge-cloud deferred-draft KV retention                             #
@@ -779,6 +787,14 @@ class PDSeparatedScheduler(Scheduler):
         )
 
     def _can_schedule_decode_first(self) -> bool:
+        if self._awaiting_first_draft_req_ids and all(
+            req.request_id in self._awaiting_first_draft_req_ids
+            for req in self.running
+        ):
+            # Every running request is waiting for its first draft chain;
+            # let the draft batches run first instead of emitting empty
+            # decode batches.
+            return False
         return bool(
             self.running
             and self.decode_or_draft_inflight_count == 0
@@ -1364,9 +1380,13 @@ class PDSeparatedScheduler(Scheduler):
                     self._pregenerated_draft_task_ids.discard(
                         scheduler_output.draft_task_id
                     )
-                    self._pregenerated_draft_req_ids.pop(
+                    dropped_reqs = self._pregenerated_draft_req_ids.pop(
                         scheduler_output.draft_task_id, None
                     )
+                    if dropped_reqs:
+                        self._awaiting_first_draft_req_ids.difference_update(
+                            dropped_reqs
+                        )
                     # Report the cut chain so EngineCore can release the
                     # retained KV blocks and invalidate the cloud-side
                     # cached draft metadata (which will never be fully
@@ -1460,6 +1480,50 @@ class PDSeparatedScheduler(Scheduler):
             getattr(hf_config, "model_type", "")
         ).lower()
 
+    def _gate_first_decode_until_draft_ready(
+        self, parent: SchedulerOutput
+    ) -> None:
+        """Hold a freshly-prefilled request out of decode until its draft
+        chain completes.  ``parent`` is the PREFILL_LAST SchedulerOutput (or
+        its step-0 DRAFT_FIRST copy, which carries the same
+        is_last_prefill_chunk / draft_output_req_ids fields)."""
+        if not getattr(parent, "is_last_prefill_chunk", True):
+            # Mid-chunk passes only warm the draft KV; the request is not
+            # entering running yet.
+            return
+        req_ids = set(
+            getattr(parent, "draft_output_req_ids", None)
+            or tuple(parent.num_scheduled_tokens)
+        )
+        newly_gated = req_ids - self._awaiting_first_draft_req_ids
+        if newly_gated:
+            self._awaiting_first_draft_req_ids.update(newly_gated)
+            logger.info(
+                "[PD-TRACE] first-draft gate: %d request(s) held out of "
+                "decode until draft chain completes: %s",
+                len(newly_gated),
+                sorted(newly_gated),
+            )
+
+    def _release_first_draft_gate(self, chain_tail: SchedulerOutput) -> None:
+        """Release gated requests when their draft chain's last DRAFT_LAST
+        output returns (chain_tail = that final DRAFT_LAST)."""
+        if not self._awaiting_first_draft_req_ids:
+            return
+        req_ids = set(
+            getattr(chain_tail, "draft_output_req_ids", None)
+            or tuple(chain_tail.num_scheduled_tokens)
+        )
+        released = req_ids & self._awaiting_first_draft_req_ids
+        if released:
+            self._awaiting_first_draft_req_ids -= released
+            logger.info(
+                "[PD-TRACE] first-draft gate released: %d request(s) may "
+                "enter decode: %s",
+                len(released),
+                sorted(released),
+            )
+
     def _pregenerate_draft_chain(
         self, target_tail: SchedulerOutput
     ) -> None:
@@ -1518,6 +1582,8 @@ class PDSeparatedScheduler(Scheduler):
 
         self._pregenerated_draft_task_ids.add(task_id)
         self._pregenerated_draft_req_ids[task_id] = set(req_ids)
+        if target_tail.batch_type == BatchType.PREFILL_LAST:
+            self._gate_first_decode_until_draft_ready(target_tail)
         logger.info(
             "[PD] pre-generated async MTP placeholders task_id=%s steps=%d",
             task_id,
@@ -1613,6 +1679,11 @@ class PDSeparatedScheduler(Scheduler):
             "draft_output_req_ids",
             tuple(source.num_scheduled_tokens),
         )
+        if (
+            draft_step_idx == 0
+            and source.batch_type == BatchType.PREFILL_LAST
+        ):
+            self._gate_first_decode_until_draft_ready(draft_first)
         self.drafts_first_ready.append(draft_first)
         return True
 
@@ -1622,12 +1693,15 @@ class PDSeparatedScheduler(Scheduler):
         draft_step_idx = int(draft_last.draft_step_idx or 0)
         next_step_idx = draft_step_idx + 1
         task_id = draft_last.draft_task_id
-        if task_id in self._pregenerated_draft_task_ids:
-            if next_step_idx >= self.num_spec_tokens:
+        if next_step_idx >= self.num_spec_tokens:
+            # The draft chain is complete: requests gated after their
+            # prefill may now enter decode with real draft tokens.
+            self._release_first_draft_gate(draft_last)
+            if task_id in self._pregenerated_draft_task_ids:
                 self._pregenerated_draft_task_ids.discard(task_id)
                 self._pregenerated_draft_req_ids.pop(task_id, None)
             return False
-        if next_step_idx >= self.num_spec_tokens:
+        if task_id in self._pregenerated_draft_task_ids:
             return False
         if task_id is None:
             raise RuntimeError("DRAFT_LAST missing draft_task_id")
@@ -1868,7 +1942,13 @@ class PDSeparatedScheduler(Scheduler):
                 task_id = output.draft_task_id
                 if task_id is not None:
                     self._pregenerated_draft_task_ids.discard(task_id)
-                    self._pregenerated_draft_req_ids.pop(task_id, None)
+                    dropped_reqs = self._pregenerated_draft_req_ids.pop(
+                        task_id, None
+                    )
+                    if dropped_reqs:
+                        self._awaiting_first_draft_req_ids.difference_update(
+                            dropped_reqs
+                        )
                     self._dropped_draft_task_ids_to_report.append(task_id)
                 if output is self._draft_first_cloud_publish_pending:
                     self._draft_first_cloud_publish_pending = None
@@ -2055,6 +2135,36 @@ class PDSeparatedScheduler(Scheduler):
                 len(self.running),
             )
 
+        # Hold back freshly-prefilled requests whose draft chain has not
+        # completed yet.  Their spec slots would be unrepaired -1
+        # placeholders (the worker only records real draft ids when the
+        # chain completes), which wastes the verify and can feed negative
+        # token ids to device kernels.
+        saved_running = None
+        if self._awaiting_first_draft_req_ids:
+            kept_running = [
+                req
+                for req in self.running
+                if req.request_id not in self._awaiting_first_draft_req_ids
+            ]
+            if len(kept_running) != len(self.running):
+                logger.info(
+                    "[PD-TRACE] decode gate: holding back %d request(s) "
+                    "awaiting first draft: %s",
+                    len(self.running) - len(kept_running),
+                    sorted(
+                        req.request_id
+                        for req in self.running
+                        if req.request_id
+                        in self._awaiting_first_draft_req_ids
+                    ),
+                )
+                saved_running = self.running
+                self.running = kept_running
+        if not self.running:
+            self.running = saved_running
+            return self._make_empty_batch()
+
         saved_chunk_prefill_first = self.chunk_prefill_first
         saved_waiting = self.waiting
         saved_skipped = self.skipped_waiting
@@ -2067,6 +2177,8 @@ class PDSeparatedScheduler(Scheduler):
         try:
             scheduler_output = super().schedule()
         finally:
+            if saved_running is not None:
+                self.running = saved_running
             if scheduler_output is not None:
                 if scheduler_output.total_num_scheduled_tokens == 0:
                     scheduler_output.batch_type = BatchType.EMPTY

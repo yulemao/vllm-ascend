@@ -213,6 +213,11 @@ from vllm.model_executor.layers.attention import Attention, MLAAttention
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
 
+# [PD debug] Optional per-stage device sync to bisect async NPU faults
+# (ACL 507035 surfaces at the first host sync, far from the faulting
+# kernel).  Default ON while debugging; VLLM_ASCEND_PD_SYNC_DEBUG=0 disables.
+_PD_SYNC_DEBUG = os.getenv("VLLM_ASCEND_PD_SYNC_DEBUG", "1") == "1"
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -2998,6 +3003,13 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError(
                 "Cannot defer edge-cloud draft without the target head_token"
             )
+        if _PD_SYNC_DEBUG:
+            torch.npu.synchronize()
+            logger.info(
+                "[PD-SYNC] stash entry ok (batch_type=%s head_token=%s)",
+                getattr(scheduler_output, "batch_type", None),
+                getattr(scheduler_output, "head_token", None),
+            )
         # The target head_token is already globally unique and is present on
         # both the cloud target step and the edge tail step.  Reusing it as
         # the draft-chain identity gives the cloud an exact metadata lookup
@@ -4600,6 +4612,14 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        if _PD_SYNC_DEBUG:
+            torch.npu.synchronize()
+            logger.info(
+                "[PD-SYNC] sampler ok (batch_type=%s head_token=%s)",
+                getattr(scheduler_output, "batch_type", None),
+                getattr(scheduler_output, "head_token", None),
+            )
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:

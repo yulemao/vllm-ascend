@@ -22,6 +22,7 @@ from typing import Any
 import copy
 import gc
 import logging
+import os
 import threading
 import time
 from types import NoneType
@@ -90,6 +91,26 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+# [PD debug] Optional per-stage device sync to bisect async NPU faults.
+# ACL 507035 surfaces at the first host sync, far away from the faulting
+# kernel; with VLLM_ASCEND_PD_SYNC_DEBUG=1 each pipeline stage syncs and
+# logs, so the crash stack points at the guilty stage.
+# Default ON while debugging; set VLLM_ASCEND_PD_SYNC_DEBUG=0 to disable.
+_PD_SYNC_DEBUG = os.getenv("VLLM_ASCEND_PD_SYNC_DEBUG", "1") == "1"
+
+
+def _pd_sync_point(tag: str, scheduler_output=None) -> None:
+    if not _PD_SYNC_DEBUG:
+        return
+    torch.npu.synchronize()
+    logger.info(
+        "[PD-SYNC] %s ok (batch_type=%s head_token=%s)",
+        tag,
+        getattr(scheduler_output, "batch_type", None),
+        getattr(scheduler_output, "head_token", None),
+    )
+
 
 class SchedulerBatchType(Enum):
     """Enum for the batch type of a SchedulerOutput step."""
@@ -893,6 +914,7 @@ class NPUWorker(WorkerBase):
             layer_slice_info=layer_slice_info,
         )
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}, after.")
+        _pd_sync_point("edge head forward", scheduler_output)
 
         is_last_slice = (
             layer_slice_info is None or layer_slice_info.is_last_slice
@@ -987,6 +1009,7 @@ class NPUWorker(WorkerBase):
             layer_slice_info=layer_slice_info,
         )
         logger.info(f"Execute model, batch_type: {scheduler_output.batch_type}, after.")
+        _pd_sync_point("edge tail forward", scheduler_output)
 
         is_last_slice = (
             layer_slice_info is None or layer_slice_info.is_last_slice
@@ -1212,6 +1235,7 @@ class NPUWorker(WorkerBase):
         output = self.model_runner._run_edge_cloud_draft_first_segment(
             scheduler_output
         )
+        _pd_sync_point("draft head forward", scheduler_output)
         if not isinstance(output, IntermediateTensors):
             raise RuntimeError("DRAFT_FIRST did not produce intermediates")
         if get_pp_group().world_size == 2:
@@ -1260,14 +1284,17 @@ class NPUWorker(WorkerBase):
             handle.wait()
         for postprocess in comm_postprocess:
             postprocess()
+        _pd_sync_point("draft tail recv", scheduler_output)
         logger.info(
             "Receive intermediate tensors from cloud after, "
             f"hidden_channel: {HiddenChannelType.DECODE.value}"
         )
         assert tensor_dict is not None
-        return self.model_runner._run_edge_cloud_draft_last_segment(
+        result = self.model_runner._run_edge_cloud_draft_last_segment(
             scheduler_output, IntermediateTensors(tensor_dict)
         )
+        _pd_sync_point("draft tail forward", scheduler_output)
+        return result
 
     def _execute_model_legacy(
         self,

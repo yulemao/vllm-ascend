@@ -1,8 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from dataclasses import replace
 
 import torch
+
+# [PD debug] Bisect async NPU faults (ACL 507035) inside the rejection
+# sampler.  Default ON while debugging; VLLM_ASCEND_PD_SYNC_DEBUG=0 disables.
+_PD_SYNC_DEBUG = os.getenv("VLLM_ASCEND_PD_SYNC_DEBUG", "1") == "1"
+
+if _PD_SYNC_DEBUG:
+    from vllm.logger import logger as _pd_logger
+
+
+def _pd_sync(tag: str) -> None:
+    if _PD_SYNC_DEBUG:
+        torch.npu.current_stream().synchronize()
+        _pd_logger.info("[PD-SYNC] rejection_sampler: %s ok", tag)
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.outputs import SamplerOutput
@@ -124,6 +138,24 @@ class AscendRejectionSampler(RejectionSampler):
         # won't affect the original logits tensor.
         assert logits is not None
         bonus_logits = logits[bonus_logits_indices]
+        if _PD_SYNC_DEBUG:
+            _pd_logger.info(
+                "[PD-SYNC] rs gather ranges: logits_rows=%d "
+                "bonus_idx[min=%d max=%d] target_idx[min=%d max=%d] "
+                "draft_ids[min=%d max=%d n=%d]",
+                logits.shape[0],
+                int(bonus_logits_indices.min()),
+                int(bonus_logits_indices.max()),
+                int(target_logits_indices.min()),
+                int(target_logits_indices.max()),
+                int(metadata.draft_token_ids.min())
+                if metadata.draft_token_ids.numel()
+                else 0,
+                int(metadata.draft_token_ids.max())
+                if metadata.draft_token_ids.numel()
+                else 0,
+                metadata.draft_token_ids.numel(),
+            )
         bonus_sampler_output = self.sampler(
             logits=bonus_logits,
             sampling_metadata=replace(
@@ -136,11 +168,13 @@ class AscendRejectionSampler(RejectionSampler):
             logprobs_mode_override="processed_logits" if self.is_processed_logprobs_mode else "raw_logits",
         )
         bonus_token_ids = bonus_sampler_output.sampled_token_ids
+        _pd_sync("bonus sampler")
 
         # Just like `bonus_logits`, `target_logits` is a new tensor with
         # separate storage from the original `logits` tensor. Therefore,
         # it is safe to update `target_logits` in place.
         raw_target_logits = logits[target_logits_indices]
+        _pd_sync("target logits gather")
         # Use float32 for the target_logits.
         raw_target_logits = raw_target_logits.to(torch.float32)
         target_logits = raw_target_logits
@@ -150,12 +184,14 @@ class AscendRejectionSampler(RejectionSampler):
             # apply_logits_processors modifies the tensor in-place.
             target_logits = target_logits.clone()
         target_logits = self.apply_logits_processors(target_logits, sampling_metadata, metadata)
+        _pd_sync("logits processors")
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
         # `apply_sampling_constraints` function.
         target_logits = apply_sampling_constraints(
             target_logits, metadata.cu_num_draft_tokens, sampling_metadata, self.top_k
         )
+        _pd_sync("sampling constraints")
 
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,
@@ -167,6 +203,7 @@ class AscendRejectionSampler(RejectionSampler):
             bonus_token_ids,
             sampling_metadata,
         )
+        _pd_sync("rejection_sample")
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:

@@ -48,6 +48,37 @@ def to_int64_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
     return tuple(tensor.tolist())
 
 
+def _ssm_state_for_recurrent_kernel(ssm_state: torch.Tensor):
+    """Adapt a padded-stride ssm state view for the custom
+    npu_recurrent_gated_delta_rule kernel.
+
+    The custom kernel (csrc/recurrent_gated_delta_rule) addresses state
+    blocks by RAW natural stride (block base = ssm_idx * NV * Dv * Dk
+    elements) and ignores the tensor view's stride(0).  When the shared
+    attn/mamba tensor pads the ssm block stride up to the attention K
+    block size (see model_runner_v1._reshape_kv_cache_tensors, required
+    to keep ssm block N aliasing K block N 1:1), present the same memory
+    to the kernel as ``ratio`` x more natural contiguous blocks and
+    scale the state indices by ``ratio``: kernel block (ratio*idx) then
+    lands exactly on view block idx (== K block idx).  When the view is
+    already naturally strided (stride(0) == block size, e.g. TP4), this
+    is a no-op.
+    """
+    natural = ssm_state[0].numel()
+    stride0 = ssm_state.stride(0)
+    if stride0 == natural:
+        return ssm_state, 1
+    assert stride0 % natural == 0 and stride0 > natural, (
+        f"ssm state stride(0)={stride0} is not a positive multiple of "
+        f"the natural block size {natural}")
+    ratio = stride0 // natural
+    expanded = torch.as_strided(
+        ssm_state,
+        size=(ratio * ssm_state.shape[0], *ssm_state.shape[1:]),
+        stride=(natural, *ssm_state.stride()[1:]))
+    return expanded, ratio
+
+
 def _check_and_get_host_args(attn_metadata, field_name: str, sub_field_name: str):
     if (fallback_meta := getattr(attn_metadata, field_name, None)) is None:
         raise RuntimeError(
@@ -420,6 +451,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
         self_kv_cache = self.kv_cache
         ssm_state = self_kv_cache[1]
+        # The custom recurrent kernel uses raw natural block addressing;
+        # adapt a padded-stride view (shared attn/mamba tensor layout) to
+        # expanded natural blocks and scale the indices to match.
+        ssm_state_kernel, ssm_idx_ratio = _ssm_state_for_recurrent_kernel(
+            ssm_state)
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 
@@ -699,10 +735,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 value=value_spec.squeeze(0),
                 g=g_spec.squeeze(0),
                 beta=beta_spec.squeeze(0),
-                state=ssm_state,
+                state=ssm_state_kernel,
                 scale=key_spec.shape[-1] ** -0.5,
                 actual_seq_lengths=actual_seq_lengths,
-                ssm_state_indices=spec_state_indices_tensor.flatten(),
+                ssm_state_indices=spec_state_indices_tensor.flatten() * ssm_idx_ratio,
                 num_accepted_tokens=num_accepted_tokens.to(torch.int32),
             ).unsqueeze(0)
         else:
@@ -741,10 +777,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 value=value_non_spec.squeeze(0),
                 g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
                 beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
-                state=ssm_state,
+                state=ssm_state_kernel,
                 scale=key_non_spec.shape[-1] ** -0.5,
                 actual_seq_lengths=actual_seq_lengths,
-                ssm_state_indices=non_spec_state_indices_tensor,
+                ssm_state_indices=non_spec_state_indices_tensor * ssm_idx_ratio,
             ).unsqueeze(0)
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None

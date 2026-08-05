@@ -3004,7 +3004,7 @@ class NPUModelRunner(GPUModelRunner):
                 "Cannot defer edge-cloud draft without the target head_token"
             )
         if _PD_SYNC_DEBUG:
-            torch.npu.synchronize()
+            torch.npu.current_stream().synchronize()
             logger.info(
                 "[PD-SYNC] stash entry ok (batch_type=%s head_token=%s)",
                 getattr(scheduler_output, "batch_type", None),
@@ -4614,7 +4614,9 @@ class NPUModelRunner(GPUModelRunner):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         if _PD_SYNC_DEBUG:
-            torch.npu.synchronize()
+            # Current-stream only (see worker.py:_pd_sync_point): a
+            # device-wide sync would deadlock on in-flight HCCL work.
+            torch.npu.current_stream().synchronize()
             logger.info(
                 "[PD-SYNC] sampler ok (batch_type=%s head_token=%s)",
                 getattr(scheduler_output, "batch_type", None),

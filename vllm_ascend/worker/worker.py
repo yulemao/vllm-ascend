@@ -103,7 +103,12 @@ _PD_SYNC_DEBUG = os.getenv("VLLM_ASCEND_PD_SYNC_DEBUG", "1") == "1"
 def _pd_sync_point(tag: str, scheduler_output=None) -> None:
     if not _PD_SYNC_DEBUG:
         return
-    torch.npu.synchronize()
+    # Current-stream only: a device-wide synchronize() would also wait for
+    # in-flight HCCL isend/irecv work, which legitimately pends until the
+    # peer posts the matching op -- that turns this debug hook into an
+    # edge<->cloud deadlock.  507035 is a vector-core (compute) fault, so
+    # syncing the compute stream is sufficient to surface it here.
+    torch.npu.current_stream().synchronize()
     logger.info(
         "[PD-SYNC] %s ok (batch_type=%s head_token=%s)",
         tag,
